@@ -12,6 +12,9 @@ datas = []
 datas += collect_data_files('matplotlib')
 datas += collect_data_files('pywt')
 datas += [('mep_cmap', 'mep_cmap')]
+# BIDS-ify (BEP037) schema asset - explicit, in case the whole-package
+# data bundling above ever changes. The app hard-depends on this JSON.
+datas += [('mep_cmap/schema/nibs_bep037.json', 'mep_cmap/schema')]
 
 hiddenimports = []
 hiddenimports += collect_submodules('mep_cmap')
@@ -21,6 +24,7 @@ hiddenimports += collect_submodules('numpy')
 hiddenimports += collect_submodules('pandas')
 hiddenimports += collect_submodules('pywt')
 hiddenimports += collect_submodules('mpl_toolkits')
+hiddenimports += collect_submodules('pyedflib')   # BIDS-ify EDF/BDF writer (C ext)
 hiddenimports += [
     'scipy.signal',
     'scipy.signal.windows',

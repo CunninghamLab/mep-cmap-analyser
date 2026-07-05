@@ -17,6 +17,9 @@ datas += collect_data_files('pywt')
 
 # Include the entire mep_cmap package as data so all .py modules are bundled
 datas += [('mep_cmap', 'mep_cmap')]
+# BIDS-ify (BEP037) schema asset - explicit, in case the whole-package
+# data bundling above ever changes. The app hard-depends on this JSON.
+datas += [('mep_cmap/schema/nibs_bep037.json', 'mep_cmap/schema')]
 
 # ── Hidden imports ────────────────────────────────────────────────────────────
 hiddenimports = []
@@ -31,6 +34,7 @@ hiddenimports += collect_submodules('numpy')
 hiddenimports += collect_submodules('pandas')
 hiddenimports += collect_submodules('pywt')
 hiddenimports += collect_submodules('mpl_toolkits')
+hiddenimports += collect_submodules('pyedflib')   # BIDS-ify EDF/BDF writer (C ext)
 
 # Explicit extras that PyInstaller sometimes misses
 hiddenimports += [
@@ -75,7 +79,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,      # --onedir (faster startup than --onefile)
-    name='MEP-CMAP Analyser v0.9.9.8',
+    name='MEP-CMAP Analyser v1.0',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -96,5 +100,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='MEP-CMAP Analyser v0.9.9.8',
+    name='MEP-CMAP Analyser v1.0',
 )

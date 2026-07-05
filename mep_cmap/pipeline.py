@@ -23,6 +23,7 @@ import glob
 import json
 import itertools
 import pathlib
+import re as _re
 import webbrowser
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -114,6 +115,28 @@ class PipelineConfig:
     csp_n_boot:            int   = 1000
     csp_search_end_ms:     float = 400.0
     csp_max_mep_offset_ms: float = 100.0
+
+
+def _make_bids_prefix(meta_prefix, file_stem):
+    """Build a unique, clean bids_prefix from metadata and file stem.
+    Strips sub-/ses- tokens (always redundant) and any token already
+    verbatim in the metadata prefix (e.g. limb-left duplication).
+    Falls back to full stem if nothing unique remains.
+    """
+    import re as _re
+    if not meta_prefix:
+        return file_stem
+    if file_stem in meta_prefix:
+        return meta_prefix
+    unique = []
+    for t in file_stem.split("_"):
+        if _re.match(r"^sub-", t, _re.I) or _re.match(r"^ses-", t, _re.I):
+            continue
+        if t in meta_prefix or t.lower() in meta_prefix.lower():
+            continue
+        unique.append(t)
+    suffix = "_".join(unique) if unique else file_stem
+    return f"{meta_prefix}_{suffix}"
 
 
 def pipeline_load_file(file_path, channel_idx, marker_name,
@@ -461,27 +484,31 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
         # ── shared fields ────────────────────────────────────────────────
         # LAT_COLS indices:
         # [0-3] ID (File/StimType/Stim_Label/Segment)
-        # [4-6] timing (Segment_Overall/Stim_Time/Time_Since_Last_Stim) — Stage 8
+        # [4-6] timing (Segment_Overall/Stim_Time/Time_Since_Last_Stim)
         # [7-8] limb/measure, [9] PTP, [10] Latency
-        # [11] SilentPeriod, [12] SP_MEP_Offset, [13] SP_EMG_Return, [14] MEP_cSP_Ratio
-        # [15] AUC, [16-17] baseline, [18-19] Z_PreStimRMS/Z_PTP_Within
-        # [20-24] pooled/detrend (WithinCond + Session), [25] Outlier_Decision
-        # [26-29] normalisation, [30] note
-        _mep_csp = round(float(man_ptp) / float(silent_dur), 4) \
-                   if (isinstance(silent_dur, (int, float)) and silent_dur > 0
-                       and man_ptp is not None) else None
+        # [11] SilentPeriod, [12] SP_MEP_Offset, [13] SP_EMG_Return, [14] cSP_MEP_Ratio
+        # [15] AUC, [16-17] PreStimRMS/PreStimPTP
+        # [18] PTP_per_PreStimRMS
+        # [19-21] Z scores, [22-25] detrended, [26] Outlier_Decision
+        # [27-31] normalisation (incl Normalised_PTP_per_PreStimRMS), [32] note
+        # cSP/MEP ratio (Orth & Rothwell 2004): cSP duration(ms) / MEP PTP(mV), in ms/mV
+        _csp_mep = round(float(silent_dur) / float(man_ptp), 4) \
+                   if (isinstance(silent_dur, (int, float)) and silent_dur >= 0
+                       and man_ptp is not None and float(man_ptp) > 0) else None
         common = [
             name, stim_type, custom_labels.get(stim_type, ""), idx + 1,  # [0-3]
             None, None, None,                                              # [4-6] timing
             cfg.limb, cfg.measure,                                        # [7-8]
             None, None,                                                   # [9-10] PTP/Lat
-            silent_dur, sp_mep_offset_ms, sp_emg_return_ms, _mep_csp,   # [11-14] SP
+            silent_dur, sp_mep_offset_ms, sp_emg_return_ms, _csp_mep,   # [11-14] SP
             auc_val,                                                      # [15]
-            round(rms_all[idx], 4), round(preptp_all[idx], 4),           # [16-17]
-            round(rms_z_full[idx], 3), None, None, None, None, None, None,  # [18-24]
-            decision,                                                          # [25]
-            None, None, None, None,                                           # [26-29] norm
-            note_txt,                                                          # [30]
+            round(rms_all[idx], 4), round(preptp_all[idx], 4),           # [16-17] PreStimRMS/PTP
+            None,                                                         # [18] PTP_per_PreStimRMS
+            round(rms_z_full[idx], 3), None, None,                       # [19-21] Z_PreStimRMS/Within/Pooled
+            None, None, None, None,                                       # [22-25] Detrended x4
+            decision,                                                     # [26] Outlier_Decision
+            None, None, None, None, None,                                 # [27-31] norm cols (incl Norm_PTP_per_PreStimRMS)
+            note_txt,                                                     # [32] Manual_Note
         ]
 
         auto_row   = common.copy()
@@ -490,6 +517,16 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
         auto_row  [10] = round(auto_lat, 2) if auto_lat is not None else "Not Detected"
         manual_row[9] = round(man_ptp, 2)
         manual_row[10] = round(man_lat, 2) if man_lat is not None else "Not Detected"
+
+        # PTP / PreStimRMS per trial (indices 30-31 in LAT_COLS)
+        _rms_val = rms_all[idx]
+        _col_ptp_rms  = LAT_COLS.index("PTP_per_PreStimRMS")
+        _col_norm_rms = LAT_COLS.index("Normalised_PTP_per_PreStimRMS")
+        auto_row  [_col_ptp_rms] = round(float(auto_ptp) / _rms_val, 4) \
+                                   if _rms_val > 0 else None
+        manual_row[_col_ptp_rms] = round(float(man_ptp)  / _rms_val, 4) \
+                                   if _rms_val > 0 else None
+        # Normalised_PTP_per_PreStimRMS filled later by apply_normalisation
 
         auto_rows.append(auto_row)
         manual_rows.append(manual_row)
@@ -690,10 +727,12 @@ LAT_COLS = [
     "cSP_Duration(ms)",     # duration MEP offset → EMG return
     "cSP_MEP_Offset(ms)",    # time of MEP offset (cSP onset) re: stim
     "cSP_EMG_Return(ms)",    # time of EMG return (cSP offset) re: stim
-    "MEP_cSP_Ratio",        # PTP(mV) / cSP duration(ms), Orth & Rothwell 2004
+    "cSP_MEP_Ratio(ms/mV)",  # cSP duration(ms) / PTP(mV), Orth & Rothwell 2004
     "AUC(mV*s)",
     # Pre-stimulus baseline
     "PreStimRMS", "PreStimPTP",
+    # PTP normalised to baseline EMG
+    "PTP_per_PreStimRMS",            # PTP(mV) / PreStimRMS
     # Z-scores and detrended values
     "Z_PreStimRMS", "Z_PTP_Within", "Z_PTP_Pooled",
     "PTP_Detrended_WithinCond(mV)", "PTP_Detrended_WithinCond_Z",
@@ -705,6 +744,7 @@ LAT_COLS = [
     "Reference_Mean(mV)", # mean amplitude of reference (plateau-detected if applicable)
     "Reference_N",        # trials contributing to reference mean
     "Normalised_PTP",     # PTP / Reference_Mean  (raw ratio)
+    "Normalised_PTP_per_PreStimRMS", # Normalised_PTP / PreStimRMS (blank until normalised)
     # Annotations — always last
     "Manual_Note",
 ]
@@ -732,15 +772,18 @@ def pipeline_write_outputs(latency_manual, results_out, bids_prefix):
         "Mean_cSP_Duration(ms)", "SD_cSP_Duration(ms)",
         "Mean_cSP_MEP_Offset(ms)", "SD_cSP_MEP_Offset(ms)",
         "Mean_cSP_EMG_Return(ms)", "SD_cSP_EMG_Return(ms)",
-        "Mean_MEP_cSP_Ratio", "SD_MEP_cSP_Ratio",
+        "Mean_cSP_MEP_Ratio(ms/mV)", "SD_cSP_MEP_Ratio(ms/mV)",
         # AUC
         "Mean_AUC(mV*s)", "SD_AUC(mV*s)",
         # Baseline
         "Mean_PreStimRMS", "SD_PreStimRMS",
         "Mean_PreStimPTP", "SD_PreStimPTP",
+        # PTP normalised to baseline EMG
+        "Mean_PTP_per_PreStimRMS", "SD_PTP_per_PreStimRMS",
         # Normalisation
         "Mean_Normalised_PTP", "SD_Normalised_PTP",
         "Reference_Type", "Reference_Mean(mV)", "Reference_N",
+        "Mean_Normalised_PTP_per_PreStimRMS", "SD_Normalised_PTP_per_PreStimRMS",
         # Detrended
         "Mean_PTP_Detrended_WithinCond(mV)", "SD_PTP_Detrended_WithinCond(mV)",
         "Mean_PTP_Detrended_Session(mV)",    "SD_PTP_Detrended_Session(mV)",
@@ -760,8 +803,8 @@ def pipeline_write_outputs(latency_manual, results_out, bids_prefix):
             pd.DataFrame(latency_manual, columns=LAT_COLS),
             "StimType").sort_values(["StimType", "File", "Segment"])
         df_clean = df_all[df_all["Outlier_Decision"] != "Outlier"]
-        df_clean.to_csv(_p("trials.csv"),               index=False)
-        df_all.to_csv(  _p("trials_with_outliers.csv"), index=False)
+        df_clean.to_csv(_p("trials.csv"), index=False)
+        # _trials_with_outliers.csv removed — use _trials.csv with Outlier_Decision column
 
     # ── Summary files — build from trial-level data for consistency ───────────
     # This ensures summary and trial files always report the same variables.
@@ -807,14 +850,17 @@ def pipeline_write_outputs(latency_manual, results_out, bids_prefix):
                     _mn(_col(clean,"cSP_Duration(ms)")), _sd(_col(clean,"cSP_Duration(ms)")),
                     _mn(_col(clean,"cSP_MEP_Offset(ms)")),_sd(_col(clean,"cSP_MEP_Offset(ms)")),
                     _mn(_col(clean,"cSP_EMG_Return(ms)")),_sd(_col(clean,"cSP_EMG_Return(ms)")),
-                    _mn(_col(clean,"MEP_cSP_Ratio")),    _sd(_col(clean,"MEP_cSP_Ratio")),
+                    _mn(_col(clean,"cSP_MEP_Ratio(ms/mV)")), _sd(_col(clean,"cSP_MEP_Ratio(ms/mV)")),
                     _mn(_col(clean,"AUC(mV*s)")),        _sd(_col(clean,"AUC(mV*s)")),
                     _mn(_col(clean,"PreStimRMS")),       _sd(_col(clean,"PreStimRMS")),
                     _mn(_col(clean,"PreStimPTP")),       _sd(_col(clean,"PreStimPTP")),
+                    _mn(_col(clean,"PTP_per_PreStimRMS")), _sd(_col(clean,"PTP_per_PreStimRMS")),
                     _mn(_col(clean,"Normalised_PTP")),   _sd(_col(clean,"Normalised_PTP")),
                     _str_col(clean,"Reference_Type"),
                     _mn(_col(clean,"Reference_Mean(mV)")),
                     _mn(_col(clean,"Reference_N")),
+                    _mn(_col(clean,"Normalised_PTP_per_PreStimRMS")),
+                    _sd(_col(clean,"Normalised_PTP_per_PreStimRMS")),
                     _mn(_col(clean,"PTP_Detrended_WithinCond(mV)")),
                     _sd(_col(clean,"PTP_Detrended_WithinCond(mV)")),
                     _mn(_col(clean,"PTP_Detrended_Session(mV)")),
@@ -1010,7 +1056,13 @@ def run_pipeline(input_path,
                    if derivatives_root
                    else os.path.join(_source_dir, "derivatives", meta.sub_ses_path()))
     os.makedirs(_deriv_base, exist_ok=True)
-    _bids_prefix = meta.bids_prefix() or pathlib.Path(input_path).stem
+    # Always ensure _bids_prefix is unique per source file.
+    # For BIDS-named files the stem is already unique and embedded in the prefix.
+    # For non-BIDS files (e.g. LabChart exports) the user enters shared metadata
+    # for multiple files, so we append a disambiguating suffix derived from the
+    # file stem — but strip any tokens that are already in the metadata prefix
+    # to avoid redundancy (e.g. sub-o001 appearing twice).
+    _bids_prefix = _make_bids_prefix(meta.bids_prefix(), pathlib.Path(input_path).stem)
 
     def _bids_path(suffix):
         return os.path.join(_deriv_base, f"{_bids_prefix}_{suffix}")
@@ -1197,7 +1249,11 @@ def run_pipeline(input_path,
                 #              "stim_times": {stim_type: [t_sec, ...]}}}
                 _extra_segs = {}
                 from .io import list_waveform_channels
-                _chan_names_all = list_waveform_channels(raw_file)
+                try:
+                    _chan_names_all = list_waveform_channels(raw_file)
+                except Exception as _lc_err:
+                    log_callback(f"⚠️  Could not list channels for extra-channel panel: {_lc_err}")
+                    _chan_names_all = []
                 for _ci in cfg.extra_channel_indices:
                     try:
                         _cname = (_chan_names_all[_ci]
@@ -1280,6 +1336,17 @@ def run_pipeline(input_path,
                 latency_auto, latency_manual)
 
             # ── Stage 9: Plots ────────────────────────────────────────────────
+            # Clean up stale figures from previous runs with old prefix names
+            for _old_fig in glob.glob(os.path.join(figures_out, "*_traces.png")):
+                try:
+                    os.remove(_old_fig)
+                except Exception:
+                    pass
+            for _old_fig in glob.glob(os.path.join(figures_all, "*_traces_all.png")):
+                try:
+                    os.remove(_old_fig)
+                except Exception:
+                    pass
             combined_plot = pipeline_generate_plots(
                 trace_stats, time_axis, segments_metadata,
                 cfg.color_map, cfg.custom_labels, cfg.plot_included,

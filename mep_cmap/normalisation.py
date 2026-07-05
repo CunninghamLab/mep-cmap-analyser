@@ -138,12 +138,15 @@ def apply_normalisation(
             )
 
     # ── Fill rows ─────────────────────────────────────────────────────────────
-    ri_type   = col["Reference_Type"]
-    ri_mean   = col["Reference_Mean(mV)"]
-    ri_n      = col["Reference_N"]
-    ri_norm   = col["Normalised_PTP"]
-    ri_ptp    = col["PTP(mV)"]
-    ri_sttype = col["StimType"]
+    ri_type      = col["Reference_Type"]
+    ri_mean      = col["Reference_Mean(mV)"]
+    ri_n         = col["Reference_N"]
+    ri_norm      = col["Normalised_PTP"]
+    ri_ptp       = col["PTP(mV)"]
+    ri_sttype    = col["StimType"]
+    ri_rms       = col.get("PreStimRMS")
+    ri_ptp_rms   = col.get("PTP_per_PreStimRMS")
+    ri_norm_rms  = col.get("Normalised_PTP_per_PreStimRMS")
 
     for row in latency_rows:
         st       = row[ri_sttype]
@@ -164,4 +167,12 @@ def apply_normalisation(
         row[ri_mean] = round(mean_ref, 4)
         row[ri_n]    = n_ref
         row[ri_norm] = round(ptp_f / mean_ref, 4)
+        # Normalised_PTP / PreStimRMS
+        if ri_norm_rms is not None and ri_rms is not None:
+            try:
+                _rms = float(row[ri_rms])
+                _norm_ptp = ptp_f / mean_ref
+                row[ri_norm_rms] = round(_norm_ptp / _rms, 4) if _rms > 0 else None
+            except (TypeError, ValueError):
+                pass
 

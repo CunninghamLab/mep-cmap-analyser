@@ -1,6 +1,6 @@
 # MEP-CMAP Analyser
 
-**Version 0.9.9.8 | May 2026**  
+**Version 1.0 | June 2026**  
 *Author: Justin Andrushko PhD, Northumbria University*
 
 [![PyPI version](https://badge.fury.io/py/mep-cmap-analyser.svg)](https://pypi.org/project/mep-cmap-analyser/)
@@ -90,7 +90,7 @@ For any other tabular text file (tab, space, or comma delimited). A one-time, fo
 | **cSP duration (ms)** | Duration of the cortical silent period, from EMG suppression onset to EMG return |
 | **cSP MEP offset (ms)** | Time from stimulus to start of cSP |
 | **cSP EMG return (ms)** | Time from stimulus to EMG recovery after cSP |
-| **MEP/cSP ratio** | PTP amplitude divided by cSP duration (Orth & Rothwell, 2004 [5]) |
+| **cSP/MEP ratio** | cSP duration divided by MEP PTP amplitude, in ms/mV (Orth & Rothwell, 2004 [5]) |
 | **Normalised PTP** | PTP expressed as a fraction of an Mmax reference or single-pulse reference mean |
 | **Paired-pulse ratio** | Conditioned / reference amplitude for SICI, ICF, or any custom pairing |
 | **Z-score (within type)** | Standardised amplitude within each stimulus type |
@@ -202,7 +202,7 @@ The tool is general enough to handle any paradigm where a time-locked EMG respon
 - **TMS MEP studies** — single-pulse, paired-pulse (SICI, ICF, LICI, SAI), or multi-intensity recruitment curves; cortical and cerebellar targets; any accessible muscle
 - **Peripheral nerve stimulation CMAPs** — M-wave recruitment curves for Mmax determination or peripheral motor nerve conduction
 - **Corticospinal excitability assays** — resting and active MEP series, pre/post intervention, crossover and parallel group designs
-- **TMS-EMG silent period studies** — cSP duration, MEP/cSP ratio, and derived inhibitory indices
+- **TMS-EMG silent period studies** — cSP duration, cSP/MEP ratio, and derived inhibitory indices
 - **Voluntary EMG bursts** — files with no stimulation events can be loaded for waveform inspection, RMS quantification, and trial-level output even without stim-triggered segmentation
 
 ---
@@ -355,7 +355,7 @@ study/
 | `cSP_Duration(ms)` | Cortical silent period duration |
 | `cSP_MEP_Offset(ms)` | Time from stimulus to cSP onset |
 | `cSP_EMG_Return(ms)` | Time from stimulus to EMG return after cSP |
-| `MEP_cSP_Ratio` | PTP / cSP duration |
+| `cSP_MEP_Ratio(ms/mV)` | cSP duration / MEP PTP amplitude |
 | `Normalised_PTP` | PTP expressed as a proportion of the reference |
 | `Reference_Type` | How the reference was computed (Mmax, single-pulse mean, etc.) |
 | `Reference_Mean(mV)` | Reference amplitude used |
@@ -443,7 +443,7 @@ The Rust extension `mep_cmap_io` is compiled automatically during the build proc
 
 If you use MEP-CMAP Analyser in published research, please cite:
 
-> Andrushko, J.W. (2026). MEP-CMAP Analyser (Version 0.9.9.5) [Software].
+> Andrushko, J.W. (2026). MEP-CMAP Analyser (Version 1.0) [Software].
 > Northumbria University. https://github.com/jandrushko/mep-cmap-analyser
 
 ---

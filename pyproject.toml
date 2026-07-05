@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mep-cmap-analyser"
-version = "0.9.9.8"
+version = "1.0"
 description = "BIDS-compliant TMS/EMG neurophysiology analysis tool for MEP and CMAP quantification"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -20,6 +20,7 @@ dependencies = [
     "PyWavelets>=1.4",
     "Pillow>=9.0",
     "neo>=0.10",
+    "pyedflib>=0.1.30",
 ]
 
 [project.scripts]
@@ -33,3 +34,7 @@ Repository = "https://github.com/jandrushko/mep-cmap-analyser"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["mep_cmap*"]
+
+[tool.setuptools.package-data]
+# Ship the BIDS-ify (BEP037) schema asset inside the wheel/sdist.
+mep_cmap = ["schema/*.json"]

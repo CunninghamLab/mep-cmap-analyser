@@ -12,7 +12,7 @@ import re
 import datetime
 from dataclasses import dataclass, field, asdict
 
-TOOL_VERSION = "0.9.9.8"
+TOOL_VERSION = "1.0"
 
 
 @dataclass
@@ -24,6 +24,7 @@ class StudyMetadata:
     timepoint:      str = ""       # e.g. "pre" / "post"  (optional)
     limb:           str = ""       # e.g. "left" / "right"  (optional)
     measure:        str = ""       # e.g. "CSE" / "SICI" / "ICF"  (optional)
+    acq:            str = ""       # e.g. "cse-cond30" — acquisition/condition label
 
     def bids_prefix(self) -> str:
         """
@@ -42,6 +43,8 @@ class StudyMetadata:
             parts.append(f"tp-{self.timepoint}")
         if self.measure:
             parts.append(f"measure-{self.measure}")
+        if self.acq:
+            parts.append(f"acq-{self.acq}")
         return "_".join(p for p in parts if p)
 
     def sub_ses_path(self) -> str:

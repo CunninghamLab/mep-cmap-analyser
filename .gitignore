@@ -68,3 +68,6 @@ __pycache__/
 *.pyc 
 dist windows/ 
 mep_cmap_io/target/ 
+dist/
+build/
+*.egg-info/

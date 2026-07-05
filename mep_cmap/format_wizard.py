@@ -1193,10 +1193,15 @@ class FormatWizard:
 
     def _centre(self) -> None:
         self.top.update_idletasks()
-        self.top.minsize(620, 480)
-        w, h = 660, 580
+        self.top.minsize(700, 540)
+        sw = self.top.winfo_screenwidth()
+        sh = self.top.winfo_screenheight()
+        w  = min(1100, int(sw * 0.75))
+        h  = min(820,  int(sh * 0.80))
         px = self.parent.winfo_x() + (self.parent.winfo_width()  - w) // 2
         py = self.parent.winfo_y() + (self.parent.winfo_height() - h) // 2
+        px = max(0, px)
+        py = max(0, py)
         self.top.geometry(f'{w}x{h}+{px}+{py}')
 
 

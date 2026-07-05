@@ -19,7 +19,7 @@ Adding a new format
 
 Public API
 ----------
-  detect_format(file_path)                     -> 'spike2' | 'spike2_smr' | 'labchart' | 'cfwb' | 'generic_tsv'
+  detect_format(file_path)                     -> 'spike2' | 'spike2_smr' | 'labchart' | 'cfwb' | 'generic_tsv' | 'edf'
   needs_wizard(file_path)                      -> bool
   list_waveform_channels(file_path)            -> list[str]
   list_event_channels(file_path)               -> list[str]
@@ -49,6 +49,7 @@ from .formats import spike2_smr  as _spike2_smr
 from .formats import labchart    as _labchart
 from .formats import cfwb        as _cfwb
 from .formats import generic_tsv as _generic_tsv
+from .formats import edf         as _edf
 
 def _generic_has_config(file_path: str) -> bool:
     return _generic_tsv.has_config(file_path)
@@ -117,10 +118,18 @@ def detect_format(file_path: str) -> str:
     """
     file_path = _resolve_path(file_path)
 
+    # Guard: reject missing or zero-byte files with a clear message
+    if not _os.path.isfile(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+    if _os.path.getsize(file_path) == 0:
+        raise ValueError(f"File is empty (0 bytes): {_os.path.basename(file_path)}")
+
     # ── Extension-based detection for binary / Neo formats ────────────────────
     ext = _os.path.splitext(file_path)[1].lower()
     if ext == '.smr':
         return 'spike2_smr'
+    if ext in ('.edf', '.bdf'):
+        return 'edf'
 
     # ── Binary formats: check magic bytes before opening as text ─────────────
     if _cfwb.is_cfwb(file_path):
@@ -186,6 +195,8 @@ def list_waveform_channels(file_path: str) -> list:
     fmt = detect_format(file_path)
     if fmt == 'spike2_smr':
         return _spike2_smr.list_waveform_channels(file_path)
+    if fmt == 'edf':
+        return _edf.list_waveform_channels(file_path)
     if fmt == 'labchart':
         return _labchart.list_waveform_channels(file_path)
     if fmt == 'cfwb':
@@ -229,6 +240,8 @@ def extract_emg_waveform_and_fs(file_path: str, channel_idx: int = 0):
     fmt = detect_format(file_path)
     if fmt == 'spike2_smr':
         return _spike2_smr.extract_emg_waveform_and_fs(file_path, channel_idx)
+    if fmt == 'edf':
+        return _edf.extract_emg_waveform_and_fs(file_path, channel_idx)
     if fmt == 'labchart':
         return _labchart.extract_emg_waveform_and_fs(file_path, channel_idx)
     if fmt == 'cfwb':
@@ -258,6 +271,8 @@ def extract_stim_times(file_path: str, marker_name: str) -> dict:
     fmt = detect_format(file_path)
     if fmt == 'spike2_smr':
         return _spike2_smr.extract_stim_times(file_path, marker_name)
+    if fmt == 'edf':
+        return _edf.extract_stim_times(file_path, marker_name)
     if fmt == 'labchart':
         return _labchart.extract_stim_times(file_path, marker_name)
     if fmt == 'cfwb':

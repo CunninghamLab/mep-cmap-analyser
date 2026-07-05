@@ -1,0 +1,884 @@
+{
+  "schema_name": "nibs_bep037",
+  "schema_version": "0.2.0",
+  "based_on": "BEP037 NIBS-BIDS, draft v6.2 (2026-03). Field keys are a grounded reconstruction from the NIBS/TMS reporting domain and the BEP037 structure (TMS/tES/TUS; parameters harmonised with SimNIBS where possible). The authoritative spec is the locked BEP037 Google document; reconcile key names against it and bump schema_version when you do.",
+  "datatype": "nibs",
+  "modalities": [
+    "TMS",
+    "tES",
+    "TUS"
+  ],
+  "groups": [
+    "device",
+    "parameters",
+    "targeting",
+    "event"
+  ],
+  "levels": [
+    "required",
+    "recommended",
+    "optional"
+  ],
+  "_field_notes": "Each field: key (the JSON sidecar key, BIDS-style CamelCase), modalities (which NIBS modalities it applies to; 'common' = all), group (UI/display block), level (required|recommended|optional), type (string|number|integer|boolean|array), units (null or a unit string), enum (null or list of allowed values), advanced (bool; collapsed by default in the dialog), description, scope (session=enter once in shared defaults | file=likely to vary per recording, foregrounded in the per-file editor).",
+  "fields": [
+    {
+      "key": "StimulationModality",
+      "modalities": [
+        "common"
+      ],
+      "group": "parameters",
+      "level": "required",
+      "type": "string",
+      "units": null,
+      "enum": [
+        "TMS",
+        "tES",
+        "TUS"
+      ],
+      "advanced": false,
+      "description": "Primary non-invasive brain stimulation modality applied during the recording.",
+      "scope": "session"
+    },
+    {
+      "key": "StimulationDescription",
+      "modalities": [
+        "common"
+      ],
+      "group": "parameters",
+      "level": "recommended",
+      "type": "string",
+      "units": null,
+      "enum": null,
+      "advanced": false,
+      "description": "Free-text summary of the stimulation protocol, in the experimenter's own words.",
+      "scope": "file"
+    },
+    {
+      "key": "Manufacturer",
+      "modalities": [
+        "common"
+      ],
+      "group": "device",
+      "level": "recommended",
+      "type": "string",
+      "units": null,
+      "enum": null,
+      "advanced": false,
+      "description": "Manufacturer of the stimulation device (e.g. Magstim, MagVenture, Brainsway, Soterix, NeuroFUS).",
+      "scope": "session"
+    },
+    {
+      "key": "ManufacturersModelName",
+      "modalities": [
+        "common"
+      ],
+      "group": "device",
+      "level": "recommended",
+      "type": "string",
+      "units": null,
+      "enum": null,
+      "advanced": false,
+      "description": "Model name/number of the stimulation device (e.g. 'Magstim 200^2', 'MagPro X100').",
+      "scope": "session"
+    },
+    {
+      "key": "SoftwareVersions",
+      "modalities": [
+        "common"
+      ],
+      "group": "device",
+      "level": "optional",
+      "type": "string",
+      "units": null,
+      "enum": null,
+      "advanced": true,
+      "description": "Version of the stimulator control / neuronavigation software used for acquisition.",
+      "scope": "session"
+    },
+    {
+      "key": "DeviceSerialNumber",
+      "modalities": [
+        "common"
+      ],
+      "group": "device",
+      "level": "optional",
+      "type": "string",
+      "units": null,
+      "enum": null,
+      "advanced": true,
+      "description": "Serial number of the stimulation device.",
+      "scope": "session"
+    },
+    {
+      "key": "CoilModel",
+      "modalities": [
+        "TMS"
+      ],
+      "group": "device",
+      "level": "recommended",
+      "type": "string",
+      "units": null,
+      "enum": null,
+      "advanced": false,
+      "description": "Model name of the TMS coil (e.g. 'D70 Alpha', 'Cool-B65', 'MCF-B70').",
+      "scope": "session"
+    },
+    {
+      "key": "CoilType",
+      "modalities": [
+        "TMS"
+      ],
+      "group": "device",
+      "level": "recommended",
+      "type": "string",
+      "units": null,
+      "enum": [
+        "figure-of-eight",
+        "circular",
+        "double-cone",
+        "H-coil",
+        "batwing",
+        "other"
+      ],
+      "advanced": false,
+      "description": "Geometry of the TMS coil.",
+      "scope": "session"
+    },
+    {
+      "key": "CoilManufacturer",
+      "modalities": [
+        "TMS"
+      ],
+      "group": "device",
+      "level": "optional",
+      "type": "string",
+      "units": null,
+      "enum": null,
+      "advanced": true,
+      "description": "Manufacturer of the TMS coil, if different from the stimulator manufacturer.",
+      "scope": "session"
+    },
+    {
+      "key": "PulseShape",
+      "modalities": [
+        "TMS"
+      ],
+      "group": "device",
+      "level": "recommended",
+      "type": "string",
+      "units": null,
+      "enum": [
+        "monophasic",
+        "biphasic",
+        "halfsine",
+        "biphasic-burst",
+        "other"
+      ],
+      "advanced": false,
+      "description": "Waveform of the induced electric field pulse.",
+      "scope": "session"
+    },
+    {
+      "key": "CurrentDirection",
+      "modalities": [
+        "TMS"
+      ],
+      "group": "device",
+      "level": "recommended",
+      "type": "string",
+      "units": null,
+      "enum": [
+        "PA",
+        "AP",
+        "LM",
+        "ML",
+        "other"
+      ],
+      "advanced": false,
+      "description": "Direction of the induced current in the cortex relative to the central sulcus (posterior-anterior, etc.).",
+      "scope": "session"
+    },
+    {
+      "key": "PulseConfiguration",
+      "modalities": [
+        "TMS"
+      ],
+      "group": "parameters",
+      "level": "recommended",
+      "type": "string",
+      "units": null,
+      "enum": [
+        "single-pulse",
+        "paired-pulse",
+        "repetitive",
+        "theta-burst",
+        "quadripulse",
+        "other"
+      ],
+      "advanced": false,
+      "description": "High-level TMS protocol class.",
+      "scope": "file"
+    },
+    {
+      "key": "TargetMuscle",
+      "modalities": [
+        "TMS"
+      ],
+      "group": "parameters",
+      "level": "recommended",
+      "type": "string",
+      "units": null,
+      "enum": null,
+      "advanced": false,
+      "description": "Muscle used to define the motor hotspot and threshold (e.g. 'FDI', 'APB', 'ADM').",
+      "scope": "file"
+    },
+    {
+      "key": "StimulationIntensity",
+      "modalities": [
+        "TMS"
+      ],
+      "group": "parameters",
+      "level": "recommended",
+      "type": "number",
+      "units": null,
+      "enum": null,
+      "advanced": false,
+      "description": "Test-pulse stimulation intensity. The unit is given by StimulationIntensityUnits.",
+      "scope": "file"
+    },
+    {
+      "key": "StimulationIntensityUnits",
+      "modalities": [
+        "TMS"
+      ],
+      "group": "parameters",
+      "level": "recommended",
+      "type": "string",
+      "units": null,
+      "enum": [
+        "%MSO",
+        "%RMT",
+        "%AMT",
+        "%SI1mV",
+        "T",
+        "A/us",
+        "V"
+      ],
+      "advanced": false,
+      "description": "Unit in which StimulationIntensity is expressed (percent of maximum stimulator output, percent of resting/active motor threshold, etc.).",
+      "scope": "file"
+    },
+    {
+      "key": "RestingMotorThreshold",
+      "modalities": [
+        "TMS"
+      ],
+      "group": "parameters",
+      "level": "recommended",
+      "type": "number",
+      "units": "%MSO",
+      "enum": null,
+      "advanced": false,
+      "description": "Resting motor threshold expressed as percent of maximum stimulator output.",
+      "scope": "session"
+    },
+    {
+      "key": "ActiveMotorThreshold",
+      "modalities": [
+        "TMS"
+      ],
+      "group": "parameters",
+      "level": "optional",
+      "type": "number",
+      "units": "%MSO",
+      "enum": null,
+      "advanced": true,
+      "description": "Active motor threshold expressed as percent of maximum stimulator output.",
+      "scope": "session"
+    },
+    {
+      "key": "MotorThresholdMethod",
+      "modalities": [
+        "TMS"
+      ],
+      "group": "parameters",
+      "level": "optional",
+      "type": "string",
+      "units": null,
+      "enum": [
+        "relative-frequency",
+        "adaptive-MLE",
+        "TMS-motor-threshold-assessment-tool",
+        "other"
+      ],
+      "advanced": true,
+      "description": "Procedure used to estimate motor threshold.",
+      "scope": "session"
+    },
+    {
+      "key": "ConditioningStimulusIntensity",
+      "modalities": [
+        "TMS"
+      ],
+      "group": "parameters",
+      "level": "optional",
+      "type": "number",
+      "units": null,
+      "enum": null,
+      "advanced": true,
+      "description": "Paired-pulse conditioning stimulus intensity (units as StimulationIntensityUnits).",
+      "scope": "file"
+    },
+    {
+      "key": "TestStimulusIntensity",
+      "modalities": [
+        "TMS"
+      ],
+      "group": "parameters",
+      "level": "optional",
+      "type": "number",
+      "units": null,
+      "enum": null,
+      "advanced": true,
+      "description": "Paired-pulse test stimulus intensity (units as StimulationIntensityUnits).",
+      "scope": "file"
+    },
+    {
+      "key": "InterPulseInterval",
+      "modalities": [
+        "TMS"
+      ],
+      "group": "parameters",
+      "level": "optional",
+      "type": "number",
+      "units": "ms",
+      "enum": null,
+      "advanced": true,
+      "description": "Interval between conditioning and test pulses in paired-pulse protocols (e.g. SICI, ICF).",
+      "scope": "file"
+    },
+    {
+      "key": "RepetitionRate",
+      "modalities": [
+        "TMS"
+      ],
+      "group": "parameters",
+      "level": "optional",
+      "type": "number",
+      "units": "Hz",
+      "enum": null,
+      "advanced": true,
+      "description": "Pulse repetition rate for repetitive TMS protocols.",
+      "scope": "file"
+    },
+    {
+      "key": "NumberOfPulses",
+      "modalities": [
+        "TMS"
+      ],
+      "group": "parameters",
+      "level": "optional",
+      "type": "integer",
+      "units": null,
+      "enum": null,
+      "advanced": true,
+      "description": "Total number of pulses delivered in the recording/run.",
+      "scope": "file"
+    },
+    {
+      "key": "PulsesPerTrain",
+      "modalities": [
+        "TMS"
+      ],
+      "group": "parameters",
+      "level": "optional",
+      "type": "integer",
+      "units": null,
+      "enum": null,
+      "advanced": true,
+      "description": "Number of pulses per train (repetitive TMS).",
+      "scope": "file"
+    },
+    {
+      "key": "NumberOfTrains",
+      "modalities": [
+        "TMS"
+      ],
+      "group": "parameters",
+      "level": "optional",
+      "type": "integer",
+      "units": null,
+      "enum": null,
+      "advanced": true,
+      "description": "Number of trains delivered (repetitive TMS).",
+      "scope": "file"
+    },
+    {
+      "key": "InterTrainInterval",
+      "modalities": [
+        "TMS"
+      ],
+      "group": "parameters",
+      "level": "optional",
+      "type": "number",
+      "units": "s",
+      "enum": null,
+      "advanced": true,
+      "description": "Interval between trains (repetitive TMS).",
+      "scope": "file"
+    },
+    {
+      "key": "BurstFrequency",
+      "modalities": [
+        "TMS"
+      ],
+      "group": "parameters",
+      "level": "optional",
+      "type": "number",
+      "units": "Hz",
+      "enum": null,
+      "advanced": true,
+      "description": "Within-burst frequency for theta-burst stimulation.",
+      "scope": "file"
+    },
+    {
+      "key": "PulsesPerBurst",
+      "modalities": [
+        "TMS"
+      ],
+      "group": "parameters",
+      "level": "optional",
+      "type": "integer",
+      "units": null,
+      "enum": null,
+      "advanced": true,
+      "description": "Number of pulses per burst for theta-burst stimulation.",
+      "scope": "file"
+    },
+    {
+      "key": "InterStimulusInterval",
+      "modalities": [
+        "TMS"
+      ],
+      "group": "parameters",
+      "level": "optional",
+      "type": "number",
+      "units": "s",
+      "enum": null,
+      "advanced": true,
+      "description": "Nominal interval between successive single pulses in a mapping/MEP block.",
+      "scope": "file"
+    },
+    {
+      "key": "StimulationType",
+      "modalities": [
+        "tES"
+      ],
+      "group": "parameters",
+      "level": "recommended",
+      "type": "string",
+      "units": null,
+      "enum": [
+        "tDCS",
+        "tACS",
+        "tRNS",
+        "tPCS",
+        "other"
+      ],
+      "advanced": false,
+      "description": "Transcranial electrical stimulation sub-type.",
+      "scope": "file"
+    },
+    {
+      "key": "Current",
+      "modalities": [
+        "tES"
+      ],
+      "group": "parameters",
+      "level": "recommended",
+      "type": "number",
+      "units": "mA",
+      "enum": null,
+      "advanced": false,
+      "description": "Applied current amplitude.",
+      "scope": "file"
+    },
+    {
+      "key": "CurrentDensity",
+      "modalities": [
+        "tES"
+      ],
+      "group": "parameters",
+      "level": "optional",
+      "type": "number",
+      "units": "mA/cm^2",
+      "enum": null,
+      "advanced": true,
+      "description": "Current density at the stimulating electrode.",
+      "scope": "file"
+    },
+    {
+      "key": "StimulationDuration",
+      "modalities": [
+        "tES"
+      ],
+      "group": "parameters",
+      "level": "recommended",
+      "type": "number",
+      "units": "s",
+      "enum": null,
+      "advanced": false,
+      "description": "Total duration of stimulation, excluding fade in/out.",
+      "scope": "file"
+    },
+    {
+      "key": "FadeInDuration",
+      "modalities": [
+        "tES"
+      ],
+      "group": "parameters",
+      "level": "optional",
+      "type": "number",
+      "units": "s",
+      "enum": null,
+      "advanced": true,
+      "description": "Ramp-up duration at stimulation onset.",
+      "scope": "file"
+    },
+    {
+      "key": "FadeOutDuration",
+      "modalities": [
+        "tES"
+      ],
+      "group": "parameters",
+      "level": "optional",
+      "type": "number",
+      "units": "s",
+      "enum": null,
+      "advanced": true,
+      "description": "Ramp-down duration at stimulation offset.",
+      "scope": "file"
+    },
+    {
+      "key": "Frequency",
+      "modalities": [
+        "tES"
+      ],
+      "group": "parameters",
+      "level": "optional",
+      "type": "number",
+      "units": "Hz",
+      "enum": null,
+      "advanced": true,
+      "description": "Oscillation frequency for tACS.",
+      "scope": "file"
+    },
+    {
+      "key": "PhaseOffset",
+      "modalities": [
+        "tES"
+      ],
+      "group": "parameters",
+      "level": "optional",
+      "type": "number",
+      "units": "degree",
+      "enum": null,
+      "advanced": true,
+      "description": "Phase offset for tACS, relative to a reference channel or event.",
+      "scope": "file"
+    },
+    {
+      "key": "ElectrodeType",
+      "modalities": [
+        "tES"
+      ],
+      "group": "device",
+      "level": "recommended",
+      "type": "string",
+      "units": null,
+      "enum": [
+        "sponge",
+        "gel",
+        "HD-ring",
+        "rubber",
+        "other"
+      ],
+      "advanced": false,
+      "description": "Type of stimulating electrode.",
+      "scope": "session"
+    },
+    {
+      "key": "ElectrodeSize",
+      "modalities": [
+        "tES"
+      ],
+      "group": "device",
+      "level": "optional",
+      "type": "number",
+      "units": "cm^2",
+      "enum": null,
+      "advanced": true,
+      "description": "Contact area of the stimulating electrode.",
+      "scope": "session"
+    },
+    {
+      "key": "MontageDescription",
+      "modalities": [
+        "tES"
+      ],
+      "group": "targeting",
+      "level": "recommended",
+      "type": "string",
+      "units": null,
+      "enum": null,
+      "advanced": false,
+      "description": "Description of the electrode montage (anode/cathode placement).",
+      "scope": "session"
+    },
+    {
+      "key": "AnodeLocation",
+      "modalities": [
+        "tES"
+      ],
+      "group": "targeting",
+      "level": "optional",
+      "type": "string",
+      "units": null,
+      "enum": null,
+      "advanced": true,
+      "description": "Anode position, e.g. a 10-20 label such as 'C3'.",
+      "scope": "session"
+    },
+    {
+      "key": "CathodeLocation",
+      "modalities": [
+        "tES"
+      ],
+      "group": "targeting",
+      "level": "optional",
+      "type": "string",
+      "units": null,
+      "enum": null,
+      "advanced": true,
+      "description": "Cathode position, e.g. a 10-20 label such as 'Fp2'.",
+      "scope": "session"
+    },
+    {
+      "key": "TransducerModel",
+      "modalities": [
+        "TUS"
+      ],
+      "group": "device",
+      "level": "recommended",
+      "type": "string",
+      "units": null,
+      "enum": null,
+      "advanced": false,
+      "description": "Model of the ultrasound transducer.",
+      "scope": "session"
+    },
+    {
+      "key": "FundamentalFrequency",
+      "modalities": [
+        "TUS"
+      ],
+      "group": "parameters",
+      "level": "recommended",
+      "type": "number",
+      "units": "kHz",
+      "enum": null,
+      "advanced": false,
+      "description": "Carrier (fundamental) frequency of the ultrasound.",
+      "scope": "file"
+    },
+    {
+      "key": "AcousticIntensitySPPA",
+      "modalities": [
+        "TUS"
+      ],
+      "group": "parameters",
+      "level": "optional",
+      "type": "number",
+      "units": "W/cm^2",
+      "enum": null,
+      "advanced": true,
+      "description": "Spatial-peak pulse-average acoustic intensity.",
+      "scope": "file"
+    },
+    {
+      "key": "MechanicalIndex",
+      "modalities": [
+        "TUS"
+      ],
+      "group": "parameters",
+      "level": "optional",
+      "type": "number",
+      "units": null,
+      "enum": null,
+      "advanced": true,
+      "description": "Mechanical index of the sonication.",
+      "scope": "file"
+    },
+    {
+      "key": "PulseRepetitionFrequency",
+      "modalities": [
+        "TUS"
+      ],
+      "group": "parameters",
+      "level": "optional",
+      "type": "number",
+      "units": "Hz",
+      "enum": null,
+      "advanced": true,
+      "description": "Pulse repetition frequency of the sonication.",
+      "scope": "file"
+    },
+    {
+      "key": "DutyCycle",
+      "modalities": [
+        "TUS"
+      ],
+      "group": "parameters",
+      "level": "optional",
+      "type": "number",
+      "units": "%",
+      "enum": null,
+      "advanced": true,
+      "description": "Duty cycle of the sonication.",
+      "scope": "file"
+    },
+    {
+      "key": "SonicationDuration",
+      "modalities": [
+        "TUS"
+      ],
+      "group": "parameters",
+      "level": "recommended",
+      "type": "number",
+      "units": "s",
+      "enum": null,
+      "advanced": false,
+      "description": "Total duration of a sonication.",
+      "scope": "file"
+    },
+    {
+      "key": "TargetRegion",
+      "modalities": [
+        "TMS",
+        "tES",
+        "TUS"
+      ],
+      "group": "targeting",
+      "level": "recommended",
+      "type": "string",
+      "units": null,
+      "enum": null,
+      "advanced": false,
+      "description": "Anatomical/functional target of stimulation (e.g. 'left M1 hand knob', 'left DLPFC').",
+      "scope": "session"
+    },
+    {
+      "key": "TargetingMethod",
+      "modalities": [
+        "TMS",
+        "tES",
+        "TUS"
+      ],
+      "group": "targeting",
+      "level": "recommended",
+      "type": "string",
+      "units": null,
+      "enum": [
+        "neuronavigation",
+        "scalp-heuristic",
+        "EEG-10-20",
+        "function-guided",
+        "fixed-position",
+        "other"
+      ],
+      "advanced": false,
+      "description": "How the stimulation site was located on the head.",
+      "scope": "session"
+    },
+    {
+      "key": "NeuronavigationSystem",
+      "modalities": [
+        "TMS",
+        "TUS"
+      ],
+      "group": "targeting",
+      "level": "optional",
+      "type": "string",
+      "units": null,
+      "enum": null,
+      "advanced": true,
+      "description": "Neuronavigation system used (e.g. 'Localite', 'Brainsight', 'Visor2'). Leave blank if no neuronavigation was used.",
+      "scope": "session"
+    },
+    {
+      "key": "StructuralMRI",
+      "modalities": [
+        "TMS",
+        "TUS"
+      ],
+      "group": "targeting",
+      "level": "optional",
+      "type": "string",
+      "units": null,
+      "enum": null,
+      "advanced": true,
+      "description": "Reference to the structural scan used for neuronavigation (BIDS path or 'template').",
+      "scope": "session"
+    },
+    {
+      "key": "TargetCoordinateSystem",
+      "modalities": [
+        "TMS",
+        "TUS"
+      ],
+      "group": "targeting",
+      "level": "optional",
+      "type": "string",
+      "units": null,
+      "enum": [
+        "MNI152",
+        "scanner",
+        "ACPC",
+        "other"
+      ],
+      "advanced": true,
+      "description": "Coordinate system in which TargetCoordinates are expressed.",
+      "scope": "session"
+    },
+    {
+      "key": "TargetCoordinates",
+      "modalities": [
+        "TMS",
+        "TUS"
+      ],
+      "group": "targeting",
+      "level": "optional",
+      "type": "array",
+      "units": "mm",
+      "enum": null,
+      "advanced": true,
+      "description": "Target location as [x, y, z] in TargetCoordinateSystem.",
+      "scope": "session"
+    },
+    {
+      "key": "CoilOrientation",
+      "modalities": [
+        "TMS"
+      ],
+      "group": "targeting",
+      "level": "optional",
+      "type": "number",
+      "units": "degree",
+      "enum": null,
+      "advanced": true,
+      "description": "Coil handle orientation relative to the mid-sagittal line.",
+      "scope": "session"
+    }
+  ]
+}

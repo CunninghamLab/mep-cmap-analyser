@@ -22,7 +22,10 @@ import re
 import json
 import time
 import queue
+import copy
 import pathlib
+import re as _re
+import copy
 from pathlib import Path
 import datetime
 import threading
@@ -52,6 +55,7 @@ from tkinter import ttk, filedialog, messagebox, simpledialog, scrolledtext, fon
 
 from .compat import _np_trapz
 from .bids import StudyMetadata, _sanitise_bids_label, TOOL_VERSION
+from .bidsify_tab import BidsifyTabMixin
 from .dataset_session import (DatasetSession, FileEntry,
                                STATUS_NOT_STARTED, STATUS_IN_PROGRESS,
                                STATUS_NEEDS_REVIEW, STATUS_COMPLETE,
@@ -68,7 +72,46 @@ from .preferences    import prefs, apply_scaling
 from .stage2         import Stage2Mixin
 from .filter_preview import FilterPreviewMixin
 
-class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
+def _make_bids_prefix(meta_prefix: str, file_stem: str) -> str:
+    """Build a unique, clean BIDS prefix from metadata and source file stem.
+
+    Strategy
+    --------
+    1. No metadata → use file stem as-is.
+    2. File stem is a substring of the metadata prefix → use prefix as-is.
+    3. Strip universally redundant tokens from the stem:
+         - sub-XX / ses-XX  (always encoded in the directory path)
+         - bare noise words: "session", "data", "raw"
+         - "emg" when the stem is BIDS-originated (starts with "sub-")
+    4. Keep only tokens not already present in the metadata prefix
+       (token-level exact match — avoids false positives like "01" matching
+       inside "ses-01").
+    5. No novel tokens → return prefix as-is.
+       Novel tokens exist → append them.
+    """
+    if not meta_prefix:
+        return file_stem
+    if file_stem in meta_prefix:
+        return meta_prefix
+
+    _is_bids_stem = bool(_re.match(r"^sub-", file_stem, _re.I))
+    _NOISE = {"session", "data", "raw"}
+    if _is_bids_stem:
+        _NOISE.add("emg")
+
+    meta_tokens = set(meta_prefix.split("_"))
+    stem_tokens = [t for t in file_stem.split("_")
+                   if not _re.match(r"^(sub|ses)-", t, _re.I)
+                   and t.lower() not in _NOISE]
+
+    novel = [t for t in stem_tokens if t not in meta_tokens]
+
+    if not novel:
+        return meta_prefix
+    return f"{meta_prefix}_{'_'.join(novel)}"
+
+
+class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
     def __init__(self, root):
         self.root = root
         # ── State that setup_gui() widgets depend on — must come first ────────
@@ -92,6 +135,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
         self.derivatives_path   = tk.StringVar()
         self._rawdata_path      = tk.StringVar()
         self._dataset           = None
+        self._bidsify_state      = None
         self._current_file_entry = None
         self._queue_progress_var = tk.StringVar(value="No files loaded")
         # ── Build GUI ─────────────────────────────────────────────────────────
@@ -141,6 +185,9 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
 
                 elif msg == "show-inspector":
                     self._open_inspector_gui(*payload)
+
+                elif msg == "bidsify-convert-done":
+                    self._bidsify_convert_done(payload[0])
 
                 elif msg == "done":
                     # Analysis finished — autosave regardless of whether the
@@ -428,7 +475,20 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
         self.tab2_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.tab2_frame, text="Stage 2 – Group Analysis LME Setup")
         self._stage2_built = False
+
+        # ── BIDS-ify worklist (added last so existing tab indices don't shift) ─
+        self.tab_bidsify = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_bidsify, text="BIDS-ify")
+        self._build_bidsify_tab(self.tab_bidsify)
+
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        # Refresh the BIDS-ify worklist whenever its tab is shown (add=+ so the
+        # existing Stage-2 handler above is preserved).
+        self.notebook.bind(
+            "<<NotebookTabChanged>>",
+            lambda _e: (self._bidsify_tab_refresh()
+                        if self.notebook.select() == str(self.tab_bidsify) else None),
+            add="+")
 
         # ─── User Path & Data States ──────────────────────────────────────────
         self.label_map = {}
@@ -539,7 +599,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
             crop_ranges       = getattr(self, "crop_ranges", None),
             gap_ms_map        = self.gap_ms_map,
             # BIDS
-            study_metadata    = self.study_metadata,
+            study_metadata    = copy.deepcopy(self.study_metadata),
             limb              = getattr(self.study_metadata, "limb", ""),
             measure           = getattr(self.study_metadata, "measure", ""),
             reference_map          = self.reference_map.copy(),
@@ -608,6 +668,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
             csp_n_boot          = self.csp_n_boot.get(),
             csp_max_mep_offset_ms = self.csp_max_mep_offset_ms.get(),
             csp_types           = self.csp_types,
+            enable_auc          = self.enable_auc_global.get(),
         )
         self.root.wait_window(inspector.top)
         self.segments_metadata = dict(inspector.meta)
@@ -810,6 +871,13 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
                                          state="disabled", width=14)
         self.channel_dd.pack(side='left', padx=(4, 0))
         self.channel_dd.bind("<<ComboboxSelected>>", self._on_channel_selected)
+
+        # Event marker dropdown — only enabled when >1 marker type available
+        tk.Label(file_row, text="  Event marker:").pack(side='left')
+        self._marker_dd = ttk.Combobox(file_row, textvariable=self.marker_choice,
+                                        state="disabled", width=16)
+        self._marker_dd.pack(side='left', padx=(4, 0))
+        self._marker_dd.bind("<<ComboboxSelected>>", lambda e: None)
 
         # ─── Filter Parameter Setup (placeholders) ───────────────────────────
         self.apply_filter = tk.BooleanVar(value=True)
@@ -1109,7 +1177,8 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
         tk.Entry(out_frame, textvariable=self.outlier_threshold, width=6).grid(row=0, column=2, sticky='w')
 
         # ─── Analysis Options + Session + Run ─────────────────────────────────
-        self.enable_inspector = tk.BooleanVar(value=True)
+        self.enable_inspector    = tk.BooleanVar(value=True)
+        self.enable_auc_global   = tk.BooleanVar(value=True)
         run_frame = tk.LabelFrame(self.main_frame, text="Analysis Options",
                                   padx=6, pady=6)
         run_frame.pack(padx=6, pady=(10, 0), fill='x')
@@ -1117,6 +1186,8 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
             variable=self.generate_individual_plots).grid(row=0, column=0, sticky='w', padx=4)
         tk.Checkbutton(run_frame, text="Enable Data Inspector",
             variable=self.enable_inspector).grid(row=0, column=1, sticky='w', padx=4)
+        tk.Checkbutton(run_frame, text="Compute AUC",
+            variable=self.enable_auc_global).grid(row=1, column=0, sticky='w', padx=4)
 
         # Log stays in the scrollable area so it expands with content
         tk.Label(self.main_frame, text="Log:").pack(anchor='w', padx=10, pady=(10,0))
@@ -1174,8 +1245,11 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
             meta = getattr(self, 'study_metadata', None)
 
             # ── Build save path ───────────────────────────────────────────────
-            bids_prefix = (meta.bids_prefix() if meta and meta.bids_prefix()
-                           else (pathlib.Path(fp).stem if fp else "mep_cmap"))
+            _file_stem   = pathlib.Path(fp).stem if fp else "mep_cmap"
+            _meta_prefix = meta.bids_prefix() if meta else ""
+            # Delegate to the module-level helper so BIDS-named source files
+            # never produce redundant prefix tokens in the session JSON name.
+            bids_prefix = _make_bids_prefix(_meta_prefix, _file_stem)
 
             source_dir  = os.path.dirname(fp) if fp else os.getcwd()
             deriv_root  = (self.derivatives_path.get()
@@ -1244,6 +1318,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
                 "onset_bigoni_walkback_sd": self.onset_bigoni_walkback_sd.get(),
                 "enable_inspector":      self.enable_inspector.get(),
                 "generate_individual_plots": self.generate_individual_plots.get(),
+                "enable_auc_global":     self.enable_auc_global.get(),
                 "csp_search_start_ms":   self.csp_search_start_ms.get(),
                 "csp_search_end_ms":     self.csp_search_end_ms.get(),
                 "csp_min_silence_ms":    self.csp_min_silence_ms.get(),
@@ -1387,7 +1462,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
         except Exception as e:
             messagebox.showerror("Save failed",str(e),parent=self.root)
 
-    def _apply_loaded_session(self, sess: dict, json_path: str = ""):
+    def _apply_loaded_session(self, sess: dict, json_path: str = "", preserve_file_path: bool = False):
         """
         Apply a loaded session dict to the current GUI state.
         Called by both load_session (user-initiated) and _load_file_entry
@@ -1426,7 +1501,8 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
             return candidate   # best effort — caller handles missing file
 
         fp = _abs(sess.get("file_path", ""))
-        self.file_path.set(fp)
+        if not preserve_file_path:
+            self.file_path.set(fp)
         self.marker_choice.set(sess.get("marker_choice",""))
         self.channel_idx=sess.get("channel_idx",0); self.channel_choice.set(sess.get("channel_choice",""))
         cr=sess.get("crop_ranges"); self.crop_ranges=[tuple(r) for r in cr] if cr else None
@@ -1491,6 +1567,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
                 self.onset_slope_threshold.set(_f("onset_slope_threshold",0.08))
                 self.enable_inspector.set(_b("enable_inspector",True))
                 self.generate_individual_plots.set(_b("generate_individual_plots",True))
+                self.enable_auc_global.set(_b("enable_auc_global",True))
                 self.wide_window_s.set(_f("wide_window_s",3.0))
                 # onset_min_latency_ms / onset_max_latency_ms were removed in v0.8.4
                 # (replaced by per-stim latency_map) — skip silently for old sessions
@@ -1919,9 +1996,13 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
             w.destroy()
 
     def _norm_apply_all(self):
-        """Apply normalisation for all configured pairs."""
+        """Apply normalisation for all configured pairs.
+
+        If either file has multiple stim types, shows a mapping dialog
+        before applying so the user can specify which ref stim type
+        normalises which main stim type.
+        """
         import pandas as _pd
-        import numpy as _np
 
         results = []
         for main_path, ref_path in [(m.get(), r.get())
@@ -1936,122 +2017,279 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
                 results.append(f"⚠️  Not found: {os.path.basename(ref_path)}")
                 continue
             try:
-                msg = self._apply_normalisation_pair(main_path, ref_path)
+                df_main = _pd.read_csv(main_path)
+                df_ref  = _pd.read_csv(ref_path)
+
+                main_stims = sorted(df_main["StimType"].dropna().unique().tolist())                              if "StimType" in df_main.columns else []
+                ref_stims  = sorted(df_ref["StimType"].dropna().unique().tolist())                              if "StimType" in df_ref.columns else []
+
+                # Show mapping dialog when either file has multiple stim types
+                if len(main_stims) > 1 or len(ref_stims) > 1:
+                    stim_map = self._norm_stim_mapping_dialog(
+                        main_stims or ["(all)"],
+                        ref_stims  or ["(all)"],
+                        os.path.basename(main_path),
+                        os.path.basename(ref_path),
+                    )
+                    if stim_map is None:
+                        results.append(f"⏭  {os.path.basename(main_path)}: cancelled")
+                        continue
+                else:
+                    # Single stim type in both — map all to all
+                    stim_map = {(main_stims[0] if main_stims else "(all)"):
+                                (ref_stims[0]  if ref_stims  else "(all)")}
+
+                msg = self._apply_normalisation_pair(
+                    main_path, ref_path, stim_map=stim_map)
                 results.append(msg)
             except Exception as e:
                 results.append(f"❌ {os.path.basename(main_path)}: {e}")
 
         self._norm_log_var.set("\n".join(results))
 
-    def _apply_normalisation_pair(self, main_csv: str, ref_csv: str) -> str:
-        """Apply normalisation from ref_csv to main_csv using the same
-        plateau-detection logic as internal normalisation.
-        Updates Normalised_PTP, Reference_Type, Reference_Mean(mV),
-        Reference_N in the main CSV in-place.
+    def _norm_stim_mapping_dialog(self, main_stims: list, ref_stims: list,
+                                   main_name: str, ref_name: str) -> dict | None:
+        """Show a dialog for mapping main stim types to reference stim types.
+
+        Returns a dict {main_stim: ref_stim} or None if cancelled.
+        ref_stim of None means skip normalisation for that main stim type.
+        """
+        result = {}
+        cancelled = [False]
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Normalisation — Stim Type Mapping")
+        dlg.transient(self.root)
+        dlg.resizable(True, False)
+        dlg.grab_set()
+
+        tk.Label(dlg,
+            text=f"Multiple stimulus types detected. Specify which reference stim type\n"
+                 f"normalises each main stim type. Select 'None' to skip a stim type.\n\n"
+                 f"Main file:      {main_name}\n"
+                 f"Reference file: {ref_name}",
+            justify="left",
+        ).pack(anchor="w", padx=16, pady=(12, 6))
+
+        tbl = tk.Frame(dlg)
+        tbl.pack(fill="x", padx=16, pady=8)
+
+        tk.Label(tbl, text="Main stim type",
+                 font=("TkDefaultFont", 9, "bold"), width=22, anchor="w")            .grid(row=0, column=0, padx=4, pady=2, sticky="w")
+        tk.Label(tbl, text="→", width=3).grid(row=0, column=1)
+        tk.Label(tbl, text="Reference stim type",
+                 font=("TkDefaultFont", 9, "bold"), width=22, anchor="w")            .grid(row=0, column=2, padx=4, pady=2, sticky="w")
+
+        ttk.Separator(tbl, orient="horizontal")            .grid(row=1, column=0, columnspan=3, sticky="ew", pady=4)
+
+        ref_options = ["None"] + ref_stims
+        row_vars = {}
+        for i, ms in enumerate(main_stims):
+            tk.Label(tbl, text=ms, anchor="w", width=22)                .grid(row=i+2, column=0, padx=4, pady=3, sticky="w")
+            tk.Label(tbl, text="→", width=3).grid(row=i+2, column=1)
+            # Default: match by name if possible, else first ref stim
+            default = ms if ms in ref_stims else (ref_stims[0] if ref_stims else "None")
+            v = tk.StringVar(value=default)
+            ttk.Combobox(tbl, textvariable=v, values=ref_options,
+                         state="readonly", width=20)                .grid(row=i+2, column=2, padx=4, pady=3, sticky="w")
+            row_vars[ms] = v
+
+        def _apply():
+            for ms, v in row_vars.items():
+                chosen = v.get()
+                result[ms] = None if chosen == "None" else chosen
+            dlg.destroy()
+
+        def _cancel():
+            cancelled[0] = True
+            dlg.destroy()
+
+        btn_row = tk.Frame(dlg)
+        btn_row.pack(pady=(4, 12))
+        tk.Button(btn_row, text="Apply mapping", width=14,
+                  bg="#5cb85c", fg="white", command=_apply).pack(side="left", padx=6)
+        tk.Button(btn_row, text="Cancel", width=10,
+                  command=_cancel).pack(side="left", padx=6)
+
+        dlg.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width()  - dlg.winfo_width())  // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{x}+{y}")
+        self.root.wait_window(dlg)
+
+        return None if cancelled[0] else result
+
+    def _apply_normalisation_pair(self, main_csv: str, ref_csv: str,
+                                   stim_map: dict | None = None) -> str:
+        """Apply normalisation from ref_csv to main_csv.
+
+        stim_map : {main_stim_type: ref_stim_type} or None.
+            When None, all trials in ref_csv are used as the reference pool.
+            When provided, each main stim type is normalised using only the
+            corresponding ref stim type trials from ref_csv.
+            A ref_stim_type of None means skip that main stim type.
         """
         import pandas as _pd
         import numpy as _np
+        from .normalisation import compute_mmax as _cmmax
 
         df_main = _pd.read_csv(main_csv)
         df_ref  = _pd.read_csv(ref_csv)
 
-        # Get clean reference PTPs (exclude outliers)
-        _ref_ptps = _pd.to_numeric(
-            df_ref.loc[df_ref["Outlier_Decision"] != "Outlier", "PTP(mV)"],
-            errors='coerce').dropna().tolist()
-
-        if not _ref_ptps:
-            return (f"⚠️  {os.path.basename(ref_csv)}: "
-                    f"no clean trials found in reference file")
-
-        # Run the same plateau detection as internal normalisation
-        from .normalisation import compute_mmax as _cmmax
         plateau_tol = self._norm1c_plateau.get() / 100.0
-        _result = _cmmax(_ref_ptps, plateau_tolerance=plateau_tol)
-        ref_mean = _result["mmax"]
-        ref_n    = _result["n_plateau"]
-        ref_type = _result["method"]
-
-        if ref_mean is None or ref_mean <= 0:
-            return (f"⚠️  {os.path.basename(ref_csv)}: "
-                    f"could not compute reference mean")
-
-        # Apply to all clean trials in main file
-        _col_idx = {c: i for i, c in enumerate(df_main.columns)}
-        _ptp_col = "PTP(mV)"
-        _norm_col = "Normalised_PTP"
+        _ptp_col   = "PTP(mV)"
+        _norm_col  = "Normalised_PTP"
         _rtype_col = "Reference_Type"
         _rmean_col = "Reference_Mean(mV)"
         _rn_col    = "Reference_N"
 
-        for col in [_norm_col, _rtype_col, _rmean_col, _rn_col]:
+        for col in [_norm_col, _rtype_col, _rmean_col, _rn_col,
+                    "Normalised_PTP_per_PreStimRMS"]:
             if col not in df_main.columns:
                 df_main[col] = ""
             df_main[col] = df_main[col].astype(object)
 
-        mask = df_main["Outlier_Decision"] != "Outlier"
-        ptps = _pd.to_numeric(df_main.loc[mask, _ptp_col], errors='coerce')
-        df_main.loc[mask, _norm_col]  = (ptps / ref_mean).round(4)
-        df_main.loc[mask, _rtype_col] = ref_type
-        df_main.loc[mask, _rmean_col] = round(ref_mean, 4)
-        df_main.loc[mask, _rn_col]    = ref_n
+        has_stim_col = "StimType" in df_main.columns and "StimType" in df_ref.columns
 
-        df_main.to_csv(main_csv, index=False)
-
-        # Also update the _trials_with_outliers.csv if it exists
-        _with_out = main_csv.replace("_trials.csv", "_trials_with_outliers.csv")
-        if os.path.isfile(_with_out):
-            df_all = _pd.read_csv(_with_out)
-            for col in [_norm_col, _rtype_col, _rmean_col, _rn_col]:
-                if col not in df_all.columns:
-                    df_all[col] = ""
-                df_all[col] = df_all[col].astype(object)
-            _mask_all = df_all["Outlier_Decision"] != "Outlier"
-            _ptps_all = _pd.to_numeric(
-                df_all.loc[_mask_all, _ptp_col], errors='coerce')
-            df_all.loc[_mask_all, _norm_col]  = (_ptps_all / ref_mean).round(4)
-            df_all.loc[_mask_all, _rtype_col] = ref_type
-            df_all.loc[_mask_all, _rmean_col] = round(ref_mean, 4)
-            df_all.loc[_mask_all, _rn_col]    = ref_n
-            df_all.to_csv(_with_out, index=False)
-
-        # ── Update summary files ──────────────────────────────────────────────
-        # Recompute Mean/SD Normalised_PTP from the updated trials data,
-        # grouped by StimType — same logic as pipeline_write_outputs.
         def _update_summary(summary_csv, trials_df):
+            """Recompute normalisation columns in a summary CSV from updated trials data."""
             if not os.path.isfile(summary_csv):
                 return
             df_sum = _pd.read_csv(summary_csv)
-            # Ensure columns exist
             for col in ["Mean_Normalised_PTP", "SD_Normalised_PTP",
-                        "Reference_Type", "Reference_Mean(mV)", "Reference_N"]:
+                        "Reference_Type", "Reference_Mean(mV)", "Reference_N",
+                        "Mean_PTP_per_PreStimRMS", "SD_PTP_per_PreStimRMS",
+                        "Mean_Normalised_PTP_per_PreStimRMS", "SD_Normalised_PTP_per_PreStimRMS"]:
                 if col not in df_sum.columns:
                     df_sum[col] = _np.nan
                 df_sum[col] = df_sum[col].astype(object)
 
             clean = trials_df[trials_df["Outlier_Decision"] != "Outlier"].copy()
-            clean[_norm_col] = _pd.to_numeric(clean[_norm_col], errors='coerce')
+            for col in ["Normalised_PTP", "PTP_per_PreStimRMS",
+                        "Normalised_PTP_per_PreStimRMS",
+                        "Reference_Mean(mV)", "Reference_N"]:
+                if col in clean.columns:
+                    clean[col] = _pd.to_numeric(clean[col], errors='coerce')
 
             for idx, row in df_sum.iterrows():
-                st = row.get("StimType", row.get("Stim_Type", ""))
-                grp = clean[clean["StimType"] == st][_norm_col].dropna()
-                if len(grp) > 0:
-                    df_sum.at[idx, "Mean_Normalised_PTP"] = round(float(grp.mean()), 4)
-                    df_sum.at[idx, "SD_Normalised_PTP"]   = round(float(grp.std(ddof=1)), 4) \
-                                                             if len(grp) > 1 else _np.nan
-                    df_sum.at[idx, "Reference_Type"]      = ref_type
-                    df_sum.at[idx, "Reference_Mean(mV)"]  = round(ref_mean, 4)
-                    df_sum.at[idx, "Reference_N"]         = ref_n
+                st   = row.get("StimType", "")
+                grp  = clean[clean["StimType"] == st] if "StimType" in clean.columns                        else clean
+                if len(grp) == 0:
+                    continue
+                # Normalised_PTP
+                _g = grp["Normalised_PTP"].dropna() if "Normalised_PTP" in grp.columns else _pd.Series(dtype=float)
+                if len(_g) > 0:
+                    df_sum.at[idx, "Mean_Normalised_PTP"] = round(float(_g.mean()), 4)
+                    df_sum.at[idx, "SD_Normalised_PTP"]   = round(float(_g.std(ddof=1)), 4) if len(_g) > 1 else _np.nan
+                # Reference info — take first non-null value
+                for _rc in ["Reference_Type", "Reference_Mean(mV)", "Reference_N"]:
+                    if _rc in grp.columns:
+                        _rv = grp[_rc].dropna()
+                        if len(_rv) > 0:
+                            df_sum.at[idx, _rc] = _rv.iloc[0]
+                # PTP_per_PreStimRMS
+                _g2 = grp["PTP_per_PreStimRMS"].dropna() if "PTP_per_PreStimRMS" in grp.columns else _pd.Series(dtype=float)
+                if len(_g2) > 0:
+                    df_sum.at[idx, "Mean_PTP_per_PreStimRMS"] = round(float(_g2.mean()), 4)
+                    df_sum.at[idx, "SD_PTP_per_PreStimRMS"]   = round(float(_g2.std(ddof=1)), 4) if len(_g2) > 1 else _np.nan
+                # Normalised_PTP_per_PreStimRMS
+                _g3 = grp["Normalised_PTP_per_PreStimRMS"].dropna() if "Normalised_PTP_per_PreStimRMS" in grp.columns else _pd.Series(dtype=float)
+                if len(_g3) > 0:
+                    df_sum.at[idx, "Mean_Normalised_PTP_per_PreStimRMS"] = round(float(_g3.mean()), 4)
+                    df_sum.at[idx, "SD_Normalised_PTP_per_PreStimRMS"]   = round(float(_g3.std(ddof=1)), 4) if len(_g3) > 1 else _np.nan
+
             df_sum.to_csv(summary_csv, index=False)
 
+        if stim_map and has_stim_col:
+            # Per-stim-type normalisation
+            msgs = []
+            for main_st, ref_st in stim_map.items():
+                if ref_st is None:
+                    continue  # user chose to skip this stim type
+
+                # Reference pool: clean trials of ref_st in df_ref
+                ref_mask = (df_ref["StimType"] == ref_st) &                            (df_ref["Outlier_Decision"] != "Outlier")
+                ref_ptps = _pd.to_numeric(
+                    df_ref.loc[ref_mask, _ptp_col], errors='coerce').dropna().tolist()
+
+                if not ref_ptps:
+                    msgs.append(f"⚠️  No clean {ref_st} trials in reference")
+                    continue
+
+                result  = _cmmax(ref_ptps, plateau_tolerance=plateau_tol)
+                ref_mean = result["mmax"]
+                ref_n    = result["n_plateau"]
+                ref_type = result["method"]
+
+                if not ref_mean or ref_mean <= 0:
+                    msgs.append(f"⚠️  Could not compute mean for {ref_st}")
+                    continue
+
+                # Apply to matching main stim type
+                main_mask = (df_main["StimType"] == main_st) &                             (df_main["Outlier_Decision"] != "Outlier")
+                ptps = _pd.to_numeric(df_main.loc[main_mask, _ptp_col], errors='coerce')
+                df_main.loc[main_mask, _norm_col]  = (ptps / ref_mean).round(4)
+                df_main.loc[main_mask, _rtype_col] = ref_type
+                df_main.loc[main_mask, _rmean_col] = round(ref_mean, 4)
+                df_main.loc[main_mask, _rn_col]    = ref_n
+                # Normalised_PTP_per_PreStimRMS
+                if "PreStimRMS" in df_main.columns:
+                    _rms_vals = _pd.to_numeric(df_main.loc[main_mask, "PreStimRMS"], errors="coerce")
+                    _norm_ptp_vals = _pd.to_numeric(df_main.loc[main_mask, _norm_col], errors='coerce')
+                    df_main.loc[main_mask, "Normalised_PTP_per_PreStimRMS"] = \
+                        (_norm_ptp_vals / _rms_vals).round(4)
+                msgs.append(f"✓  {main_st} → {ref_st} (mean {ref_mean:.3f} mV, n={ref_n})")
+
+            df_main.to_csv(main_csv, index=False)
+            # Update summary files
+            _summary_csv_ps      = main_csv.replace("_trials.csv", "_summary.csv")
+            _summary_with_out_ps = main_csv.replace("_trials.csv", "_summary_with_outliers.csv")
+            _update_summary(_summary_csv_ps, df_main)
+            # summary_with_outliers built from same trials df (all rows, clean filtering inside)
+            _update_summary(_summary_with_out_ps, df_main)
+            return f"✅  {os.path.basename(main_csv)}:\n" + "\n".join(f"    {m}" for m in msgs)
+
+        else:
+            # Single pool — use all clean ref trials regardless of stim type
+            ref_mask = df_ref["Outlier_Decision"] != "Outlier"
+            ref_ptps = _pd.to_numeric(
+                df_ref.loc[ref_mask, _ptp_col], errors='coerce').dropna().tolist()
+
+            if not ref_ptps:
+                return (f"⚠️  {os.path.basename(ref_csv)}: "
+                        f"no clean trials found in reference file")
+
+            result   = _cmmax(ref_ptps, plateau_tolerance=plateau_tol)
+            ref_mean = result["mmax"]
+            ref_n    = result["n_plateau"]
+            ref_type = result["method"]
+
+            if ref_mean is None or ref_mean <= 0:
+                return (f"⚠️  {os.path.basename(ref_csv)}: "
+                        f"could not compute reference mean")
+
+            mask = df_main["Outlier_Decision"] != "Outlier"
+            ptps = _pd.to_numeric(df_main.loc[mask, _ptp_col], errors='coerce')
+            df_main.loc[mask, _norm_col]  = (ptps / ref_mean).round(4)
+            df_main.loc[mask, _rtype_col] = ref_type
+            df_main.loc[mask, _rmean_col] = round(ref_mean, 4)
+            df_main.loc[mask, _rn_col]    = ref_n
+            # Normalised_PTP_per_PreStimRMS
+            if "PreStimRMS" in df_main.columns:
+                _rms_vals = _pd.to_numeric(df_main.loc[mask, "PreStimRMS"], errors="coerce")
+                df_main.loc[mask, "Normalised_PTP_per_PreStimRMS"] = \
+                    ((ptps / ref_mean) / _rms_vals).round(4)
+
+            df_main.to_csv(main_csv, index=False)
+
+        # _trials_with_outliers.csv removed — _trials.csv contains all trials
+
+        # ── Update summary files ─────────────────────────────────────────────
         _summary_csv      = main_csv.replace("_trials.csv", "_summary.csv")
         _summary_with_out = main_csv.replace("_trials.csv", "_summary_with_outliers.csv")
-
-        # Use the updated trials data for summary recomputation
         _update_summary(_summary_csv, df_main)
-        if os.path.isfile(_with_out):
-            _update_summary(_summary_with_out,
-                            _pd.read_csv(_with_out))
+        # summary_with_outliers uses same df (all rows, clean filtering inside _update_summary)
+        _update_summary(_summary_with_out, df_main)
 
         return (f"✅ {os.path.basename(main_csv)}: "
                 f"normalised to {ref_type} = {ref_mean:.4f} mV "
@@ -2061,7 +2299,8 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
         """Browse for an external M-wave reference file."""
         path = filedialog.askopenfilename(
             title="Select M-wave reference file",
-            filetypes=[("Spike2 export", "*.txt")],
+            filetypes=[("Data files", "*.txt *.smr *.adibin *.edf *.bdf"),
+                       ("All files", "*.*")],
             parent=self.root)
         if path:
             self.mmax_file.set(path)
@@ -2239,6 +2478,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
         _ctx = tk.Menu(self._queue_tree, tearoff=0)
         _ctx.add_command(label="Load & process", command=lambda: self._queue_on_double_click(None))
         _ctx.add_command(label="Mark as rerun", command=self._queue_mark_rerun)
+        _ctx.add_command(label="🔄  Reset & reprocess from scratch…", command=self._queue_reset_file)
         _ctx.add_separator()
         _ctx.add_command(label="✏️  Rename / audit filename…", command=self._queue_rename_selected)
         _ctx.add_separator()
@@ -2314,7 +2554,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
                 _date  = "—"
 
             _ext = os.path.splitext(fe.path)[1].lower()
-            _ftype = {".txt": "TXT", ".smr": "SMR", ".adibin": "ADIBIN"}.get(_ext, _ext.lstrip(".").upper() or "—")
+            _ftype = {".txt": "TXT", ".smr": "SMR", ".adibin": "ADIBIN", ".edf": "EDF", ".bdf": "BDF"}.get(_ext, _ext.lstrip(".").upper() or "—")
 
             # Tags: (status_tag, raw_bytes_str) — raw bytes used for numeric size sort
             tree.insert("", "end", iid=fe.id,
@@ -2466,6 +2706,117 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
         self._dataset.save()
         self._queue_refresh()
 
+    def _queue_reset_file(self):
+        """Fully reset a file — delete derivatives, sidecars, and all state.
+
+        After reset the file is treated as if it has never been processed.
+        The user can then reconfigure in Stage 1a/1b and re-run from scratch.
+        """
+        import pathlib
+        ids = self._queue_selected_ids()
+        if not ids or self._dataset is None:
+            return
+
+        fids_to_reset = []
+        for fid in ids:
+            fe = self._dataset.get_file(fid)
+            if fe:
+                fids_to_reset.append((fid, fe))
+
+        if not fids_to_reset:
+            return
+
+        names = "\n".join(f"  • {os.path.basename(fe.path)}"
+                           for _, fe in fids_to_reset)
+        confirmed = messagebox.askyesno(
+            "Reset & reprocess",
+            f"This will permanently delete all processed results and sidecar "
+            f"config files for:\n\n{names}\n\n"
+            f"The file(s) will be treated as new. This cannot be undone.\n\n"
+            f"Continue?",
+            icon="warning",
+            parent=self.root,
+        )
+        if not confirmed:
+            return
+
+        deleted, skipped = [], []
+        for fid, fe in fids_to_reset:
+            p = pathlib.Path(fe.path)
+
+            # 1. Delete derivatives JSON (pipeline output)
+            if fe.derivatives_json and os.path.isfile(fe.derivatives_json):
+                try:
+                    os.remove(fe.derivatives_json)
+                    deleted.append(os.path.basename(fe.derivatives_json))
+                except Exception as exc:
+                    skipped.append(f"{os.path.basename(fe.derivatives_json)}: {exc}")
+
+            # 2. Delete any figures associated with this file
+            if fe.derivatives_json:
+                _deriv_dir = os.path.dirname(fe.derivatives_json)
+                _fig_dir   = os.path.join(os.path.dirname(_deriv_dir), "figures")
+                if os.path.isdir(_fig_dir):
+                    import glob as _glob
+                    for _f in _glob.glob(os.path.join(_fig_dir, "*_traces.png")):
+                        try:
+                            os.remove(_f)
+                            deleted.append(os.path.basename(_f))
+                        except Exception:
+                            pass
+
+            # 3. Delete SMR channel assignment sidecar
+            smr_cfg = p.with_suffix(".smr_config.json")
+            if smr_cfg.exists():
+                try:
+                    smr_cfg.unlink()
+                    deleted.append(smr_cfg.name)
+                except Exception as exc:
+                    skipped.append(f"{smr_cfg.name}: {exc}")
+
+            # 4. Delete generic TSV / LabChart TXT wizard sidecar
+            tsv_cfg = p.with_suffix(".tsv_config.json")
+            if tsv_cfg.exists():
+                try:
+                    tsv_cfg.unlink()
+                    deleted.append(tsv_cfg.name)
+                except Exception as exc:
+                    skipped.append(f"{tsv_cfg.name}: {exc}")
+
+            # 5. Reset FileEntry state completely
+            fe.derivatives_json = ""
+            fe.status           = STATUS_NOT_STARTED
+            fe.last_processed   = ""
+            fe.stim_letters     = []
+            fe.stim_label_map   = {}
+            fe.review_flags     = {}
+
+        self._dataset.save()
+        self._queue_refresh()
+
+        # Log summary
+        if deleted:
+            self.log(f"🔄 Reset complete. Deleted: {', '.join(deleted)}")
+        if skipped:
+            self.log(f"⚠️  Could not delete: {'; '.join(skipped)}")
+
+    def _update_marker_dropdown(self):
+        """Refresh the event marker combobox in the active file row."""
+        if not hasattr(self, "_marker_dd"):
+            return
+        markers = self.available_markers or []
+        self._marker_dd["values"] = markers
+        if len(markers) > 1:
+            self._marker_dd.config(state="readonly")
+            # Pre-select current marker_choice if valid, else first
+            if self.marker_choice.get() not in markers:
+                self.marker_choice.set(markers[0])
+        elif len(markers) == 1:
+            self._marker_dd.config(state="disabled")
+            self.marker_choice.set(markers[0])
+        else:
+            self._marker_dd.config(state="disabled")
+
     # ── Filename rename / BIDS audit ──────────────────────────────────────────
 
     # Expected BIDS filename entity pattern:
@@ -2483,7 +2834,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
         re.IGNORECASE,
     )
 
-    _SUPPORTED_EXTENSIONS = {".txt", ".smr", ".adibin"}
+    _SUPPORTED_EXTENSIONS = {".txt", ".smr", ".adibin", ".edf", ".bdf"}
 
     def _audit_filename(self, basename: str) -> list:
         """Return a list of human-readable issue strings for *basename*.
@@ -2493,7 +2844,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
         name, ext = os.path.splitext(basename)
 
         if ext.lower() not in self._SUPPORTED_EXTENSIONS:
-            issues.append(f"Extension '{ext}' — expected .txt, .smr, or .adibin")
+            issues.append(f"Extension '{ext}' — expected .txt, .smr, .adibin, .edf, or .bdf")
 
         parts = name.split("_")
 
@@ -2788,7 +3139,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
                 import json as _json
                 with open(fe.derivatives_json, encoding="utf-8") as fh:
                     sess = _json.load(fh)
-                self._apply_loaded_session(sess, json_path=fe.derivatives_json)
+                self._apply_loaded_session(sess, json_path=fe.derivatives_json, preserve_file_path=True)
                 self.log(f"💾 Restored session — {len(self.segments_metadata)} segment(s) with saved edits")
             except Exception as e:
                 self.log(f"⚠️  Could not restore session: {e}")
@@ -2854,6 +3205,8 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
             return
 
         # Trigger the normal file loading flow
+        # Save restored channel before _browse_file_path resets it
+        self._restored_channel_choice = self.channel_choice.get()
         self._browse_file_path(fe.path, auto_run=auto_run)
 
     def _open_study_folder(self):
@@ -2915,17 +3268,18 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
         EXCLUDE = ("metric_definitions", "metrics_definitions",
                    "channel_info", "_readme")
         import glob as _glob
-        _EXTS = ("*.txt", "*.smr", "*.adibin")
+        _EXTS = ("*.txt", "*.smr", "*.adibin", "*.edf", "*.bdf")
         all_files = []
         for _pat in _EXTS:
             all_files.extend(_glob.glob(os.path.join(raw, "**", _pat), recursive=True))
         files = sorted(
             f for f in all_files
             if not any(p in os.path.basename(f).lower() for p in EXCLUDE)
+            and "sourcedata" not in os.path.normpath(f).lower().split(os.sep)
         )
         if not files:
             messagebox.showinfo("No files found",
-                "No .txt data files found in the raw data folder.",
+                "No data files (.txt, .smr, .adibin, .edf, .bdf) found in the raw data folder.",
                 parent=self.root)
             return
         ds = self._get_or_create_dataset()
@@ -2963,18 +3317,19 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
             "_readme",
         )
         import glob as _glob
-        _EXTS = ("*.txt", "*.smr", "*.adibin")
+        _EXTS = ("*.txt", "*.smr", "*.adibin", "*.edf", "*.bdf")
         all_files = []
         for _pat in _EXTS:
             all_files.extend(_glob.glob(os.path.join(folder, "**", _pat), recursive=True))
         files = sorted(
             f for f in all_files
             if not any(p in os.path.basename(f).lower() for p in EXCLUDE_PATTERNS)
+            and "sourcedata" not in os.path.normpath(f).lower().split(os.sep)
         )
 
         if not files:
             messagebox.showinfo("No files found",
-                "No data files (.txt, .smr, .adibin) found in that folder or its subfolders.\n\n"
+                "No data files (.txt, .smr, .adibin, .edf, .bdf) found in that folder or its subfolders.\n\n"
                 "If your files are in a different format, use '+ Add file(s)' instead.",
                 parent=self.root)
             return
@@ -2997,10 +3352,11 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
         fpaths = filedialog.askopenfilenames(
             title="Select data file(s)",
             filetypes=[
-                ("All supported formats", "*.txt *.smr *.adibin"),
+                ("All supported formats", "*.txt *.smr *.adibin *.edf *.bdf"),
                 ("Spike2 / LabChart text export", "*.txt"),
                 ("Spike2 native", "*.smr"),
                 ("ADInstruments binary", "*.adibin"),
+                ("BIDS EDF/BDF", "*.edf *.bdf"),
                 ("All files", "*.*"),
             ]
         )
@@ -3042,7 +3398,8 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
             import glob as _glob
             _folder = os.path.dirname(fpath)
             _candidates = [
-                f for f in _glob.glob(os.path.join(_folder, "*.txt"))
+                f for _mp in ("*.txt", "*.edf", "*.bdf")
+                for f in _glob.glob(os.path.join(_folder, _mp))
                 if any(kw in os.path.basename(f).lower()
                        for kw in ("mwave","mmax","m-wave","m_wave"))
             ]
@@ -3089,6 +3446,12 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
             self.marker_choice.set('A')
             self.log("📋 ADInstruments binary (CFWB) format — stim times from trigger channel")
 
+        elif _fmt == 'edf':
+            self.marker_choice.set('A')
+            self.log("📋 BIDS EDF/BDF format — stim times from sidecar _events.tsv "
+                     "(or EDF+ annotations)")
+            # stim_events populated later via extract_stim_times in pipeline
+
         elif _fmt == 'spike2_smr':
             self.log("📋 Spike2 SMR format detected — reading via Neo")
             try:
@@ -3124,6 +3487,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
                             stim_options.append(f"[Analogue] {n}")
                     if not stim_options:
                         stim_options = [f"[Analogue] {n}" for n in analogue]
+                    self.available_markers = stim_options
 
                     _chosen = {}
 
@@ -3134,7 +3498,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
                         import tkinter as tk
                         from tkinter import ttk
                         dlg = tk.Toplevel(self.root)
-                        dlg.title("SMR Channel Assignment")
+                        dlg.title("Channel Assignment")
                         dlg.transient(self.root)
                         dlg.resizable(False, False)
                         dlg.grab_set()
@@ -3223,15 +3587,43 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
                         f"   EMG: {_chosen['emg']} | "
                         f"Stim: {_chosen['stim']} — saved to sidecar"
                     )
-                    self.marker_choice.set(_chosen["stim"])
+                    # Set marker_choice to the full prefixed option so
+                    # _update_marker_dropdown finds it in the list
+                    _bare = _chosen["stim"]
+                    _full = next(
+                        (o for o in stim_options
+                         if o.endswith(f"] {_bare}") or o == _bare),
+                        _bare
+                    )
+                    self.marker_choice.set(_full)
+                    self.available_markers = stim_options
 
                 else:
                     cfg = _smr_load_cfg(fpath)
                     stim_ch = cfg.get("stim_channel", "A")
-                    # Set marker_choice to the stim CHANNEL name so that
-                    # stim_types_found decodes all codes from the channel.
-                    # No picker needed — all codes are passed to Stage 1a.
-                    self.marker_choice.set(stim_ch)
+                    # Rebuild stim_options from file info for the marker dropdown
+                    info = _smr_info(fpath)
+                    _events  = info.get("events",  [])
+                    _epochs  = info.get("epochs",  [])
+                    _spikes  = info.get("spikes",  [])
+                    _analogue = info.get("analogue", [])
+                    stim_options = []
+                    for n in _events:  stim_options.append(f"[Event] {n}")
+                    for n in _epochs:  stim_options.append(f"[DigMark/Epoch] {n}")
+                    for n in _spikes:  stim_options.append(f"[Spike] {n}")
+                    _STIM_KW = ("stim", "trig", "ttl", "digmark")
+                    for n in _analogue:
+                        if any(kw in n.lower() for kw in _STIM_KW):
+                            stim_options.append(f"[Analogue] {n}")
+                    if not stim_options:
+                        stim_options = [f"[Analogue] {n}" for n in _analogue]
+                    # Find the full prefixed option matching the saved stim channel
+                    _matched = next(
+                        (o for o in stim_options if o.endswith(f"] {stim_ch}") or o == stim_ch),
+                        stim_ch
+                    )
+                    self.marker_choice.set(_matched)
+                    self.available_markers = stim_options
                     self.log(
                         f"   EMG: {cfg.get('emg_channel')} | "
                         f"Stim channel: {stim_ch} — loaded from sidecar"
@@ -3269,57 +3661,117 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
                 return
 
             if len(marker_set) > 1:
+                self.available_markers = sorted(marker_set)
                 self._ask_marker_gui(sorted(marker_set))
             elif marker_set:
+                self.available_markers = sorted(marker_set)
                 self.marker_choice.set(next(iter(marker_set)))
         
         # ── populate inline channel dropdown
         chan_list = list_waveform_channels(fpath)
         self._populate_channel_dropdown(chan_list)
+        # Restore previously saved channel — use _restored_channel_choice
+        # which is set by _load_file_entry before calling _browse_file_path,
+        # since _populate_channel_dropdown resets to index 0.
+        _saved_ch = getattr(self, '_restored_channel_choice', None)                     or self.channel_choice.get()
+        if _saved_ch and _saved_ch in chan_list:
+            self.channel_var.set(_saved_ch)
+            self.channel_idx = chan_list.index(_saved_ch)
+            self.channel_choice.set(_saved_ch)
+        self._restored_channel_choice = None  # clear after use
+        self._update_marker_dropdown()
 
-        # ── prompt channel selection if more than one channel available
-        if len(chan_list) > 1:
-            # Show a dropdown dialog rather than a text entry
-            dlg = tk.Toplevel(self.root)
-            dlg.title("Select channel")
-            dlg.transient(self.root)
-            dlg.resizable(False, False)
-            dlg.grab_set()
+        # ── Unified channel + event marker assignment dialog (Spike2 text exports only)
+        # SMR files have their own dialog. Generic TSV/LabChart/CFWB use the
+        # Format Wizard or have no event marker concept — exclude them here.
+        markers = self.available_markers or []
+        _needs_assign_dlg = (
+            _fmt not in ('spike2_smr', 'generic_tsv', 'labchart', 'cfwb')
+            and (len(chan_list) > 1 or len(markers) > 1)
+        )
+        if _needs_assign_dlg:
+            _chosen = {}
 
-            tk.Label(dlg, text="Select the EMG channel to analyse:",
-                     padx=16, pady=(10)).pack()
+            def _show_assign_dlg(
+                _chan_list=chan_list,
+                _markers=markers,
+            ):
+                import tkinter as _tk
+                from tkinter import ttk as _ttk
+                dlg = _tk.Toplevel(self.root)
+                dlg.title("Channel Assignment")
+                dlg.transient(self.root)
+                dlg.resizable(False, False)
+                dlg.grab_set()
 
-            chosen_var = tk.StringVar(value=chan_list[0])
-            cb = ttk.Combobox(dlg, textvariable=chosen_var,
-                              values=chan_list, state="readonly", width=28)
-            cb.pack(padx=16, pady=6)
-            cb.current(0)
+                _tk.Label(
+                    dlg,
+                    text=(
+                        f"File: {os.path.basename(fpath)}\n\n"
+                        "Choose the EMG channel and the event/marker source.\n"
+                        "Your choices are saved and will not be asked again."
+                    ),
+                    justify="left",
+                ).pack(anchor="w", padx=16, pady=(12, 6))
 
-            def _ok():
-                dlg.destroy()
-            def _cancel():
-                chosen_var.set("")
-                dlg.destroy()
+                frm = _tk.Frame(dlg, padx=16, pady=8)
+                frm.pack(fill="x")
 
-            btn_row = tk.Frame(dlg)
-            btn_row.pack(pady=(0, 10))
-            tk.Button(btn_row, text="OK", width=10,
-                      command=_ok).pack(side='left', padx=6)
-            tk.Button(btn_row, text="Cancel", width=10,
-                      command=_cancel).pack(side='left', padx=6)
+                # EMG channel row (only show if >1 channel)
+                emg_var = _tk.StringVar(value=chan_list[0] if chan_list else "")
+                if len(_chan_list) > 1:
+                    _tk.Label(frm, text="EMG channel:", anchor="w", width=22)                        .grid(row=0, column=0, sticky="w", pady=6)
+                    _ttk.Combobox(frm, textvariable=emg_var,
+                                  values=_chan_list, state="readonly", width=28)                        .grid(row=0, column=1, sticky="w")
 
-            # Centre over main window
-            self.root.update_idletasks()
-            dlg.update_idletasks()
-            x = self.root.winfo_x() + (self.root.winfo_width() - dlg.winfo_width()) // 2
-            y = self.root.winfo_y() + (self.root.winfo_height() - dlg.winfo_height()) // 2
-            dlg.geometry(f"+{x}+{y}")
-            self.root.wait_window(dlg)
+                # Event marker row (only show if >1 marker)
+                _cur_marker = self.marker_choice.get()
+                stim_var = _tk.StringVar(
+                    value=_cur_marker if _cur_marker in _markers else
+                    (next((m for m in _markers if "DigMark" in m), _markers[0])
+                     if _markers else ""))
+                if len(_markers) > 1:
+                    _tk.Label(frm, text="Event/marker source:", anchor="w", width=22)                        .grid(row=1, column=0, sticky="w", pady=6)
+                    _ttk.Combobox(frm, textvariable=stim_var,
+                                  values=_markers, state="readonly", width=28)                        .grid(row=1, column=1, sticky="w")
 
-            chosen = chosen_var.get()
-            if chosen and chosen in chan_list:
-                self.channel_var.set(chosen)
-                self.channel_idx = chan_list.index(chosen)
+                _tk.Label(
+                    frm,
+                    text="Tip: Event channels use timestamps directly.\n"
+                         "Analogue channels use threshold-crossing detection.",
+                    fg="grey", justify="left",
+                ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+                def _save():
+                    _chosen["emg"]  = emg_var.get()
+                    _chosen["stim"] = stim_var.get()
+                    dlg.destroy()
+
+                def _cancel_dlg():
+                    dlg.destroy()
+
+                btn_r = _tk.Frame(dlg)
+                btn_r.pack(pady=(4, 12))
+                _tk.Button(btn_r, text="Save & continue", width=14,
+                           command=_save).pack(side="left", padx=6)
+                _tk.Button(btn_r, text="Cancel", width=10,
+                           command=_cancel_dlg).pack(side="left", padx=6)
+
+                self.root.update_idletasks()
+                dlg.update_idletasks()
+                x = self.root.winfo_x() + (self.root.winfo_width()  - dlg.winfo_width())  // 2
+                y = self.root.winfo_y() + (self.root.winfo_height() - dlg.winfo_height()) // 2
+                dlg.geometry(f"+{x}+{y}")
+                self.root.wait_window(dlg)
+
+            _show_assign_dlg()
+
+            if _chosen.get("emg") and _chosen["emg"] in chan_list:
+                self.channel_var.set(_chosen["emg"])
+                self.channel_idx = chan_list.index(_chosen["emg"])
+            if _chosen.get("stim"):
+                self.marker_choice.set(_chosen["stim"])
+                self.available_markers = markers
 
         # All channels available in inspector extra channel dropdown
         self.extra_channel_indices = list(range(len(chan_list)))
@@ -3434,6 +3886,31 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
             if stim_types_found:
                 self.log(f"   Marker codes in range: {', '.join(sorted(stim_types_found))}")
 
+        elif _fmt == 'edf':
+            # BIDS EDF/BDF: stim types come from the sidecar _events.tsv
+            # (or EDF+ annotations) — read the actual trial types present so the
+            # labels tab matches what the pipeline will produce.
+            try:
+                _all_stim = extract_stim_times(fpath, self.marker_choice.get())
+            except Exception as _e:
+                self.log(f"   ⚠️  Could not read events: {_e}")
+                _all_stim = {}
+            if self.crop_ranges:
+                stim_types_found = {
+                    stype for stype, times in _all_stim.items()
+                    if any(start <= t <= end
+                           for t in times for start, end in self.crop_ranges)
+                } or set(_all_stim.keys())
+            elif self.crop_start is not None and self.crop_end is not None:
+                stim_types_found = {
+                    stype for stype, times in _all_stim.items()
+                    if any(self.crop_start <= t <= self.crop_end for t in times)
+                } or set(_all_stim.keys())
+            else:
+                stim_types_found = set(_all_stim.keys())
+            if not stim_types_found:
+                stim_types_found = {self.marker_choice.get() or 'A'}
+
         elif self.crop_ranges:
             stim_types_found = {
                 stype for stype, times in stim_events.items()
@@ -3464,7 +3941,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
         """
         name   = pathlib.Path(fpath).stem
         result = {'participant_id': '', 'session': '', 'task': '',
-                  'timepoint': '', 'limb': '', 'measure': ''}
+                  'timepoint': '', 'limb': '', 'measure': '', 'acq': ''}
         for part in name.split('_'):
             pl = part.lower()
             if   pl.startswith('sub-'):     result['participant_id'] = part
@@ -3473,6 +3950,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
             elif pl.startswith('tp-'):      result['timepoint']      = part[3:]
             elif pl.startswith('limb-'):    result['limb']           = part[5:]
             elif pl.startswith('measure-'): result['measure']        = part[8:]
+            elif pl.startswith('acq-'):     result['acq']            = part[4:]
         return result
 
     def prompt_study_metadata(self, context: str = ""):
@@ -3488,6 +3966,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
         v_tp      = tk.StringVar(value=parsed['timepoint']      or carry.timepoint)
         v_limb    = tk.StringVar(value=parsed['limb']           or getattr(carry, 'limb', ''))
         v_measure = tk.StringVar(value=parsed['measure']        or getattr(carry, 'measure', ''))
+        v_acq     = tk.StringVar(value=parsed['acq']            or getattr(carry, 'acq',     ''))
         v_rem     = tk.BooleanVar(value=self._remembered_meta is not None)
 
         win = tk.Toplevel(self.root)
@@ -3523,11 +4002,12 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
         _row(3, "Limb",              v_limb, "e.g.  left / right  (auto-detected)")
         _row(4, "Task label",        v_task, "e.g.  fatigue  (optional)")
         _row(5, "Timepoint",         v_tp,   "e.g.  pre / post  (optional)")
+        _row(6, "Acquisition / Cond.", v_acq,  "e.g.  cond-rest  or  cond-30  (optional)")
 
         # Measure type — dropdown of common TMS paradigms
-        tk.Label(win, text="Measure type").grid(row=6+_row_offset, column=0, sticky="e", **pad)
+        tk.Label(win, text="Measure type").grid(row=7+_row_offset, column=0, sticky="e", **pad)
         measure_frame = tk.Frame(win)
-        measure_frame.grid(row=6+_row_offset, column=1, columnspan=2, sticky="w")
+        measure_frame.grid(row=7+_row_offset, column=1, columnspan=2, sticky="w")
         _measure_choices = ['CSE', 'SICI', 'ICF', 'LICI', 'SAI', 'LAI', 'M-wave', 'CMEP', 'Other']
         measure_cb = ttk.Combobox(measure_frame, textvariable=v_measure,
                                   values=_measure_choices, width=10)
@@ -3536,10 +4016,10 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
                  fg="grey", font=("TkDefaultFont", 8)).pack(side="left", padx=(6,0))
 
         tk.Checkbutton(win, text="Remember these settings for the next file",
-                       variable=v_rem)          .grid(row=7+_row_offset, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 2))
+                       variable=v_rem)          .grid(row=8+_row_offset, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 2))
 
         err_lbl = tk.Label(win, text="", fg="red")
-        err_lbl.grid(row=8+_row_offset, column=0, columnspan=3, sticky="w", padx=10)
+        err_lbl.grid(row=9+_row_offset, column=0, columnspan=3, sticky="w", padx=10)
 
         def _save(_e=None):
             raw_sub = v_sub.get().strip()
@@ -3557,6 +4037,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
 
             limb    = _sanitise_bids_label(v_limb.get()).lower()    if v_limb.get().strip()    else ""
             measure = _sanitise_bids_label(v_measure.get())         if v_measure.get().strip() else ""
+            acq     = _sanitise_bids_label(v_acq.get())             if v_acq.get().strip()     else ""
             self.study_metadata = StudyMetadata(
                 participant_id = sub,
                 session        = ses,
@@ -3564,6 +4045,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
                 timepoint      = tp,
                 limb           = limb,
                 measure        = measure,
+                acq            = acq,
             )
             self._remembered_meta = self.study_metadata if v_rem.get() else None
             win.destroy()
@@ -3584,6 +4066,67 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin):
         win.geometry(f"+{px+(pw-w)//2}+{py+(ph-h)//2}")
         win.grab_set()
         self.root.wait_window(win)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # BIDS-ify — shared helpers used by the BIDS-ify tab (bidsify_tab.py)
+    # ──────────────────────────────────────────────────────────────────────────
+    def _show_bidsify_preview(self, plan) -> bool:
+        """Modal dry-run preview. Returns True if the user clicks Proceed."""
+        win = tk.Toplevel(self.root)
+        win.title("BIDS-ify — preview (dry run)")
+        win.transient(self.root)
+        tk.Label(win,
+                 text="Review the plan below. Nothing is written until you click Proceed.",
+                 fg="#d9534f", font=("TkDefaultFont", 9, "bold")).pack(
+                 anchor="w", padx=10, pady=(10, 4))
+        txt = scrolledtext.ScrolledText(win, width=104, height=24, wrap="none")
+        txt.pack(fill="both", expand=True, padx=10, pady=4)
+        txt.insert("1.0", plan.preview_text())
+        txt.config(state="disabled")
+
+        result = {"go": False}
+        btns = tk.Frame(win)
+        btns.pack(fill="x", pady=8)
+
+        def _go():
+            result["go"] = True
+            win.destroy()
+
+        tk.Button(btns, text="Proceed", bg="#5cb85c", fg="white",
+                  font=("TkDefaultFont", 9, "bold"),
+                  command=_go).pack(side="right", padx=(0, 10))
+        tk.Button(btns, text="Cancel",
+                  command=win.destroy).pack(side="right", padx=(0, 6))
+
+        win.update_idletasks()
+        px, py = self.root.winfo_rootx(), self.root.winfo_rooty()
+        pw, ph = self.root.winfo_width(), self.root.winfo_height()
+        w, h = win.winfo_width(), win.winfo_height()
+        win.geometry(f"+{px + (pw - w) // 2}+{py + (ph - h) // 2}")
+        win.grab_set()
+        self.root.wait_window(win)
+        return result["go"]
+
+    def _bidsify_done_gui(self, results):
+        """Summarise a finished BIDS-ify run (runs on the main thread)."""
+        ok = sum(1 for r in results if getattr(r, "ok", False))
+        fail = len(results) - ok
+        msg = f"BIDS-ify complete: {ok} succeeded, {fail} failed."
+        self.log(msg)
+
+        problems = []
+        for r in results:
+            if not getattr(r, "ok", False):
+                why = (getattr(r, "error", "")
+                       or "; ".join(getattr(r, "discrepancies", []))
+                       or "unknown error")
+                problems.append(f"• {os.path.basename(r.source_path)}: {why}")
+        if problems:
+            messagebox.showwarning(
+                "BIDS-ify",
+                msg + "\n\nProblems:\n" + "\n".join(problems), parent=self.root)
+        else:
+            messagebox.showinfo("BIDS-ify", msg, parent=self.root)
 
     def browse_derivatives_folder(self):
         """Let the user choose where the derivatives/ root lives."""

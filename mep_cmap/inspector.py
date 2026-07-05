@@ -12,7 +12,6 @@ import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.widgets import SpanSelector
 import tkinter as tk
 from tkinter import ttk, scrolledtext
 
@@ -95,6 +94,76 @@ class DraggablePoint:
         self.update_cb(idx_new)
         self.point.figure.canvas.draw_idle()
 
+
+class DraggableLine:
+    """
+    A draggable vertical line on a matplotlib axes.
+    Only responds to clicks within pick_radius_ms of the line —
+    clicking elsewhere has no effect whatsoever.
+    On release, snaps to nearest sample and fires update_cb(new_idx).
+    """
+    def __init__(self, ax, time_axis, idx0, update_cb,
+                 color="tab:blue", lw=1.8, ls="--", pick_radius_ms=4.0):
+        self.ax          = ax
+        self.t           = time_axis
+        self.idx         = idx0
+        self.update_cb   = update_cb
+        self.pick_radius = pick_radius_ms
+        self._dragging   = False
+        self.line = ax.axvline(time_axis[idx0], color=color,
+                               lw=lw, ls=ls, alpha=0.9, zorder=4)
+        canvas = ax.figure.canvas
+        self._cids = [
+            canvas.mpl_connect("button_press_event",   self._on_press),
+            canvas.mpl_connect("motion_notify_event",  self._on_motion),
+            canvas.mpl_connect("button_release_event", self._on_release),
+        ]
+
+    def remove(self):
+        canvas = self.ax.figure.canvas
+        for cid in self._cids:
+            try: canvas.mpl_disconnect(cid)
+            except Exception: pass
+        try: self.line.remove()
+        except Exception: pass
+
+    def set_idx(self, new_idx):
+        """Move line programmatically without firing update_cb."""
+        self.idx = new_idx
+        self.line.set_xdata([self.t[new_idx], self.t[new_idx]])
+
+    def _on_press(self, event):
+        if event.inaxes is not self.ax or event.xdata is None:
+            return
+        try:
+            tb = self.ax.figure.canvas.toolbar
+            if tb is not None and tb.mode != '':
+                return
+        except Exception:
+            pass
+        if abs(event.xdata - self.t[self.idx]) <= self.pick_radius:
+            self._dragging = True
+
+    def _on_motion(self, event):
+        if not self._dragging or event.inaxes is not self.ax:
+            return
+        if event.xdata is None:
+            return
+        self.line.set_xdata([event.xdata, event.xdata])
+        self.ax.figure.canvas.draw_idle()
+
+    def _on_release(self, event):
+        if not self._dragging:
+            return
+        self._dragging = False
+        if event.xdata is None:
+            return
+        new_idx = int(np.argmin(np.abs(self.t - event.xdata)))
+        self.idx = new_idx
+        self.line.set_xdata([self.t[new_idx], self.t[new_idx]])
+        self.update_cb(new_idx)
+        self.ax.figure.canvas.draw_idle()
+
 class DataInspectorWindow:
     """
     Interactive reviewer for single-trial EMG segments.
@@ -127,6 +196,7 @@ class DataInspectorWindow:
                  onset_bootstrap_crit=1.96, onset_bootstrap_n=500,
                  onset_bigoni_smooth_ms=0.5, onset_bigoni_min_run_ms=0.5,
                  onset_bigoni_walkback_sd=1.0,
+                 enable_auc=True,
                  csp_search_start_ms=40, csp_search_end_ms=400,
                  csp_min_silence_ms=25, csp_min_return_ms=40,
                  csp_criterion=1.96, csp_significance=0.99,
@@ -161,6 +231,7 @@ class DataInspectorWindow:
         self.onset_bigoni_smooth_ms    = onset_bigoni_smooth_ms
         self.onset_bigoni_min_run_ms   = onset_bigoni_min_run_ms
         self.onset_bigoni_walkback_sd  = onset_bigoni_walkback_sd
+        self._enable_auc_global        = enable_auc
         self.csp_search_start_ms  = csp_search_start_ms
         self.csp_search_end_ms    = csp_search_end_ms
         self.csp_min_silence_ms   = csp_min_silence_ms
@@ -230,7 +301,7 @@ class DataInspectorWindow:
         self.btn_bar.pack(pady=(0, 6))
 
         self.enable_silent = tk.BooleanVar(value=True)
-        self.enable_auc    = tk.BooleanVar(value=True)   # AUC on by default
+        self.enable_auc    = tk.BooleanVar(value=enable_auc)
         self.exclude_var = tk.BooleanVar(value=False)
         self.note_enable_var = tk.BooleanVar(value=True)
 
@@ -238,9 +309,17 @@ class DataInspectorWindow:
                     variable=self.enable_silent,
                     command=self._on_silent_toggle).pack(side="left", padx=10)
 
+        def _on_auc_toggle():
+            key = (self.cur_type, self.cur_idx)
+            self.meta.setdefault(key, {})["auc_enabled"] = self.enable_auc.get()
+            self._plot()
+        # (auc_enabled is restored in _plot from segment metadata)
         tk.Checkbutton(self.btn_bar, text="AUC selector",
                     variable=self.enable_auc,
-                    command=self._plot).pack(side="left")
+                    command=_on_auc_toggle).pack(side="left")
+        self.link_onset_auc = tk.BooleanVar(value=True)
+        tk.Checkbutton(self.btn_bar, text="🔗 Link onset → AUC",
+                    variable=self.link_onset_auc).pack(side="left", padx=(8, 0))
 
         tk.Checkbutton(self.btn_bar, text="Exclude this segment",
                     variable=self.exclude_var,
@@ -284,6 +363,10 @@ class DataInspectorWindow:
         self.note_box.pack(fill="x", padx=10, pady=(4, 6))
         self.note_box_is_shown = True
 
+        # --------- keyboard navigation ----------------------------------
+        self.top.bind("<Right>", lambda e: self._next())
+        self.top.bind("<Left>",  lambda e: self._prev())
+
         # --------- close ------------------------------------------------
         self.btn_row = tk.Button(self.top, text="Save edits & close",
                          width=20,
@@ -294,9 +377,9 @@ class DataInspectorWindow:
         self.cur_idx  = 0
         self.dd_event.current(0)
 
-        # Span selector and fill collections (on main plot)
-        self._auc_span = None
-        self._auc_fill = []
+        # AUC draggable lines and fill shading
+        self._auc_lines = []   # [DraggableLine start, DraggableLine end]
+        self._auc_fill  = []
 
         # Maximise the inspector window on open — gives the most room for
         # the figure and makes marker placement much easier.
@@ -352,9 +435,41 @@ class DataInspectorWindow:
     # ---------------------------------------------------------------- helper
     def _update_meta(self, field, new_idx):
         key = (self.cur_type, self.cur_idx)
-        self.meta.setdefault(key, {})[field] = new_idx
+        m   = self.meta.setdefault(key, {})
+        m[field] = new_idx
+        # When onset moves and link is active, sync AUC start line to match
+        if field == "onset_idx" \
+                and getattr(self, "link_onset_auc", None) \
+                and self.link_onset_auc.get() \
+                and self.enable_auc.get():
+            m["auc_start_idx"] = new_idx
+            if self._auc_lines:
+                self._auc_lines[0].set_idx(new_idx)
+                self._redraw_auc_fill(m)
         self._refresh_status()
     
+    def _redraw_auc_fill(self, m):
+        """Redraw fill_between shading for current AUC window."""
+        for fc in self._auc_fill:
+            try: fc.remove()
+            except Exception: pass
+        self._auc_fill = []
+        a0 = m.get("auc_start_idx")
+        a1 = m.get("auc_end_idx")
+        if a0 is None or a1 is None or a0 >= a1:
+            self.canvas.draw_idle()
+            return
+        seg = self.segments[self.cur_type][self.cur_idx]
+        t_win   = self.t[a0:a1]
+        emg_win = seg[a0:a1]
+        self._auc_fill.append(self.ax_raw.fill_between(
+            t_win, 0, emg_win, where=(emg_win >= 0),
+            alpha=0.35, color="tab:blue", zorder=2))
+        self._auc_fill.append(self.ax_raw.fill_between(
+            t_win, 0, emg_win, where=(emg_win < 0),
+            alpha=0.35, color="tab:blue", zorder=2))
+        self.canvas.draw_idle()
+
     def _ylab(self, base="EMG"):
             return f"{base} ({self.emg_unit})" if self.emg_unit else base
     
@@ -467,8 +582,9 @@ class DataInspectorWindow:
             # Not yet attempted — checkbox will be set after detection below.
             self.enable_silent.set(False)
 
-        # ---------- sync “exclude” & note widgets ---------------------------
+        # ---------- sync “exclude”, AUC & note widgets ----------------------
         self.exclude_var.set(m.get('exclude', False))
+        self.enable_auc.set(m.get('auc_enabled', self._enable_auc_global))
 
         # note‑box follow‑through
         note_txt = m.get('note', '')
@@ -716,73 +832,71 @@ class DataInspectorWindow:
         self.ax_raw.legend(loc="upper right", fontsize=12, frameon=False)
         self.fig._draggables = self._dpts
 
-        # ---------- AUC selector on main plot --------------------------------
-        # Remove any previous fill patches
+        # ---------- AUC selector — two DraggableLines ----------------------
+        # Remove previous fill and lines
         for _fc in self._auc_fill:
             try: _fc.remove()
             except Exception: pass
         self._auc_fill = []
+        for _dl in self._auc_lines:
+            try: _dl.remove()
+            except Exception: pass
+        self._auc_lines = []
 
         show_auc = self.enable_auc.get()
-        if not show_auc:
-            if self._auc_span is not None:
-                self._auc_span.set_visible(False)
-                self._auc_span = None
-        else:
-            def _draw_auc_fill(a0, a1):
-                for _fc in self._auc_fill:
-                    try: _fc.remove()
-                    except Exception: pass
-                self._auc_fill = []
-                t_win   = self.t[a0:a1]
-                emg_win = emg[a0:a1]
-                fc_pos = self.ax_raw.fill_between(
-                    t_win, 0, emg_win,
-                    where=(emg_win >= 0),
-                    alpha=0.35, color="tab:blue", zorder=2)
-                fc_neg = self.ax_raw.fill_between(
-                    t_win, 0, emg_win,
-                    where=(emg_win < 0),
-                    alpha=0.35, color="tab:blue", zorder=2)
-                self._auc_fill = [fc_pos, fc_neg]
-                self.canvas.draw_idle()
+        if show_auc:
+            # Ensure AUC window exists — default onset → cSP or onset+50ms
+            if "auc_start_idx" not in m and "onset_idx" in m:
+                a0 = int(m["onset_idx"])
+                a1 = int(m.get("silent_start_idx",
+                               min(len(self.t) - 1,
+                                   a0 + int(50 * fs / 1000))))
+                m["auc_start_idx"] = a0
+                m["auc_end_idx"]   = a1
 
             if "auc_start_idx" in m and "auc_end_idx" in m:
-                _draw_auc_fill(m["auc_start_idx"], m["auc_end_idx"])
+                # Draw initial fill
+                self._redraw_auc_fill(m)
 
-            def _auc_cb(x0, x1):
-                i0, i1 = sorted((
-                    int(np.argmin(np.abs(self.t - x0))),
-                    int(np.argmin(np.abs(self.t - x1)))
-                ))
-                m["auc_start_idx"] = i0
-                m["auc_end_idx"]   = i1
-                _draw_auc_fill(i0, i1)
-                self._refresh_status()
+                def _on_start_moved(new_idx):
+                    """AUC start line dragged."""
+                    end_idx = m.get("auc_end_idx", new_idx + 1)
+                    new_idx = max(0, min(new_idx, end_idx - 1))
+                    m["auc_start_idx"] = new_idx
+                    if self._auc_lines:
+                        self._auc_lines[0].set_idx(new_idx)
+                    # Sync onset if linked
+                    if getattr(self, "link_onset_auc", None)                             and self.link_onset_auc.get():
+                        m["onset_idx"] = new_idx
+                        for dp in self._dpts:
+                            if dp.role == "onset_idx":
+                                dp.idx = new_idx
+                                dp.point.set_offsets(
+                                    [[self.t[new_idx], emg[new_idx]]])
+                                break
+                        self.canvas.draw()
+                    self._redraw_auc_fill(m)
+                    self._refresh_status()
 
-            def _auc_change_cb(span):
-                x0, x1 = span.extents
-                i0, i1 = sorted((
-                    int(np.argmin(np.abs(self.t - x0))),
-                    int(np.argmin(np.abs(self.t - x1)))
-                ))
-                m["auc_start_idx"] = i0
-                m["auc_end_idx"]   = i1
-                _draw_auc_fill(i0, i1)
-                self._refresh_status()
+                def _on_end_moved(new_idx):
+                    """AUC end line dragged."""
+                    start_idx = m.get("auc_start_idx", 0)
+                    new_idx = max(start_idx + 1,
+                                  min(new_idx, len(self.t) - 1))
+                    m["auc_end_idx"] = new_idx
+                    if len(self._auc_lines) >= 2:
+                        self._auc_lines[1].set_idx(new_idx)
+                    self._redraw_auc_fill(m)
+                    self._refresh_status()
 
-            self._auc_span = SpanSelector(
-                self.ax_raw, _auc_cb, "horizontal",
-                useblit=False,
-                props=dict(alpha=0.0, facecolor="tab:blue"),
-                interactive=True,
-                drag_from_anywhere=True,
-                onmove_callback=_auc_change_cb,
-            )
-
-            if "auc_start_idx" in m and "auc_end_idx" in m:
-                self._auc_span.extents = (self.t[m["auc_start_idx"]],
-                                          self.t[m["auc_end_idx"]])
+                self._auc_lines = [
+                    DraggableLine(self.ax_raw, self.t,
+                                  m["auc_start_idx"], _on_start_moved,
+                                  color="tab:blue", lw=1.8, ls="--"),
+                    DraggableLine(self.ax_raw, self.t,
+                                  m["auc_end_idx"],   _on_end_moved,
+                                  color="tab:cyan",  lw=1.8, ls="--"),
+                ]
 
         # ---------- figure geometry ------------------------------------------
         # AUC selector now lives on the main plot — no second subplot.

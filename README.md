@@ -1,7 +1,8 @@
 # MEP-CMAP Analyser
 
 **Version 1.2 | August 2026**  
-*Author: Justin Andrushko PhD, Northumbria University*
+*Author: Justin Andrushko PhD, Northumbria University*  
+*Collaborators: [David Cunningham PhD](https://fescenter.org/team/investigators/cunningham-david-phd/) ([TMS Analysis ToolBox](https://github.com/CunninghamLab/TMSAnalysisToolBox)) · [Nicholas Holmes PhD](https://www.birmingham.ac.uk/staff/profiles/sportex/holmes-nick) · [TMSMultiLab](https://github.com/TMSMultiLab/TMSMultiLab/wiki)*
 
 [![PyPI version](https://badge.fury.io/py/mep-cmap-analyser.svg)](https://pypi.org/project/mep-cmap-analyser/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/jandrushko/mep-cmap-analyser/blob/main/LICENSE)

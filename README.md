@@ -1,6 +1,6 @@
 # MEP-CMAP Analyser
 
-**Version 1.2 | August 2026**  
+**Version 1.2.1 | August 2026**  
 *Author: Justin Andrushko PhD, Northumbria University*  
 *Collaborators: [David Cunningham PhD](https://fescenter.org/team/investigators/cunningham-david-phd/) ([TMS Analysis ToolBox](https://github.com/CunninghamLab/TMSAnalysisToolBox)) · [Nicholas Holmes PhD](https://www.birmingham.ac.uk/staff/profiles/sportex/holmes-nick) · [TMSMultiLab](https://github.com/TMSMultiLab/TMSMultiLab/wiki)*
 
@@ -455,7 +455,7 @@ The optional Rust extension `mep_cmap_io` provides accelerated I/O for the Spike
 
 If you use MEP-CMAP Analyser in published research, please cite:
 
-> Andrushko, J.W. (2026). MEP-CMAP Analyser (Version 1.2) [Software].
+> Andrushko, J.W. (2026). MEP-CMAP Analyser (Version 1.2.1) [Software].
 > Northumbria University. https://github.com/jandrushko/mep-cmap-analyser
 
 ---

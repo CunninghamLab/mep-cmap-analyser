@@ -21,8 +21,14 @@ jobs:
       - name: Build
         run: pyinstaller MEP_CMAP_Windows.spec --clean
       - name: Zip
-        run: Compress-Archive -Path "dist\MEP-CMAP Analyser" -DestinationPath MEP-CMAP_Analyser_Windows.zip
         shell: pwsh
+        run: |
+          # Zip whatever folder PyInstaller produced in dist/ (name may carry
+          # the version, e.g. "MEP-CMAP Analyser v1.2"), so a version bump never
+          # breaks this step again.
+          $folder = Get-ChildItem -Path dist -Directory | Select-Object -First 1
+          if (-not $folder) { throw "No build folder found in dist/" }
+          Compress-Archive -Path $folder.FullName -DestinationPath MEP-CMAP_Analyser_Windows.zip -Force
       - uses: actions/upload-artifact@v4
         with:
           name: windows-build

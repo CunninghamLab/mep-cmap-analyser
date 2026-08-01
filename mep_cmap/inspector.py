@@ -204,7 +204,7 @@ class DataInspectorWindow:
                  csp_max_mep_offset_ms=40,
                  latency_map=None,
                  csp_types=None, analysis_pre_ms=None,
-                 extra_segs=None, wide_window_s=3.0):
+                 extra_segs=None, wide_window_s=3.0, underlays=None):
 
         # --------- book-keeping -----------------------------------------
         self.top = tk.Toplevel(master)
@@ -246,6 +246,9 @@ class DataInspectorWindow:
         # extra_segs: {chan_name: {stim_type: [wide_seg_array]}}
         self._extra_segs          = extra_segs or {}
         self._wide_window_s       = wide_window_s
+        # Averaged-mode individual traces to underlay behind the mean:
+        # {stim_type: ndarray[n_trials, L]}. Empty on the normal path.
+        self._underlays           = underlays or {}
         self._extra_axes          = []   # subplot axes for extra channels
         # Pre-populate silent period state from caller-specified csp_types.
         # Types in csp_types start ticked; all others start unticked.
@@ -789,6 +792,17 @@ class DataInspectorWindow:
                 m['auc_start_idx'] = int(m['onset_idx'])
                 m['auc_end_idx']   = int(_csp_end_for_auc)
         self.ax_raw.clear()
+        # ---------- averaged-mode underlays (guarded) --------------------
+        # Draw the individual clean traces faintly behind the mean so the
+        # user can judge the average's quality. When no underlays were
+        # supplied (the normal per-trial path) this is skipped entirely and
+        # the plot is byte-for-byte unchanged.
+        _underlay = self._underlays.get(self.cur_type) if self._underlays else None
+        if _underlay is not None:
+            for _utr in _underlay:
+                if len(_utr) == len(self.t):
+                    self.ax_raw.plot(self.t, _utr, color=colour,
+                                     lw=0.4, alpha=0.20, zorder=1)
         self.ax_raw.plot(self.t, emg, color=colour, lw=1)
         self.ax_raw.axvline(0, color="k", ls="--")
         # Limit x-axis to the visible window even if segment has more pre-stim

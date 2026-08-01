@@ -68,7 +68,7 @@ from .filters import adaptive_mains_cancel
 from .detection import detect_mep_onset_peak_fraction
 from .inspector import DataInspectorWindow
 from .pipeline       import run_pipeline
-from .preferences    import prefs, apply_scaling
+from .preferences    import prefs, apply_scaling, accent_button_kw
 from .stage2         import Stage2Mixin
 from .filter_preview import FilterPreviewMixin
 
@@ -388,8 +388,17 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         # so we use a custom style with anchor="center" on the tab area.
         _nb_style = ttk.Style()
         _nb_style.configure("Centered.TNotebook", tabposition="n")
-        _nb_style.configure("Centered.TNotebook.Tab", anchor="center", padding=[20, 4])
+        _nb_style.configure("Centered.TNotebook.Tab", anchor="center", padding=[22, 7])
         self.notebook.configure(style="Centered.TNotebook")
+        # Sub-level notebooks (Setup ▸ …, Stage 1 ▸ …): visually secondary —
+        # tighter tabs and a tinted strip so the two tab rows read as different
+        # levels. (Tab background colours honour the theme; the size contrast is
+        # the reliable cue on native Windows themes.)
+        _nb_style.configure("Sub.TNotebook", background="#c9d3de")
+        _nb_style.configure("Sub.TNotebook.Tab", padding=[12, 2])
+        _nb_style.map("Sub.TNotebook.Tab",
+                      background=[("selected", "#f4f7fa"), ("!selected", "#c9d3de")],
+                      foreground=[("selected", "#123a5e"), ("!selected", "#333333")])
 
         # ── Derivatives status bar ─────────────────────────────────────────────
         # Persistent strip below tabs: red when unset, green when set.
@@ -397,98 +406,106 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         self._deriv_status_bar = tk.Label(
             self.root,
             text="⚠  Derivatives folder not set — File → Set Derivatives Folder",
-            bg="#d9534f", fg="white",
+            **accent_button_kw("red"),
             anchor="w", padx=10, pady=3,
-            font=("TkDefaultFont", 9))
+            font="TkDefaultFont")
         self._deriv_status_bar.pack(fill="x")
         self._deriv_status_bar.bind(
             "<Button-1>", lambda e: self.browse_derivatives_folder())
 
-        # ── Session tab (index 0) ──────────────────────────────────────────────
-        self.tab_session = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_session, text="Dataset Setup")
+        # ══ Top-level notebook: Setup | Stage 1: Single File | Stage 2: Group Level
+        # self.notebook (created above) is now the TOP notebook holding three
+        # groups. "Setup" and "Stage 1" each contain a sub-notebook; "Stage 2"
+        # holds its content directly.
+
+        # ── "Setup" group ──────────────────────────────────────
+        self.setup_outer = ttk.Frame(self.notebook)
+        self.notebook.add(self.setup_outer, text="Setup")
+        self.nb_setup = ttk.Notebook(self.setup_outer, style="Sub.TNotebook")
+        self.nb_setup.pack(fill="both", expand=True)
+
+        self.tab_session = ttk.Frame(self.nb_setup)
+        self.nb_setup.add(self.tab_session, text="Dataset")
         self._build_session_tab(self.tab_session)
 
-        # ── Stage 1a: Labels & Analysis Setup (index 1) ───────────────────────
-        self.tab1b_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab1b_frame, text="Stage 1a – Labels & Analysis Setup")
+        self.tab_bidsify = ttk.Frame(self.nb_setup)
+        self.nb_setup.add(self.tab_bidsify, text="BIDS-ify")
+        self._build_bidsify_tab(self.tab_bidsify)
+
+        # ── "Stage 1: Single File" group ──────────────────────────
+        self.stage1_outer = ttk.Frame(self.notebook)
+        self.notebook.add(self.stage1_outer, text="First Level: Single File")
+        # Persistent header — active file / channel / marker, visible on every
+        # Stage 1 sub-tab (populated by setup_gui()).
+        self._stage1_header = ttk.Frame(self.stage1_outer)
+        self._stage1_header.pack(side="top", fill="x")
+        ttk.Separator(self.stage1_outer, orient="horizontal").pack(side="top", fill="x")
+        self.nb_stage1 = ttk.Notebook(self.stage1_outer, style="Sub.TNotebook")
+        self.nb_stage1.pack(fill="both", expand=True)
+
+        # Stage 1a — Labels & Analysis Setup
+        self.tab1b_frame = ttk.Frame(self.nb_stage1)
+        self.nb_stage1.add(self.tab1b_frame, text="1a – Labels & Analysis Setup")
         self._labels_tab_built = False
         self._labels_tab_confirmed = False
 
-        # ── Stage 1b: Single File Processing (index 2) ────────────────────────
-        tab1_outer = ttk.Frame(self.notebook)
-        self.notebook.add(tab1_outer, text="Stage 1b – Single File Processing")
+        # Stage 1b — Data Filtering  (Filter Settings; body populated by setup_gui)
+        self.tab_filter = ttk.Frame(self.nb_stage1)
+        self.nb_stage1.add(self.tab_filter, text="1b – Data Filtering")
+        self._filter_body, self.canvas_filter = self._make_scroll_body(self.tab_filter)
 
-        # Fixed footer — packed FIRST (before canvas) so it stays pinned
-        # at the bottom regardless of scroll position.
-        self.footer_frame = tk.Frame(tab1_outer, bd=1, relief="raised")
+        # Stage 1c — Feature Detection Setup  (detection/analysis + Run footer)
+        self.tab_detect = ttk.Frame(self.nb_stage1)
+        self.nb_stage1.add(self.tab_detect, text="1c – Feature Detection Setup")
+        # Fixed footer (▶ Run Analysis) pinned at the bottom of 1c
+        self.footer_frame = tk.Frame(self.tab_detect, bd=1, relief="raised")
         self.footer_frame.pack(side="bottom", fill="x")
+        self._detect_body, self.canvas_detect = self._make_scroll_body(self.tab_detect)
 
-        # Scrollable area fills the remaining space above the footer
-        scroll_area = ttk.Frame(tab1_outer)
-        scroll_area.pack(side="top", fill="both", expand=True)
-
-        vscroll = ttk.Scrollbar(scroll_area, orient="vertical")
-        vscroll.pack(side="right", fill="y")
-
-        self.canvas = tk.Canvas(scroll_area, bd=0, highlightthickness=0,
-                                yscrollcommand=vscroll.set)
-        self.canvas.pack(side="left", fill="both", expand=True)
-        vscroll.config(command=self.canvas.yview)
-
-        self.main_frame = ttk.Frame(self.canvas)
-        self._canvas_window = self.canvas.create_window(
-            (0, 0), window=self.main_frame, anchor="nw")
-
-        # Re-centre content whenever the canvas is resized.
-        # Content is capped at 860px wide so it doesn't stretch awkwardly
-        # on large monitors, then centred in the available space.
-        MAX_CONTENT_W = 1100
-        def _on_canvas_resize(event):
-            cw = event.width
-            content_w = min(cw, MAX_CONTENT_W)
-            x = max(0, (cw - content_w) // 2)
-            self.canvas.itemconfigure(self._canvas_window, width=content_w)
-            self.canvas.coords(self._canvas_window, x, 0)
-        self.canvas.bind("<Configure>", _on_canvas_resize)
-
-        self.main_frame.bind(
-            "<Configure>",
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        )
+        # setup_gui() builds the Filter section into the 1b body, then swaps
+        # self.main_frame to the 1c body for the detection/analysis sections + Run.
+        self.main_frame = self._filter_body
 
         def _on_mousewheel(event):
-            # Only scroll when Stage 1b processing tab is active (index 2)
-            if self.notebook.index(self.notebook.select()) == 2:
-                delta = event.delta if event.delta else (-120 if event.num == 5 else 120)
-                self.canvas.yview_scroll(int(-delta / 120), "units")
+            # Scroll whichever processing body (1b or 1c) is currently on screen.
+            for _cv in (self.canvas_filter, self.canvas_detect):
+                if _cv.winfo_ismapped():
+                    delta = event.delta if event.delta else (-120 if event.num == 5 else 120)
+                    _cv.yview_scroll(int(-delta / 120), "units")
+                    break
         for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-            self.canvas.bind_all(seq, _on_mousewheel)
+            self.tab_detect.bind_all(seq, _on_mousewheel)
 
-        # ── Stage 1c: Normalisation — Optional (index 3) ─────────────────────
-        self.tab1c_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab1c_frame,
-                          text="Stage 1c – Normalisation (optional)")
+        # Stage 1c — Normalisation (optional)
+        self.tab1c_frame = ttk.Frame(self.nb_stage1)
+        self.nb_stage1.add(self.tab1c_frame, text="1d – Normalisation (optional)")
         self._build_normalisation_tab()
 
-        # ── Stage 2: Group Analysis (index 4) ────────────────────────────────
-        self.tab2_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab2_frame, text="Stage 2 – Group Analysis LME Setup")
+        # Add-ons
+        self.tab_addons = ttk.Frame(self.nb_stage1)
+        self.nb_stage1.add(self.tab_addons, text="Add-ons")
+        self._build_addons_tab(self.tab_addons)
+
+        # ── "Stage 2: Group Level" group (no sub-tabs) ─────────────────
+        self.stage2_outer = ttk.Frame(self.notebook)
+        self.notebook.add(self.stage2_outer, text="Second Level: Group")
+        self.nb_stage2 = ttk.Notebook(self.stage2_outer, style="Sub.TNotebook")
+        self.nb_stage2.pack(fill="both", expand=True)
+        # Group Analysis (LME) sub-tab — content built lazily on first visit
+        self.tab2_frame = ttk.Frame(self.nb_stage2)
+        self.nb_stage2.add(self.tab2_frame, text="Group Analysis (LME)")
         self._stage2_built = False
+        # Group-level (second-level) Add-ons sub-tab
+        self.tab_group_addons = ttk.Frame(self.nb_stage2)
+        self.nb_stage2.add(self.tab_group_addons, text="Add-ons")
+        self._build_group_addons_tab(self.tab_group_addons)
 
-        # ── BIDS-ify worklist (added last so existing tab indices don't shift) ─
-        self.tab_bidsify = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_bidsify, text="BIDS-ify")
-        self._build_bidsify_tab(self.tab_bidsify)
-
-        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
-        # Refresh the BIDS-ify worklist whenever its tab is shown (add=+ so the
-        # existing Stage-2 handler above is preserved).
-        self.notebook.bind(
-            "<<NotebookTabChanged>>",
-            lambda _e: (self._bidsify_tab_refresh()
-                        if self.notebook.select() == str(self.tab_bidsify) else None),
-            add="+")
+        # ── Tab-change dispatch (widget-identity; bound to every notebook) ──
+        # One handler fires on any tab change in any notebook and refreshes
+        # whatever just became visible (Stage 2 lazy build, BIDS-ify worklist,
+        # Add-ons rescan) using winfo_ismapped() — no fragile tab indices.
+        for _nb in (self.notebook, self.nb_setup, self.nb_stage1, self.nb_stage2):
+            _nb.bind("<<NotebookTabChanged>>", self._on_tab_changed, add="+")
 
         # ─── User Path & Data States ──────────────────────────────────────────
         self.label_map = {}
@@ -520,10 +537,11 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                 not getattr(self, "_labels_tab_confirmed", False):
             messagebox.showwarning(
                 "Setup not confirmed",
-                "Please go to the 'Stage 1b – Labels & Analysis Setup' tab "
+                "Please go to the '1a – Labels & Analysis Setup' tab "
                 "and click  ✔ Confirm Setup  before running analysis.",
                 parent=self.root)
-            self.notebook.select(self.tab1b_frame)
+            self.notebook.select(self.stage1_outer)
+            self.nb_stage1.select(self.tab1b_frame)
             return
         # Guard: prevent launching a second worker while one is already running.
         if getattr(self, '_analysis_running', False):
@@ -587,9 +605,12 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             onset_bigoni_min_run_ms  = self.onset_bigoni_min_run_ms.get(),
             onset_bigoni_walkback_sd = self.onset_bigoni_walkback_sd.get(),
             latency_map           = dict(self.latency_map),
+            onset_anchor          = self.onset_anchor.get(),
+            onset_anchor_halfwidth_ms = self.onset_anchor_halfwidth.get(),
 
             # misc
             enable_inspector  = self.enable_inspector.get(),
+            average_mode      = self.average_mode.get(),
             channel_idx       = self.channel_idx,
             label_map         = self.label_map.copy(),
             color_map         = self.color_map.copy(),
@@ -629,7 +650,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
     # ──────────────────────────────────────────────────────────────
     def _open_inspector_gui(self, segments_dict, fs, pre_ms, post_ms,
                             unit, label_map, color_map, analysis_pre_ms=None,
-                            extra_segs=None, wide_window_s=3.0):
+                            extra_segs=None, wide_window_s=3.0, auto_meta=None, underlays=None):
         """GUI thread – open the Inspector, block until closed.
         pre_ms here is the analysis/extraction pre-stim (prestim_ms, e.g. 100ms).
         visible_pre_ms is the display window (pre_time, e.g. 20ms).
@@ -638,11 +659,17 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         time_axis = np.linspace(-pre_ms, post_ms, n, endpoint=False)
         _analysis_pre  = analysis_pre_ms if analysis_pre_ms is not None else pre_ms
         _visible_pre   = self.pre_time.get()  # display window only
+        # Single source of truth: start from the anchored auto-onset seed, then
+        # layer any previously saved edits on top so a resumed session shows the
+        # final result (manual edits win per field). A fresh start (empty saved
+        # metadata) therefore shows the pure auto onsets.
+        _seed = {k: dict(v) for k, v in (auto_meta or {}).items()}
+        for _k, _m in getattr(self, 'segments_metadata', {}).items():
+            _seed.setdefault(_k, {}).update(_m)
         inspector = DataInspectorWindow(
             self.root, segments_dict, time_axis,
-            # Seed with any previously stored metadata so notes, AUC windows
-            # and manual marker positions survive re-runs within the same session.
-            metadata_dict       = dict(getattr(self, 'segments_metadata', {})),
+            # Seed = anchored auto onsets, overlaid with saved manual edits.
+            metadata_dict       = _seed,
             label_map=label_map, color_map=color_map, emg_unit=unit,
             ptp_start_ms        = self.ptp_start.get(),
             ptp_end_ms          = self.ptp_end.get(),
@@ -669,6 +696,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             csp_max_mep_offset_ms = self.csp_max_mep_offset_ms.get(),
             csp_types           = self.csp_types,
             enable_auc          = self.enable_auc_global.get(),
+            underlays           = underlays or {},
         )
         self.root.wait_window(inspector.top)
         self.segments_metadata = dict(inspector.meta)
@@ -680,7 +708,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
 
     def _show_inspector_cb(self, segments_dict, fs, pre_ms, post_ms,
                         unit, label_map, color_map, analysis_pre_ms=None,
-                        extra_segs=None, wide_window_s=3.0):
+                        extra_segs=None, wide_window_s=3.0, auto_meta=None, underlays=None):
         """
         Called by the worker thread.  Sends a message to the GUI thread and waits.
         Returns the inspector's metadata dict.
@@ -688,7 +716,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         self.msg_q.put(("show-inspector",
                         segments_dict, fs, pre_ms, post_ms,
                         unit, label_map, color_map, analysis_pre_ms,
-                        extra_segs, wide_window_s))
+                        extra_segs, wide_window_s, auto_meta, underlays))
         while self._last_outlier_result is None:
             time.sleep(0.05)
         meta = self._last_outlier_result
@@ -767,6 +795,8 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                 onset_bigoni_min_run_ms  = params.get("onset_bigoni_min_run_ms",  0.5),
                 onset_bigoni_walkback_sd = params.get("onset_bigoni_walkback_sd", 1.0),
                 latency_map          = params.get("latency_map", {}),
+                onset_anchor         = params.get("onset_anchor", False),
+                onset_anchor_halfwidth_ms = params.get("onset_anchor_halfwidth_ms", 8.0),
                 csp_types            = params.get("csp_types", set()),
                 csp_min_silence_ms   = params.get("csp_min_silence_ms", 25.0),
                 csp_min_return_ms    = params.get("csp_min_return_ms", 40.0),
@@ -778,6 +808,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                 existing_segments_metadata = dict(self.segments_metadata),
 
                 enable_inspector     = params["enable_inspector"],
+                average_mode         = params["average_mode"],
                 channel_idx          = params["channel_idx"],
                 custom_labels        = params["label_map"],
                 color_map            = params["color_map"],
@@ -843,6 +874,9 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         settings_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Settings", menu=settings_menu)
         settings_menu.add_command(label="Preferences...", command=self._open_preferences)
+        settings_menu.add_separator()
+        settings_menu.add_command(label="Check for updates\u2026",
+                                  command=self._check_for_updates)
 
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=help_menu)
@@ -855,11 +889,36 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         help_menu.add_separator()
         help_menu.add_command(label="About", command=self._show_about)
 
+    def _make_scroll_body(self, parent, max_content_w=1100):
+        """Create a vertically-scrollable, width-capped, centred body frame inside
+        `parent`. Returns (body_frame, canvas). Used for the 1b/1c processing bodies."""
+        scroll_area = ttk.Frame(parent)
+        scroll_area.pack(side="top", fill="both", expand=True)
+        vscroll = ttk.Scrollbar(scroll_area, orient="vertical")
+        vscroll.pack(side="right", fill="y")
+        canvas = tk.Canvas(scroll_area, bd=0, highlightthickness=0,
+                           yscrollcommand=vscroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vscroll.config(command=canvas.yview)
+        body = ttk.Frame(canvas)
+        win = canvas.create_window((0, 0), window=body, anchor="nw")
+        def _resize(event):
+            content_w = min(event.width, max_content_w)
+            x = max(0, (event.width - content_w) // 2)
+            canvas.itemconfigure(win, width=content_w)
+            canvas.coords(win, x, 0)
+        canvas.bind("<Configure>", _resize)
+        body.bind("<Configure>",
+                  lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        return body, canvas
+
     def setup_gui(self):
         # ─── Input File + Channel (single compact row) ──────────────────────
         # ── Active file indicator ─────────────────────────────────────────────
-        file_row = tk.Frame(self.main_frame)
-        file_row.pack(fill='x', padx=10, pady=(10, 0))
+        # Active-file row lives in the persistent Stage 1 header so it stays
+        # visible across all Stage 1 sub-tabs (not inside a scrolled body).
+        file_row = tk.Frame(self._stage1_header)
+        file_row.pack(fill='x', padx=10, pady=(8, 8))
         tk.Label(file_row, text="Active file:").pack(side='left')
 
         tk.Entry(file_row, textvariable=self.file_path, width=56,
@@ -908,6 +967,9 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         self.onset_bigoni_smooth_ms   = tk.DoubleVar(value=prefs.onset_bigoni_smooth_ms)
         self.onset_bigoni_min_run_ms  = tk.DoubleVar(value=prefs.onset_bigoni_min_run_ms)
         self.onset_bigoni_walkback_sd = tk.DoubleVar(value=prefs.onset_bigoni_walkback_sd)
+        # Onset search-window anchoring (per-run detection config; not a global pref)
+        self.onset_anchor             = tk.BooleanVar(value=False)
+        self.onset_anchor_halfwidth   = tk.DoubleVar(value=8.0)
         self.pre_time = tk.IntVar(value=20)
         self.post_time = tk.IntVar(value=400)
         self.ptp_start = tk.IntVar(value=10)
@@ -1060,6 +1122,19 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         self.toggle_bp_order_fields()
         self.toggle_notch_fields()
 
+        # ── Confirm-and-advance button on the Data Filtering (1b) tab ─────────
+        _filt_bar = tk.Frame(self.main_frame)
+        _filt_bar.pack(fill="x", padx=6, pady=(12, 6))
+        tk.Button(_filt_bar,
+                  text="\u2714  Confirm filter settings  \u2192  Feature Detection",
+                  **accent_button_kw("green"),
+                  command=lambda: self.nb_stage1.select(self.tab_detect)
+                  ).pack(anchor="w")
+
+        # ── Split point: the Filter section above lives on 1b (Data Filtering);
+        # everything below builds into the 1c (Feature Detection Setup) body. ──
+        self.main_frame = self._detect_body
+
         # ─── Time + Onset Settings ─────────────────────────────────────────────────
         # ── Time Window + MEP Onset Detection ──────────────────────────────────
         # Redesigned as 4-column grid, split into two logical sub-sections:
@@ -1099,8 +1174,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         # ── Separator ────────────────────────────────────────────────────────
         ttk.Separator(time_frame, orient="horizontal").grid(
             row=3, column=0, columnspan=4, sticky='ew', pady=(8, 4))
-        tk.Label(time_frame, text="MEP Onset Detection",
-                 font=("TkDefaultFont", 9, "bold")).grid(
+        tk.Label(time_frame, text="MEP Onset Detection").grid(
             row=3, column=0, columnspan=4, sticky='w', padx=6)
 
         # ── Sub-section: Onset Detection ─────────────────────────────────────
@@ -1142,6 +1216,17 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             command=_open_detection_prefs, cursor="hand2"
         ).grid(row=4, column=3, sticky='w', padx=6, pady=(2, 4))
 
+        # Onset search-window anchoring (median-waveform seed)
+        tk.Checkbutton(
+            time_frame,
+            text="Anchor onset search window to sample-median onset",
+            variable=self.onset_anchor
+        ).grid(row=5, column=0, columnspan=3, sticky='w', padx=6, pady=(0, 4))
+        tk.Label(time_frame, text="Window ± (ms):").grid(
+            row=5, column=3, sticky='e', padx=(6, 2), pady=(0, 4))
+        tk.Entry(time_frame, textvariable=self.onset_anchor_halfwidth, width=5).grid(
+            row=5, column=3, sticky='w', padx=(96, 6), pady=(0, 4))
+
         # ─── CSP Detection Settings ────────────────────────────────────────────────
         csp_frame = tk.LabelFrame(self.main_frame,
             text="CSP (Cortical Silent Period) Detection Settings", padx=6, pady=8)
@@ -1162,10 +1247,15 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         tk.Entry(csp_frame, textvariable=self.csp_n_boot, width=7).grid(row=3,column=1,sticky='w')
         tk.Label(csp_frame, text="Max offset from MEP 2nd peak (ms):").grid(row=3,column=2,sticky='e',padx=6)
         tk.Entry(csp_frame, textvariable=self.csp_max_mep_offset_ms, width=5).grid(row=3,column=3,sticky='w')
-        tk.Label(csp_frame,
+        _csp_help = tk.Label(csp_frame,
             text="Z-score: threshold multiplier (1.96 = 95% CI)  ·  Significance: bootstrap percentile for min duration (0.99 = 99th pct)  ·  "
                  "Max offset: cSP start must fall within this many ms after the 2nd MEP peak (prevents unrealistic late placements)",
-            fg="grey",font=("TkDefaultFont",9,"italic")).grid(row=4,column=0,columnspan=4,sticky='w',padx=6,pady=(2,0))
+            fg="grey", justify="left", wraplength=1000)
+        _csp_help.grid(row=4,column=0,columnspan=4,sticky='w',padx=6,pady=(2,0))
+        # Wrap the footnote to the frame's width so it never forces the grid wider
+        # than the visible area (which was clipping the right-hand column).
+        csp_frame.bind("<Configure>",
+                       lambda e, _l=_csp_help: _l.configure(wraplength=max(300, e.width - 24)))
 
         # ─── Outlier Detection ─────────────────────────────────────────────────
         out_frame = tk.LabelFrame(self.main_frame, text="Outlier Detection Settings",
@@ -1179,6 +1269,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         # ─── Analysis Options + Session + Run ─────────────────────────────────
         self.enable_inspector    = tk.BooleanVar(value=True)
         self.enable_auc_global   = tk.BooleanVar(value=True)
+        self.average_mode        = tk.BooleanVar(value=False)
         run_frame = tk.LabelFrame(self.main_frame, text="Analysis Options",
                                   padx=6, pady=6)
         run_frame.pack(padx=6, pady=(10, 0), fill='x')
@@ -1188,6 +1279,8 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             variable=self.enable_inspector).grid(row=0, column=1, sticky='w', padx=4)
         tk.Checkbutton(run_frame, text="Compute AUC",
             variable=self.enable_auc_global).grid(row=1, column=0, sticky='w', padx=4)
+        tk.Checkbutton(run_frame, text="Analyse average waveform per event type",
+            variable=self.average_mode).grid(row=1, column=1, sticky='w', padx=4)
 
         # Log stays in the scrollable area so it expands with content
         tk.Label(self.main_frame, text="Log:").pack(anchor='w', padx=10, pady=(10,0))
@@ -1316,7 +1409,10 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                 "onset_bigoni_smooth_ms":   self.onset_bigoni_smooth_ms.get(),
                 "onset_bigoni_min_run_ms":  self.onset_bigoni_min_run_ms.get(),
                 "onset_bigoni_walkback_sd": self.onset_bigoni_walkback_sd.get(),
+                "onset_anchor":          self.onset_anchor.get(),
+                "onset_anchor_halfwidth": self.onset_anchor_halfwidth.get(),
                 "enable_inspector":      self.enable_inspector.get(),
+                "average_mode":          self.average_mode.get(),
                 "generate_individual_plots": self.generate_individual_plots.get(),
                 "enable_auc_global":     self.enable_auc_global.get(),
                 "csp_search_start_ms":   self.csp_search_start_ms.get(),
@@ -1438,7 +1534,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
              "onset_peak_fraction":self.onset_peak_fraction.get(),
              "onset_min_amplitude":self.onset_min_amplitude.get(),
              "onset_slope_threshold":self.onset_slope_threshold.get(),
-             "enable_inspector":self.enable_inspector.get(),"generate_individual_plots":self.generate_individual_plots.get(),
+             "enable_inspector":self.enable_inspector.get(),"average_mode":self.average_mode.get(),"generate_individual_plots":self.generate_individual_plots.get(),
              "csp_search_start_ms":self.csp_search_start_ms.get(),
              "csp_search_end_ms":self.csp_search_end_ms.get(),
              "csp_min_silence_ms":self.csp_min_silence_ms.get(),
@@ -1562,10 +1658,13 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                 self.onset_bigoni_smooth_ms.set(_f("onset_bigoni_smooth_ms",0.5))
                 self.onset_bigoni_min_run_ms.set(_f("onset_bigoni_min_run_ms",0.5))
                 self.onset_bigoni_walkback_sd.set(_f("onset_bigoni_walkback_sd",1.0))
+                self.onset_anchor.set(_b("onset_anchor",False))
+                self.onset_anchor_halfwidth.set(_f("onset_anchor_halfwidth",8.0))
                 self.onset_peak_fraction.set(_f("onset_peak_fraction",0.15))
                 self.onset_min_amplitude.set(_f("onset_min_amplitude",0.1))
                 self.onset_slope_threshold.set(_f("onset_slope_threshold",0.08))
                 self.enable_inspector.set(_b("enable_inspector",True))
+                self.average_mode.set(_b("average_mode",False))
                 self.generate_individual_plots.set(_b("generate_individual_plots",True))
                 self.enable_auc_global.set(_b("enable_auc_global",True))
                 self.wide_window_s.set(_f("wide_window_s",3.0))
@@ -1860,6 +1959,126 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
     # STAGE 2 – Group Analysis
     # ══════════════════════════════════════════════════════════════════════════
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # Check for updates (GitHub Releases; manual; assisted install)
+    # ──────────────────────────────────────────────────────────────────────────
+    _GH_REPO = "jandrushko/mep-cmap-analyser"
+
+    def _check_for_updates(self):
+        """Query GitHub Releases in the background and report the result."""
+        import threading
+        threading.Thread(target=self._check_for_updates_worker, daemon=True).start()
+
+    def _check_for_updates_worker(self):
+        import json, urllib.request, urllib.error
+        base = f"https://api.github.com/repos/{self._GH_REPO}"
+        hdrs = {"Accept": "application/vnd.github+json",
+                "User-Agent": "MEP-CMAP-Analyser"}
+
+        def _get(path):
+            req = urllib.request.Request(base + path, headers=hdrs)
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return json.load(r)
+
+        # 1) Latest published Release (has notes + download page)
+        try:
+            data = _get("/releases/latest")
+            latest = str(data.get("tag_name", "")).lstrip("vV").strip()
+            notes  = (data.get("body") or "").strip()
+            page   = data.get("html_url") or f"https://github.com/{self._GH_REPO}/releases"
+            self.root.after(0, lambda: self._show_update_result(latest, notes, page))
+            return
+        except urllib.error.HTTPError as he:
+            if he.code != 404:
+                self.root.after(0, lambda he=he: messagebox.showinfo(
+                    "Check for updates",
+                    f"GitHub returned an error (HTTP {he.code}).\n\nPlease try again later.",
+                    parent=self.root))
+                return
+            # 404 → no published Releases; fall through to git tags.
+        except Exception as e:
+            self.root.after(0, lambda e=e: messagebox.showinfo(
+                "Check for updates",
+                "Couldn't reach GitHub to check for updates.\n\n"
+                f"({e})\n\nCheck your internet connection and try again.",
+                parent=self.root))
+            return
+
+        # 2) Fall back to version tags (repo tags releases but hasn't published one)
+        try:
+            tags = _get("/tags")
+        except Exception:
+            tags = None
+        if not tags:
+            self.root.after(0, lambda: messagebox.showinfo(
+                "Check for updates",
+                "No published releases or version tags were found for this project "
+                f"on GitHub yet.\n\nYou're running version {TOOL_VERSION}.",
+                parent=self.root))
+            return
+        best = max((str(t.get("name", "")).lstrip("vV").strip() for t in tags),
+                   key=self._version_tuple, default="")
+        page = f"https://github.com/{self._GH_REPO}/releases"
+        self.root.after(0, lambda: self._show_update_result(best, "", page))
+        return
+
+    @staticmethod
+    def _version_tuple(v):
+        import re
+        nums = tuple(int(x) for x in re.findall(r"\d+", v or ""))
+        return nums or (0,)
+
+    def _show_update_result(self, latest, notes, page):
+        import sys, webbrowser
+        cur = TOOL_VERSION
+        if not latest:
+            messagebox.showinfo("Check for updates",
+                f"You're running version {cur}.\n\nCouldn't read the latest release "
+                "version from GitHub.", parent=self.root)
+            return
+        if self._version_tuple(latest) <= self._version_tuple(cur):
+            messagebox.showinfo("Check for updates",
+                f"You're up to date.\n\nInstalled:  {cur}\nLatest:      {latest}",
+                parent=self.root)
+            return
+        trimmed = notes if len(notes) <= 700 else notes[:700].rstrip() + "\u2026"
+        head = (f"A new version is available.\n\nInstalled:  {cur}\nLatest:      {latest}\n")
+        if trimmed:
+            head += f"\nWhat's new:\n{trimmed}\n"
+        if getattr(sys, "frozen", False):
+            # Compiled .exe / .app — can't safely self-replace; open the download page.
+            if messagebox.askyesno("Update available",
+                    head + "\nOpen the download page to get the new build?",
+                    parent=self.root):
+                webbrowser.open(page)
+        else:
+            # pip / source install — offer an assisted pip upgrade.
+            if messagebox.askyesno("Update available",
+                    head + "\nUpdate now with pip? (the app must be restarted afterwards)",
+                    parent=self.root):
+                self._run_pip_upgrade(page)
+
+    def _run_pip_upgrade(self, page):
+        import sys, subprocess, threading, webbrowser
+        pkg = "mep-cmap-analyser"
+        def _worker():
+            try:
+                r = subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", pkg],
+                                   capture_output=True, text=True)
+                ok = (r.returncode == 0)
+                tail = (r.stderr or r.stdout or "")[-500:]
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Update",
+                    "Update installed. Please close and reopen the app to use the new version."
+                    if ok else f"pip couldn't complete the update.\n\n{tail}",
+                    parent=self.root))
+                if not ok:
+                    self.root.after(0, lambda: webbrowser.open(page))
+            except Exception as e:
+                self.root.after(0, lambda e=e: messagebox.showerror(
+                    "Update", f"Update failed: {e}", parent=self.root))
+        threading.Thread(target=_worker, daemon=True).start()
+
     def _open_preferences(self):
         """Open the preferences dialog."""
         from .preferences import open_preferences_dialog
@@ -1889,26 +2108,367 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         win.grab_set()
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Stage 1c — External normalisation (optional)
+    # Stage 1d — External normalisation (optional)
     # ──────────────────────────────────────────────────────────────────────────
 
+    # ───────────────────────────────────────────────────────────────
+    # Add-ons tab  (modular post-hoc analyses; see mep_cmap/addons.py)
+    # ───────────────────────────────────────────────────────────────
+    def _build_addons_tab(self, parent):
+        """Build the Add-ons tab. Content is (re)built on selection."""
+        self._addons_entries = []
+        self._addons_setting_vars = {}
+        for w in parent.winfo_children():
+            w.destroy()
+        tk.Label(parent, text="Add-ons",
+                 font=("TkDefaultFont", 13, "bold")).pack(pady=(12, 2))
+        tk.Label(parent,
+            text="Run optional analysis add-ons on your processed results.\n"
+                 "Add-ons read the saved waveform bundle (<prefix>_segments.npz)\n"
+                 "and write their own new files — they never change core outputs.\n"
+                 "Set your own add-ons folder in Preferences → Add-ons.",
+            justify="left", fg="grey").pack(anchor="w", padx=16, pady=(0, 8))
+        # Add-ons read the BIDS derivatives folder configured for the session
+        # (File \u2192 Set Derivatives Folder) \u2014 not a per-run option.
+        self._addons_status = tk.Label(parent, anchor="w", justify="left", fg="grey")
+        self._addons_status.pack(anchor="w", padx=16, pady=(0, 4))
+        _br = tk.Frame(parent); _br.pack(fill="x", padx=16, pady=(0, 4))
+        tk.Button(_br, text="Rescan add-ons",
+                  command=self._addons_discover).pack(side="left")
+        self._addons_list_frame = tk.Frame(parent)
+        self._addons_list_frame.pack(fill="both", expand=True, padx=16, pady=(8, 4))
+        tk.Label(parent, text="Log:", anchor="w").pack(anchor="w", padx=16)
+        self._addons_log_text = tk.Text(parent, height=8, wrap="word")
+        self._addons_log_text.pack(fill="both", expand=False, padx=16, pady=(0, 12))
+        self._addons_refresh_status()
+        self._addons_discover()
+
+    def _addons_refresh_status(self):
+        """Show which derivatives folder add-ons will read (or prompt to set it)."""
+        d = ""
+        if hasattr(self, "derivatives_path"):
+            d = (self.derivatives_path.get() or "").strip()
+        if d:
+            self._addons_status.config(
+                fg="grey",
+                text=f"Reading results from your derivatives folder:\n{d}")
+        else:
+            self._addons_status.config(
+                fg="#b00020",
+                text="\u26a0 No derivatives folder set \u2014 use File \u2192 Set "
+                     "Derivatives Folder before running add-ons.")
+
+    def _addons_log(self, msg):
+        try:
+            self._addons_log_text.insert("end", str(msg) + "\n")
+            self._addons_log_text.see("end")
+        except Exception:
+            print(msg)
+
+    def _addons_discover(self):
+        """Scan built-in + user folders and rebuild the add-on list."""
+        from . import addons as _addons
+        try:
+            self._addons_entries = _addons.discover_all("single_file", prefs.addons_path,
+                                                        log=self._addons_log)
+        except Exception as e:
+            self._addons_entries = []
+            self._addons_log(f"add-on discovery failed: {e}")
+        for w in self._addons_list_frame.winfo_children():
+            w.destroy()
+        if not self._addons_entries:
+            tk.Label(self._addons_list_frame,
+                     text="No add-ons found. Built-in add-ons ship with the app; "
+                          "add your own folder in Preferences → Add-ons.",
+                     fg="grey", justify="left").pack(anchor="w")
+            return
+        for entry in self._addons_entries:
+            row = tk.Frame(self._addons_list_frame, relief="groove", bd=1)
+            row.pack(fill="x", pady=3)
+            txt = tk.Frame(row); txt.pack(side="left", fill="x", expand=True, padx=6, pady=4)
+            tk.Label(txt, text=entry["name"],
+                     font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
+            _desc = entry["description"] or "(no description)"
+            if entry["version"] or entry["author"]:
+                _desc += f"   —  v{entry['version']}  {entry['author']}"
+            tk.Label(txt, text=_desc, fg="grey", wraplength=650,
+                     justify="left").pack(anchor="w")
+            # Per-add-on settings (declared via ADDON_SETTINGS) render here and
+            # are merged into the run config. Values persist across rescans.
+            if entry.get("settings"):
+                svars = self._addons_setting_vars.setdefault(entry["name"], {})
+                sframe = tk.Frame(txt); sframe.pack(anchor="w", fill="x", pady=(4, 0))
+                for sp in entry["settings"]:
+                    key = sp.get("key")
+                    if not key:
+                        continue
+                    if key not in svars:
+                        svars[key] = tk.StringVar(value=str(sp.get("default", "")))
+                    _rr = tk.Frame(sframe); _rr.pack(anchor="w", fill="x")
+                    tk.Label(_rr, text=f"{sp.get('label', key)}:").pack(side="left")
+                    tk.Entry(_rr, textvariable=svars[key], width=8).pack(side="left", padx=(4, 0))
+                    if sp.get("help"):
+                        tk.Label(sframe, text=sp["help"], fg="grey", justify="left",
+                                 wraplength=600, font="TkSmallCaptionFont").pack(anchor="w")
+            tk.Button(row, text="Run",
+                      command=lambda e=entry: self._addons_run(e)).pack(
+                          side="right", padx=8, pady=4)
+
+    def _addons_build_config(self):
+        """Analysis settings handed to add-ons as context.config."""
+        def _g(attr, default=None):
+            v = getattr(self, attr, None)
+            try:
+                return v.get() if v is not None else default
+            except Exception:
+                return default
+        return {
+            "ptp_start":  _g("ptp_start", 10),
+            "ptp_end":    _g("ptp_end", 50),
+            "prestim_ms": _g("prestim_ms", 100),
+            "pre_ms":     _g("pre_time", 20),
+            "post_ms":    _g("post_time", 400),
+            # Per-condition onset (latency) windows {stim_type: (min_ms, max_ms)}.
+            # MEPFeatX-style add-ons use this as t_onset; without it they fall back
+            # to the wide PTP window, which makes onset/latency unreliable.
+            "latency_map": dict(getattr(self, "latency_map", {}) or {}),
+        }
+
+    def _addons_run(self, entry):
+        """Run one add-on on every *_segments.npz bundle under the results folder."""
+        import os, glob
+        from . import addons as _addons
+        folder = ""
+        if hasattr(self, "derivatives_path"):
+            folder = (self.derivatives_path.get() or "").strip()
+        if not folder or not os.path.isdir(folder):
+            self._addons_log("No derivatives folder set. Use File \u2192 Set "
+                             "Derivatives Folder, then run an analysis so the "
+                             "waveform bundle is saved.")
+            return
+        bundles = sorted(glob.glob(os.path.join(folder, "**", "*_segments.npz"),
+                                   recursive=True))
+        if not bundles:
+            self._addons_log(f"No *_segments.npz bundles under {folder}. "
+                             f"Run an analysis first (the bundle is saved with results).")
+            return
+        cfg = self._addons_build_config()
+        # merge this add-on's own GUI settings (ADDON_SETTINGS) into the config
+        for sp in entry.get("settings", []):
+            var = self._addons_setting_vars.get(entry["name"], {}).get(sp.get("key"))
+            if var is None:
+                continue
+            raw = var.get()
+            try:
+                typ = sp.get("type", "str")
+                if typ == "int":
+                    cfg[sp["key"]] = int(float(raw))
+                elif typ == "float":
+                    cfg[sp["key"]] = float(raw)
+                elif typ == "bool":
+                    cfg[sp["key"]] = str(raw).strip().lower() in ("1", "true", "yes", "on")
+                else:
+                    cfg[sp["key"]] = raw
+            except Exception:
+                self._addons_log(f"add-ons: '{sp.get('key')}' value '{raw}' invalid; using add-on default.")
+        self._addons_log(f"— Running '{entry['name']}' on {len(bundles)} bundle(s) —")
+        n_written = 0
+        for bpath in bundles:
+            try:
+                contexts = _addons.load_contexts(bpath, config=cfg, log=self._addons_log)
+            except Exception as ex:
+                self._addons_log(f"  {os.path.basename(bpath)}: could not load ({ex})")
+                continue
+            for ctx in contexts:
+                res = _addons.run_addon(entry, ctx)
+                if res["ok"]:
+                    for pth in res["paths"]:
+                        n_written += 1
+                        self._addons_log(f"  ✓ {os.path.basename(pth)}")
+                else:
+                    self._addons_log(f"  ✗ {entry['name']} failed on {ctx.bids_prefix}:")
+                    _err = (res["error"] or "").strip().splitlines()
+                    self._addons_log(_err[-1] if _err else "unknown error")
+        self._addons_log(f"Done. {n_written} file(s) written.")
+
+    def _on_addons_tab_selected(self, event=None):
+        """Deprecated: tab-change handling is now unified in _on_tab_changed
+        (visibility-based, nested-notebook aware). Kept as a thin delegate."""
+        self._on_tab_changed(event)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Second-level (group) Add-ons tab
+    # ──────────────────────────────────────────────────────────────────────────
+    def _build_group_addons_tab(self, parent):
+        """Build the second-level (group-level) Add-ons tab."""
+        self._gaddons_entries = []
+        self._gaddons_setting_vars = {}
+        for w in parent.winfo_children():
+            w.destroy()
+        tk.Label(parent, text="Add-ons",
+                 font=("TkDefaultFont", 13, "bold")).pack(pady=(12, 2))
+        tk.Label(parent,
+            text="Run optional group-level add-ons on your built group table.\n"
+                 "Add-ons read the group file (group_level_LME_ready.csv) that\n"
+                 "Group Analysis (LME) builds, and write their own new files \u2014\n"
+                 "they never change it. Put your own group add-ons in the\n"
+                 "'group_level' subfolder of your Preferences \u2192 Add-ons folder.",
+            justify="left", fg="grey").pack(anchor="w", padx=16, pady=(0, 8))
+        self._gaddons_status = tk.Label(parent, anchor="w", justify="left", fg="grey")
+        self._gaddons_status.pack(anchor="w", padx=16, pady=(0, 4))
+        _br = tk.Frame(parent); _br.pack(fill="x", padx=16, pady=(0, 4))
+        tk.Button(_br, text="Rescan add-ons",
+                  command=self._group_addons_discover).pack(side="left")
+        self._gaddons_list_frame = tk.Frame(parent)
+        self._gaddons_list_frame.pack(fill="both", expand=True, padx=16, pady=(8, 4))
+        tk.Label(parent, text="Log:", anchor="w").pack(anchor="w", padx=16)
+        self._gaddons_log_text = tk.Text(parent, height=8, wrap="word")
+        self._gaddons_log_text.pack(fill="both", expand=False, padx=16, pady=(0, 12))
+        self._group_addons_refresh_status()
+        self._group_addons_discover()
+
+    def _group_addons_refresh_status(self):
+        d = ""
+        if hasattr(self, "derivatives_path"):
+            d = (self.derivatives_path.get() or "").strip()
+        if d:
+            self._gaddons_status.config(
+                fg="grey",
+                text=f"Reading the group table from your derivatives folder:\n{d}")
+        else:
+            self._gaddons_status.config(
+                fg="#b00020",
+                text="\u26a0 No derivatives folder set \u2014 set it (File \u2192 Set "
+                     "Derivatives Folder), then build the group file in Group Analysis (LME).")
+
+    def _group_addons_log(self, msg):
+        try:
+            self._gaddons_log_text.insert("end", str(msg) + "\n")
+            self._gaddons_log_text.see("end")
+        except Exception:
+            print(msg)
+
+    def _group_addons_discover(self):
+        """Scan built-in + user 'group_level' folders and rebuild the list."""
+        from . import addons as _addons
+        try:
+            self._gaddons_entries = _addons.discover_all("group_level", prefs.addons_path,
+                                                         log=self._group_addons_log)
+        except Exception as e:
+            self._gaddons_entries = []
+            self._group_addons_log(f"add-on discovery failed: {e}")
+        for w in self._gaddons_list_frame.winfo_children():
+            w.destroy()
+        if not self._gaddons_entries:
+            tk.Label(self._gaddons_list_frame,
+                     text="No group-level add-ons found. Built-in ones ship with the app; "
+                          "add your own in the 'group_level' subfolder of your add-ons folder.",
+                     fg="grey", justify="left").pack(anchor="w")
+            return
+        for entry in self._gaddons_entries:
+            row = tk.Frame(self._gaddons_list_frame, relief="groove", bd=1)
+            row.pack(fill="x", pady=3)
+            txt = tk.Frame(row); txt.pack(side="left", fill="x", expand=True, padx=6, pady=4)
+            tk.Label(txt, text=entry["name"],
+                     font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
+            _desc = entry["description"] or "(no description)"
+            if entry["version"] or entry["author"]:
+                _desc += f"   \u2014  v{entry['version']}  {entry['author']}"
+            tk.Label(txt, text=_desc, fg="grey", wraplength=650,
+                     justify="left").pack(anchor="w")
+            if entry.get("settings"):
+                svars = self._gaddons_setting_vars.setdefault(entry["name"], {})
+                sframe = tk.Frame(txt); sframe.pack(anchor="w", fill="x", pady=(4, 0))
+                for sp in entry["settings"]:
+                    key = sp.get("key")
+                    if not key:
+                        continue
+                    if key not in svars:
+                        svars[key] = tk.StringVar(value=str(sp.get("default", "")))
+                    _rr = tk.Frame(sframe); _rr.pack(anchor="w", fill="x")
+                    tk.Label(_rr, text=f"{sp.get('label', key)}:").pack(side="left")
+                    tk.Entry(_rr, textvariable=svars[key], width=8).pack(side="left", padx=(4, 0))
+                    if sp.get("help"):
+                        tk.Label(sframe, text=sp["help"], fg="grey", justify="left",
+                                 wraplength=600, font="TkSmallCaptionFont").pack(anchor="w")
+            tk.Button(row, text="Run",
+                      command=lambda e=entry: self._group_addons_run(e)).pack(
+                          side="right", padx=8, pady=4)
+
+    def _group_addons_run(self, entry):
+        """Run one group-level add-on on every group_level_LME_ready.csv found."""
+        import os, glob
+        from . import addons as _addons
+        folder = ""
+        if hasattr(self, "derivatives_path"):
+            folder = (self.derivatives_path.get() or "").strip()
+        if not folder or not os.path.isdir(folder):
+            self._group_addons_log("No derivatives folder set. Use File \u2192 Set "
+                                   "Derivatives Folder, then build the group file.")
+            return
+        targets = sorted(glob.glob(
+            os.path.join(folder, "**", "group_level_LME_ready.csv"), recursive=True))
+        if not targets:
+            self._group_addons_log(
+                "No group_level_LME_ready.csv found. Build it first in "
+                "Second Level \u2192 Group Analysis (LME).")
+            return
+        # base config = merged ADDON_SETTINGS only (group add-ons need no analysis params)
+        cfg = {}
+        for sp in entry.get("settings", []):
+            var = self._gaddons_setting_vars.get(entry["name"], {}).get(sp.get("key"))
+            if var is None:
+                continue
+            raw = var.get()
+            try:
+                typ = sp.get("type", "str")
+                if typ == "int":
+                    cfg[sp["key"]] = int(float(raw))
+                elif typ == "float":
+                    cfg[sp["key"]] = float(raw)
+                elif typ == "bool":
+                    cfg[sp["key"]] = str(raw).strip().lower() in ("1", "true", "yes", "on")
+                else:
+                    cfg[sp["key"]] = raw
+            except Exception:
+                self._group_addons_log(f"add-ons: '{sp.get('key')}' value '{raw}' invalid; using default.")
+        self._group_addons_log(f"\u2014 Running '{entry['name']}' on {len(targets)} group file(s) \u2014")
+        n_written = 0
+        for tpath in targets:
+            try:
+                contexts = _addons.load_group_contexts(tpath, config=cfg,
+                                                       log=self._group_addons_log)
+            except Exception as ex:
+                self._group_addons_log(f"  {os.path.basename(tpath)}: could not load ({ex})")
+                continue
+            for ctx in contexts:
+                res = _addons.run_addon(entry, ctx)
+                if res["ok"]:
+                    for pth in res["paths"]:
+                        n_written += 1
+                        self._group_addons_log(f"  \u2713 {os.path.basename(pth)}")
+                else:
+                    self._group_addons_log(f"  \u2717 {entry['name']} failed:")
+                    _err = (res["error"] or "").strip().splitlines()
+                    self._group_addons_log(_err[-1] if _err else "unknown error")
+        self._group_addons_log(f"Done. {n_written} file(s) written.")
+
     def _build_normalisation_tab(self):
-        """Build the Stage 1c normalisation tab."""
+        """Build the Stage 1d normalisation tab."""
         f = self.tab1c_frame
         for w in f.winfo_children():
             w.destroy()
 
         tk.Label(f,
             text="Optional: normalise processed results using a reference file's PTP values.\n"
-                 "Both files must be fully processed first (Stage 1a/1b).\n"
+                 "Both files must be fully processed first (First Level).\n"
                  "Select the _trials.csv files from the derivatives/results folder.\n"
                  "The reference mean is computed using the same plateau detection as "
                  "internal normalisation: if the reference data has a reliable plateau "
                  "within the tolerance threshold, the plateau mean is used; "
                  "otherwise the peak value is used.\n"
                  "Results are written back into the main file's _trials.csv in-place.",
-            justify="left", wraplength=950, fg="grey",
-            font=("TkDefaultFont", 9, "italic")
+            justify="left", wraplength=950, fg="grey"
         ).pack(anchor="w", padx=16, pady=(12, 6))
 
         # ── Plateau tolerance ─────────────────────────────────────────────────
@@ -1921,17 +2481,15 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         tk.Label(tol_row,
             text="Trials within this % of the peak are averaged to form the "
                  "plateau mean. If fewer than 2 trials qualify, the peak is used.",
-            fg="grey", font=("TkDefaultFont", 8)
+            fg="grey", font="TkSmallCaptionFont"
         ).pack(side="left", padx=(4, 0))
 
         # ── Column headers ────────────────────────────────────────────────────
         hdr = tk.Frame(f)
         hdr.pack(fill="x", padx=16, pady=(4, 0))
-        tk.Label(hdr, text="File to normalise  (_trials.csv)",
-                 font=("TkDefaultFont", 9, "bold"), width=52, anchor="w")\
+        tk.Label(hdr, text="File to normalise  (_trials.csv)", width=52, anchor="w")\
             .grid(row=0, column=0, padx=4, sticky="w")
-        tk.Label(hdr, text="Reference file  (_trials.csv)",
-                 font=("TkDefaultFont", 9, "bold"), width=52, anchor="w")\
+        tk.Label(hdr, text="Reference file  (_trials.csv)", width=52, anchor="w")\
             .grid(row=0, column=2, padx=4, sticky="w")
 
         # ── Pairing table ─────────────────────────────────────────────────────
@@ -1945,7 +2503,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         tk.Button(btn_row, text="+ Add normalisation pair",
                   command=self._norm_add_pair).pack(side="left", padx=(0, 8))
         tk.Button(btn_row, text="▶ Apply normalisation",
-                  bg="#5cb85c", fg="white",
+                  **accent_button_kw("green"),
                   command=self._norm_apply_all).pack(side="left")
 
         self._norm_log_var = tk.StringVar(value="")
@@ -2074,11 +2632,9 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         tbl = tk.Frame(dlg)
         tbl.pack(fill="x", padx=16, pady=8)
 
-        tk.Label(tbl, text="Main stim type",
-                 font=("TkDefaultFont", 9, "bold"), width=22, anchor="w")            .grid(row=0, column=0, padx=4, pady=2, sticky="w")
+        tk.Label(tbl, text="Main stim type", width=22, anchor="w")            .grid(row=0, column=0, padx=4, pady=2, sticky="w")
         tk.Label(tbl, text="→", width=3).grid(row=0, column=1)
-        tk.Label(tbl, text="Reference stim type",
-                 font=("TkDefaultFont", 9, "bold"), width=22, anchor="w")            .grid(row=0, column=2, padx=4, pady=2, sticky="w")
+        tk.Label(tbl, text="Reference stim type", width=22, anchor="w")            .grid(row=0, column=2, padx=4, pady=2, sticky="w")
 
         ttk.Separator(tbl, orient="horizontal")            .grid(row=1, column=0, columnspan=3, sticky="ew", pady=4)
 
@@ -2107,7 +2663,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         btn_row = tk.Frame(dlg)
         btn_row.pack(pady=(4, 12))
         tk.Button(btn_row, text="Apply mapping", width=14,
-                  bg="#5cb85c", fg="white", command=_apply).pack(side="left", padx=6)
+                  **accent_button_kw("green"), command=_apply).pack(side="left", padx=6)
         tk.Button(btn_row, text="Cancel", width=10,
                   command=_cancel).pack(side="left", padx=6)
 
@@ -2144,7 +2700,8 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         _rn_col    = "Reference_N"
 
         for col in [_norm_col, _rtype_col, _rmean_col, _rn_col,
-                    "Normalised_PTP_per_PreStimRMS"]:
+                    "Normalised_PTP_per_PreStimRMS",
+                    "Normalised_Adjusted_PTP_QR"]:
             if col not in df_main.columns:
                 df_main[col] = ""
             df_main[col] = df_main[col].astype(object)
@@ -2159,7 +2716,8 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             for col in ["Mean_Normalised_PTP", "SD_Normalised_PTP",
                         "Reference_Type", "Reference_Mean(mV)", "Reference_N",
                         "Mean_PTP_per_PreStimRMS", "SD_PTP_per_PreStimRMS",
-                        "Mean_Normalised_PTP_per_PreStimRMS", "SD_Normalised_PTP_per_PreStimRMS"]:
+                        "Mean_Normalised_PTP_per_PreStimRMS", "SD_Normalised_PTP_per_PreStimRMS",
+                        "Mean_Normalised_Adjusted_PTP_QR", "SD_Normalised_Adjusted_PTP_QR"]:
                 if col not in df_sum.columns:
                     df_sum[col] = _np.nan
                 df_sum[col] = df_sum[col].astype(object)
@@ -2167,6 +2725,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             clean = trials_df[trials_df["Outlier_Decision"] != "Outlier"].copy()
             for col in ["Normalised_PTP", "PTP_per_PreStimRMS",
                         "Normalised_PTP_per_PreStimRMS",
+                        "Normalised_Adjusted_PTP_QR",
                         "Reference_Mean(mV)", "Reference_N"]:
                 if col in clean.columns:
                     clean[col] = _pd.to_numeric(clean[col], errors='coerce')
@@ -2197,6 +2756,11 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                 if len(_g3) > 0:
                     df_sum.at[idx, "Mean_Normalised_PTP_per_PreStimRMS"] = round(float(_g3.mean()), 4)
                     df_sum.at[idx, "SD_Normalised_PTP_per_PreStimRMS"]   = round(float(_g3.std(ddof=1)), 4) if len(_g3) > 1 else _np.nan
+                # Normalised_Adjusted_PTP_QR (re-derived against the new reference)
+                _g4 = grp["Normalised_Adjusted_PTP_QR"].dropna() if "Normalised_Adjusted_PTP_QR" in grp.columns else _pd.Series(dtype=float)
+                if len(_g4) > 0:
+                    df_sum.at[idx, "Mean_Normalised_Adjusted_PTP_QR"] = round(float(_g4.mean()), 4)
+                    df_sum.at[idx, "SD_Normalised_Adjusted_PTP_QR"]   = round(float(_g4.std(ddof=1)), 4) if len(_g4) > 1 else _np.nan
 
             df_sum.to_csv(summary_csv, index=False)
 
@@ -2238,6 +2802,11 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                     _norm_ptp_vals = _pd.to_numeric(df_main.loc[main_mask, _norm_col], errors='coerce')
                     df_main.loc[main_mask, "Normalised_PTP_per_PreStimRMS"] = \
                         (_norm_ptp_vals / _rms_vals).round(4)
+                # Normalised_Adjusted_PTP_QR = Adjusted_PTP_QR / raw reference mean
+                if "Adjusted_PTP_QR(mV)" in df_main.columns:
+                    _adj_vals = _pd.to_numeric(df_main.loc[main_mask, "Adjusted_PTP_QR(mV)"], errors="coerce")
+                    df_main.loc[main_mask, "Normalised_Adjusted_PTP_QR"] = \
+                        (_adj_vals / ref_mean).round(4)
                 msgs.append(f"✓  {main_st} → {ref_st} (mean {ref_mean:.3f} mV, n={ref_n})")
 
             df_main.to_csv(main_csv, index=False)
@@ -2279,6 +2848,11 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                 _rms_vals = _pd.to_numeric(df_main.loc[mask, "PreStimRMS"], errors="coerce")
                 df_main.loc[mask, "Normalised_PTP_per_PreStimRMS"] = \
                     ((ptps / ref_mean) / _rms_vals).round(4)
+            # Normalised_Adjusted_PTP_QR = Adjusted_PTP_QR / raw reference mean
+            if "Adjusted_PTP_QR(mV)" in df_main.columns:
+                _adj_vals = _pd.to_numeric(df_main.loc[mask, "Adjusted_PTP_QR(mV)"], errors="coerce")
+                df_main.loc[mask, "Normalised_Adjusted_PTP_QR"] = \
+                    (_adj_vals / ref_mean).round(4)
 
             df_main.to_csv(main_csv, index=False)
 
@@ -2316,8 +2890,10 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
 
         study_row = tk.Frame(setup_frame)
         study_row.pack(fill='x', pady=(0, 6))
+        # No custom font: use the live default font exactly like the Browse
+        # and Run selected buttons, so the height matches regardless of the
+        # app's DPI/font scaling.
         tk.Button(study_row, text="📂  Open study folder",
-                  font=("TkDefaultFont", 9, "bold"),
                   command=self._open_study_folder).pack(side='left', padx=(0, 8))
         tk.Label(study_row,
                  text="Auto-detects rawdata/ and derivatives/ subfolders",
@@ -2379,10 +2955,6 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                   command=self._queue_move_up, width=2).pack(side='left')
         tk.Button(q_toolbar, text="▼",
                   command=self._queue_move_down, width=2).pack(side='left', padx=(2, 0))
-        tk.Button(q_toolbar, text="▶  Run all unprocessed",
-                  command=self._queue_run_all,
-                  bg="#5cb85c", fg="white",
-                  font=("TkDefaultFont", 9, "bold")).pack(side='right', padx=(0, 4))
         tk.Button(q_toolbar, text="▶  Run selected",
                   command=self._queue_run_selected).pack(side='right', padx=(0, 4))
 
@@ -2393,7 +2965,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         self._load_prog_frame = tk.Frame(queue_frame)
         self._load_prog_label = tk.Label(
             self._load_prog_frame, text="", fg="#555",
-            font=("TkDefaultFont", 8), anchor="w")
+            font="TkSmallCaptionFont", anchor="w")
         self._load_prog_label.pack(side="left", padx=(0, 8))
         self._load_prog_bar = ttk.Progressbar(
             self._load_prog_frame,
@@ -2683,7 +3255,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         btn_row = tk.Frame(dlg)
         btn_row.pack(pady=8)
         tk.Button(btn_row, text="Restore selected", command=_restore,
-                  bg="#5cb85c", fg="white").pack(side="left", padx=6)
+                  **accent_button_kw("green")).pack(side="left", padx=6)
         tk.Button(btn_row, text="Cancel", command=dlg.destroy,
                   width=10).pack(side="left", padx=6)
 
@@ -2926,7 +3498,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         win.minsize(680, 10)
 
         # Current path
-        tk.Label(win, text="Current path:", font=("TkDefaultFont", 9, "bold"),
+        tk.Label(win, text="Current path:",
                  anchor="w").grid(row=0, column=0, sticky="w", padx=10, pady=(12, 2))
         tk.Label(win, text=old_path, fg="#555", wraplength=640, justify="left",
                  anchor="w").grid(row=1, column=0, columnspan=2, sticky="w",
@@ -2936,8 +3508,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=4)
 
         # Audit results
-        tk.Label(win, text="BIDS naming audit:",
-                 font=("TkDefaultFont", 9, "bold"), anchor="w"
+        tk.Label(win, text="BIDS naming audit:", anchor="w"
                  ).grid(row=3, column=0, sticky="w", padx=10, pady=(4, 2))
 
         audit_frm = tk.Frame(win, bd=1, relief="sunken", bg="#fffde7")
@@ -2947,20 +3518,20 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             for issue in issues:
                 tk.Label(audit_frm, text=f"  \u26a0  {issue}",
                          fg="#b26a00", bg="#fffde7",
-                         font=("TkDefaultFont", 9), anchor="w"
+                         font="TkDefaultFont", anchor="w"
                          ).pack(fill="x", padx=4, pady=1)
         else:
             tk.Label(audit_frm,
                      text="  \u2705  No issues found \u2014 filename looks BIDS-compliant",
                      fg="#2e7d32", bg="#fffde7",
-                     font=("TkDefaultFont", 9), anchor="w"
+                     font="TkDefaultFont", anchor="w"
                      ).pack(fill="x", padx=4, pady=4)
 
         ttk.Separator(win, orient="horizontal").grid(
             row=5, column=0, columnspan=2, sticky="ew", padx=10, pady=4)
 
         # New name entry
-        tk.Label(win, text="New filename:", font=("TkDefaultFont", 9, "bold"),
+        tk.Label(win, text="New filename:",
                  anchor="w").grid(row=6, column=0, sticky="w", padx=10, pady=(4, 2))
 
         name_var = tk.StringVar(value=old_name)
@@ -2987,7 +3558,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
 
         preview_lbl = tk.Label(win, textvariable=preview_var,
                                wraplength=640, justify="left",
-                               font=("TkDefaultFont", 8), anchor="w")
+                               font="TkSmallCaptionFont", anchor="w")
         preview_lbl.grid(row=8, column=0, columnspan=2, sticky="w",
                          padx=10, pady=(0, 8))
         _update_preview()
@@ -2995,14 +3566,14 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         # BIDS template hint
         tk.Label(win,
                  text="Suggested pattern:  sub-<label>_ses-<label>_limb-<left|right>_<date>.txt",
-                 fg="#888", font=("TkDefaultFont", 8)
+                 fg="#888", font="TkSmallCaptionFont"
                  ).grid(row=9, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 8))
 
         ttk.Separator(win, orient="horizontal").grid(
             row=10, column=0, columnspan=2, sticky="ew", padx=10, pady=4)
 
         warn_lbl = tk.Label(win, text="", fg="#d9534f",
-                            font=("TkDefaultFont", 9))
+                            font="TkDefaultFont")
         warn_lbl.grid(row=11, column=0, columnspan=2, sticky="w", padx=10)
 
         def _do_rename(_e=None):
@@ -3052,7 +3623,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         btn_bar = tk.Frame(win)
         btn_bar.grid(row=12, column=0, columnspan=2, pady=(4, 12))
         tk.Button(btn_bar, text="\u270f\ufe0f  Rename file",
-                  bg="#2196F3", fg="white", width=16,
+                  **accent_button_kw("blue"), width=16,
                   command=_do_rename).pack(side="left", padx=8)
         tk.Button(btn_bar, text="Cancel", width=10,
                   command=win.destroy).pack(side="left", padx=4)
@@ -3978,15 +4549,13 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
 
         if context:
             tk.Label(win, text=f"📋 External normalisation file: {context}",
-                     fg="#d9534f", font=("TkDefaultFont", 9, "bold")).grid(
+                     fg="#d9534f").grid(
                      row=0, column=0, columnspan=3, **pad, sticky="w")
-            tk.Label(win, text="Enter metadata for BIDS-style output naming.",
-                     font=("TkDefaultFont", 9, "italic")).grid(
+            tk.Label(win, text="Enter metadata for BIDS-style output naming.").grid(
                      row=1, column=0, columnspan=3, **pad, sticky="w")
             _row_offset = 2
         else:
-            tk.Label(win, text="Enter study metadata for BIDS-style output naming.",
-                     font=("TkDefaultFont", 9, "italic")).grid(
+            tk.Label(win, text="Enter study metadata for BIDS-style output naming.").grid(
                      row=0, column=0, columnspan=3, **pad, sticky="w")
             _row_offset = 1
 
@@ -3994,7 +4563,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         def _row(r, label, var, example):
             tk.Label(win, text=label).grid(row=r+_row_offset, column=0, sticky="e", **pad)
             tk.Entry(win, textvariable=var, width=22).grid(row=r+_row_offset, column=1, sticky="w", **pad)
-            tk.Label(win, text=example, fg="grey", font=("TkDefaultFont", 8))\
+            tk.Label(win, text=example, fg="grey", font="TkSmallCaptionFont")\
                 .grid(row=r+_row_offset, column=2, sticky="w", padx=(0, 10))
 
         _row(1, "Participant ID *",  v_sub,  "e.g.  sub-JD001  or  JD001")
@@ -4013,7 +4582,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                                   values=_measure_choices, width=10)
         measure_cb.pack(side="left")
         tk.Label(measure_frame, text="or type your own",
-                 fg="grey", font=("TkDefaultFont", 8)).pack(side="left", padx=(6,0))
+                 fg="grey", font="TkSmallCaptionFont").pack(side="left", padx=(6,0))
 
         tk.Checkbutton(win, text="Remember these settings for the next file",
                        variable=v_rem)          .grid(row=8+_row_offset, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 2))
@@ -4077,7 +4646,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         win.transient(self.root)
         tk.Label(win,
                  text="Review the plan below. Nothing is written until you click Proceed.",
-                 fg="#d9534f", font=("TkDefaultFont", 9, "bold")).pack(
+                 fg="#d9534f").pack(
                  anchor="w", padx=10, pady=(10, 4))
         txt = scrolledtext.ScrolledText(win, width=104, height=24, wrap="none")
         txt.pack(fill="both", expand=True, padx=10, pady=4)
@@ -4092,8 +4661,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             result["go"] = True
             win.destroy()
 
-        tk.Button(btns, text="Proceed", bg="#5cb85c", fg="white",
-                  font=("TkDefaultFont", 9, "bold"),
+        tk.Button(btns, text="Proceed", **accent_button_kw("green"),
                   command=_go).pack(side="right", padx=(0, 10))
         tk.Button(btns, text="Cancel",
                   command=win.destroy).pack(side="right", padx=(0, 6))
@@ -4166,11 +4734,11 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             display = path if len(path) <= 70 else "…" + path[-67:]
             self._deriv_status_bar.config(
                 text=f"✔  Derivatives: {display}",
-                bg="#5cb85c", fg="white")
+                **accent_button_kw("green"))
         else:
             self._deriv_status_bar.config(
                 text="⚠  Derivatives folder not set — click here or use File → Set Derivatives Folder",
-                bg="#d9534f", fg="white")
+                **accent_button_kw("red"))
 
     def log(self, message):
         self.log_box.insert(tk.END, message + "\n")
@@ -4350,7 +4918,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
     # ──────────────────────────────────────────────────────────────────────
     def _build_labels_tab(self, stim_types):
         """
-        Build (or rebuild) the Stage 1b tab with per-stim configuration:
+        Build (or rebuild) the Stage 1a labels tab with per-stim configuration:
           • label, colour, include in combined plot, gap (ms)
           • detect CSP checkbox
           • internal normalisation reference (ratio to another stim type)
@@ -4419,8 +4987,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                    "Plateau (%)",
                    "Stim type", "Muscle group", "Min lat (ms)", "Max lat (ms)"]
         for c, h in enumerate(headers):
-            tk.Label(inner, text=h,
-                     font=("TkDefaultFont", 9, "bold"))\
+            tk.Label(inner, text=h)\
                 .grid(row=1, column=c, padx=6, pady=(0,4), sticky="w")
 
         # ── per-stim rows ─────────────────────────────────────────────────────
@@ -4575,7 +5142,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         confirm_btn = tk.Button(
             footer,
             textvariable=self._confirm_btn_var,
-            bg="#d9534f", fg="white",
+            **accent_button_kw("red"),
             font=("TkDefaultFont", 10, "bold"),
             command=self._confirm_labels_tab)
         confirm_btn.pack(side="left", padx=12, pady=6, ipadx=10)
@@ -4590,7 +5157,8 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
 
         # Switch to Stage 1a Labels tab so user can configure stim types
         self.root.update_idletasks()
-        self.notebook.select(self.tab1b_frame)
+        self.notebook.select(self.stage1_outer)
+        self.nb_stage1.select(self.tab1b_frame)
 
     def _browse_mmax_for_var(self, string_var):
         """Interactively configure an external normalisation reference file.
@@ -4755,7 +5323,8 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
 
         self._labels_tab_confirmed = True
         self._confirm_btn_var.set("✔  Setup confirmed")
-        self._confirm_btn_widget.config(bg="#5cb85c")
+        self._confirm_btn_widget.config(**accent_button_kw("green"))
         self.log("✔ Label & analysis setup confirmed — ready to run.\n")
         # Switch back to Stage 1a so user can hit Run Analysis
-        self.notebook.select(2)
+        self.notebook.select(self.stage1_outer)
+        self.nb_stage1.select(self.tab_filter)

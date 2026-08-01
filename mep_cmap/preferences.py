@@ -11,6 +11,7 @@ PREFS_DIR  = Path.home() / ".mep_cmap"
 PREFS_FILE = PREFS_DIR / "preferences.json"
 DEFAULTS   = {
     "font_scale":          1.0,
+    "addons_path":         None,   # user add-ons folder (None → built-in only)
     "latency_profiles":    None,   # None → use LATENCY_PROFILE_DEFAULTS
     "default_latency_key": None,   # None → use DEFAULT_LATENCY_KEY
     "onset_method":        "bigoni",  # "peak_fraction" | "bootstrap" | "bigoni"
@@ -61,6 +62,22 @@ BASE_FONT_SIZES = {
     "TkTooltipFont":      10,
 }
 
+def accent_button_kw(kind="green"):
+    """Cross-platform styling for coloured action buttons.
+
+    macOS (Aqua) ignores a tk.Button's ``bg``, so ``fg='white'`` would render as
+    unreadable white-on-light. There we colour the *text* instead (still readable
+    and visually distinct). Windows/Linux honour ``bg``, so we fill the button.
+
+    Usage:  tk.Button(parent, text="Run", command=..., **accent_button_kw("green"))
+    """
+    colour = {"green": "#5cb85c", "red": "#d9534f",
+              "blue": "#2196F3"}.get(kind, "#5cb85c")
+    if sys.platform == "darwin":
+        return {"fg": colour}
+    return {"bg": colour, "fg": "white"}
+
+
 class Preferences:
     def __init__(self):
         self._data: dict = dict(DEFAULTS)
@@ -94,6 +111,16 @@ class Preferences:
 
     def set_font_scale(self, value: float):
         self._data["font_scale"] = round(max(0.7, min(1.5, float(value))), 2)
+        self.save()
+
+    # ── Add-ons folder ────────────────────────────────────────────────────────
+    @property
+    def addons_path(self):
+        v = self._data.get("addons_path")
+        return v or None
+
+    def set_addons_path(self, value):
+        self._data["addons_path"] = (str(value).strip() or None) if value else None
         self.save()
 
     # ── Latency profiles ──────────────────────────────────────────────────────
@@ -268,6 +295,7 @@ def apply_scaling(root):
     style = _ttk.Style(root)
     for s in ("TCombobox","TButton","TEntry","TLabel","TCheckbutton",
               "TRadiobutton","TMenubutton","TSpinbox","TNotebook.Tab","Centered.TNotebook.Tab",
+              "Sub.TNotebook.Tab",
               "TLabelframe.Label","Treeview","Treeview.Heading"):
         try:
             style.configure(s, font=font_spec)
@@ -571,6 +599,28 @@ def open_preferences_dialog(root, on_apply=None):
     _update_desc()
 
     # ── Shared Apply / Reset / Cancel row ────────────────────────────────────
+    # ── Tab 4: Add-ons ────────────────────────────────────────────────────────
+    addon_tab = tk.Frame(notebook)
+    notebook.add(addon_tab, text="Add-ons")
+    tk.Label(addon_tab, text="Add-ons folder",
+             font=("TkDefaultFont", 11, "bold")).pack(pady=(14, 4))
+    tk.Label(addon_tab,
+             text="Folder containing your custom analysis add-on modules (.py).\n"
+                  "Built-in add-ons always load; this path is for your own, and is\n"
+                  "saved so you can keep add-ons anywhere.",
+             justify="left", fg="grey").pack(anchor="w", padx=16, pady=(0, 8))
+    addons_path_var = tk.StringVar(value=prefs.addons_path or "")
+    _ar = tk.Frame(addon_tab); _ar.pack(fill="x", padx=16, pady=(0, 6))
+    tk.Entry(_ar, textvariable=addons_path_var).pack(side="left", fill="x", expand=True)
+    def _browse_addons():
+        from tkinter import filedialog
+        d = filedialog.askdirectory(title="Select add-ons folder")
+        if d:
+            addons_path_var.set(d)
+    tk.Button(_ar, text="Browse\u2026", command=_browse_addons).pack(side="left", padx=(6, 0))
+    tk.Button(addon_tab, text="Clear",
+              command=lambda: addons_path_var.set("")).pack(anchor="w", padx=16, pady=(0, 4))
+
     def _apply():
         # Font scale
         prefs.set_font_scale(scale_var.get() / 100.0)
@@ -604,6 +654,8 @@ def open_preferences_dialog(root, on_apply=None):
             prefs.set_onset_prefs(method_var.get(), pf, mpa, slp, crit, n, bsm, brn, bwb)
         except ValueError:
             pass
+
+        prefs.set_addons_path(addons_path_var.get())
 
         if on_apply:
             on_apply(root)

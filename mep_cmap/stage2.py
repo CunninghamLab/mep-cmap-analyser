@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 
 from .bids import StudyMetadata
+from .preferences import accent_button_kw
 
 
 class Stage2Mixin:
@@ -25,12 +26,44 @@ class Stage2Mixin:
     All methods are intended to be used as part of TMSAnalysisApp.
     """
 
-    def _on_tab_changed(self, event):
-        """Build Stage 2 UI lazily on first visit."""
-        if self.notebook.index(self.notebook.select()) == 3:
-            if not self._stage2_built:
-                self._build_stage2()
-                self._stage2_built = True
+    def _on_tab_changed(self, event=None):
+        """Refresh whatever tab just became visible.
+
+        Nested-notebook aware: fires on tab changes in any notebook (top or a
+        sub-notebook) and uses winfo_ismapped() to decide what is now on screen,
+        rather than relying on flat tab indices.
+        """
+        # Stage 2 — lazy-build on first visit
+        tab2 = getattr(self, "tab2_frame", None)
+        if tab2 is not None and tab2.winfo_ismapped() and not self._stage2_built:
+            self._build_stage2()
+            self._stage2_built = True
+
+        # BIDS-ify — refresh the worklist when its sub-tab is shown
+        bids = getattr(self, "tab_bidsify", None)
+        if bids is not None and bids.winfo_ismapped():
+            try:
+                self._bidsify_tab_refresh()
+            except Exception:
+                pass
+
+        # Add-ons — rescan when its sub-tab is shown (fresh drop-ins)
+        addons_tab = getattr(self, "tab_addons", None)
+        if addons_tab is not None and addons_tab.winfo_ismapped():
+            try:
+                self._addons_refresh_status()
+                self._addons_discover()
+            except Exception:
+                pass
+
+        # Group (second-level) Add-ons — rescan when its sub-tab is shown
+        gadd = getattr(self, "tab_group_addons", None)
+        if gadd is not None and gadd.winfo_ismapped():
+            try:
+                self._group_addons_refresh_status()
+                self._group_addons_discover()
+            except Exception:
+                pass
 
     def _build_stage2(self):
         """Construct the entire Stage 2 panel inside self.tab2_frame."""
@@ -53,8 +86,7 @@ class Stage2Mixin:
                   command=self._s2_load_design).pack(side="left", padx=(2, 0))
         tk.Button(toolbar, text="▶  Build group analysis file",
                   command=self._s2_run,
-                  bg="#5cb85c", fg="white",
-                  font=("TkDefaultFont", 9, "bold")).pack(side="right", padx=(0, 4))
+                  **accent_button_kw("green")).pack(side="right", padx=(0, 4))
 
         # ── Group column manager ──────────────────────────────────────────────
         col_bar = tk.Frame(f)
@@ -169,8 +201,8 @@ class Stage2Mixin:
 
         if not found:
             messagebox.showinfo("Nothing found",
-                "No Stage 1 outputs found in that folder. "
-                "Make sure you have run Stage 1 with a derivatives folder set.",
+                "No First Level outputs found in that folder. "
+                "Make sure you have run First Level with a derivatives folder set.",
                 parent=self.root)
             return
 
@@ -357,14 +389,10 @@ class Stage2Mixin:
         sec1 = tk.LabelFrame(win, text="Stim type roles", padx=8, pady=6)
         sec1.pack(fill="x", padx=10, pady=(10, 4))
 
-        tk.Label(sec1, text="Stim",     width=8,  anchor="w",
-                 font=("TkDefaultFont", 9, "bold")).grid(row=0, column=0, sticky="w")
-        tk.Label(sec1, text="Label",    width=16, anchor="w",
-                 font=("TkDefaultFont", 9, "bold")).grid(row=0, column=1, sticky="w")
-        tk.Label(sec1, text="Role",     width=28, anchor="w",
-                 font=("TkDefaultFont", 9, "bold")).grid(row=0, column=2, sticky="w")
-        tk.Label(sec1, text="N trials", width=8,  anchor="w",
-                 font=("TkDefaultFont", 9, "bold")).grid(row=0, column=3, sticky="w")
+        tk.Label(sec1, text="Stim",     width=8,  anchor="w").grid(row=0, column=0, sticky="w")
+        tk.Label(sec1, text="Label",    width=16, anchor="w").grid(row=0, column=1, sticky="w")
+        tk.Label(sec1, text="Role",     width=28, anchor="w").grid(row=0, column=2, sticky="w")
+        tk.Label(sec1, text="N trials", width=8,  anchor="w").grid(row=0, column=3, sticky="w")
 
         role_vars = {}
         for r, st in enumerate(stim_types, start=1):
@@ -380,7 +408,7 @@ class Stage2Mixin:
             tk.Label(sec1, text=str(n_trials), width=8, anchor="w").grid(row=r, column=3, sticky="w")
 
         tk.Label(win,
-            text="Stage 1 already handles normalisation. Roles are appended as\n"
+            text="First Level already handles normalisation. Roles are appended as\n"
                  "metadata to help identify stim type function in the merged file.",
             fg="grey", justify="left").pack(padx=10, pady=(4, 0), anchor="w")
 
@@ -739,7 +767,7 @@ class Stage2Mixin:
         # ── Bail if nothing loaded ─────────────────────────────────────────────
         if not all_frames:
             messagebox.showerror("No data",
-                "Could not load any session CSVs. Check that Stage 1 has been "
+                "Could not load any session CSVs. Check that First Level has been "
                 "run and the derivatives folder is correct.", parent=self.root)
             return
 

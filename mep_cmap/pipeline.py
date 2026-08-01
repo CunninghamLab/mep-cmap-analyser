@@ -46,7 +46,7 @@ from .detection     import (detect_mep_onset_peak_fraction,
                              detect_mep_onset_bigoni,
                              detect_mep_onset_bigoni_walkback,
                              compute_bootstrap_threshold)
-from .normalisation import compute_mmax, apply_normalisation
+from .normalisation import compute_mmax, apply_normalisation, apply_emg_compensation
 
 @dataclass
 class PipelineConfig:
@@ -86,6 +86,14 @@ class PipelineConfig:
     onset_bigoni_min_run_ms:   float = 0.5
     onset_bigoni_walkback_sd:  float = 1.0
     latency_map:           dict  = field(default_factory=dict)
+    # Onset search-window anchoring (median-waveform seed; MEP onset only).
+    # When enabled, the per-trial onset search window for each stim type is
+    # narrowed to (anchor ± halfwidth), where 'anchor' is the onset detected
+    # on the sample's median waveform using the selected method. Falls back to
+    # the user's latency_map window if the anchor is weak/out-of-window.
+    onset_anchor:              bool  = False
+    onset_anchor_halfwidth_ms: float = 8.0
+    onset_anchor_min_trials:   int   = 8
     # Outlier detection
     outlier_threshold:     float = 1.96
     enable_outlier_review: bool  = True
@@ -115,6 +123,8 @@ class PipelineConfig:
     csp_n_boot:            int   = 1000
     csp_search_end_ms:     float = 400.0
     csp_max_mep_offset_ms: float = 100.0
+    # Averaged-waveform analysis mode (analyse per-condition mean once)
+    average_mode:          bool  = False
 
 
 def _make_bids_prefix(meta_prefix, file_stem):
@@ -304,11 +314,145 @@ def pipeline_review_outliers(stim_type, name, emg_segments, prestim_segments,
     return rejected_indices, log_entries
 
 
+def _detect_onset_dispatch(signal, fs, cfg, min_lat, max_lat):
+    """Run the configured onset detector on a single trace and return onset (ms).
+
+    Standalone copy of the per-trial dispatch used by pipeline_quantify_segments,
+    so the onset-anchoring feature can detect an anchor on the median waveform
+    using the *same* method and parameters as the per-trial detection, without
+    altering the per-trial code path. Returns None if no onset is detected.
+
+    NOTE: ``pre_ms`` MUST be ``cfg.pre_ms`` here — segs_all are extracted with
+    ``samples_before = cfg.pre_ms`` of pre-stim (pipeline_extract_segments), so
+    the stimulus sits at ``cfg.pre_ms``·fs/1000, NOT ``cfg.prestim_ms``. Passing
+    prestim_ms mislocates the stimulus and the detector searches the wrong
+    region (returns None even when a clear MEP is present).
+    """
+    if cfg.onset_method == "bootstrap":
+        return detect_mep_onset_bootstrap(
+            signal, fs,
+            pre_ms=cfg.pre_ms,
+            peak_search_start_ms=cfg.ptp_start,
+            peak_search_end_ms=cfg.ptp_end,
+            min_latency_ms=min_lat,
+            max_latency_ms=max_lat,
+            min_peak_amplitude=cfg.min_peak_amplitude,
+            criterion=cfg.onset_bootstrap_crit,
+            n_boot=cfg.onset_bootstrap_n,
+        )
+    elif cfg.onset_method == "bigoni":
+        return detect_mep_onset_bigoni(
+            signal, fs,
+            pre_ms=cfg.pre_ms,
+            search_start_ms=cfg.ptp_start,
+            search_end_ms=cfg.ptp_end,
+            min_latency_ms=min_lat,
+            max_latency_ms=max_lat,
+            min_peak_amplitude=cfg.min_peak_amplitude,
+            smooth_window_ms=cfg.onset_bigoni_smooth_ms,
+            min_run_ms=cfg.onset_bigoni_min_run_ms,
+        )
+    elif cfg.onset_method == "bigoni_walkback":
+        return detect_mep_onset_bigoni_walkback(
+            signal, fs,
+            pre_ms=cfg.pre_ms,
+            search_start_ms=cfg.ptp_start,
+            search_end_ms=cfg.ptp_end,
+            min_latency_ms=min_lat,
+            max_latency_ms=max_lat,
+            min_peak_amplitude=cfg.min_peak_amplitude,
+            smooth_window_ms=cfg.onset_bigoni_smooth_ms,
+            min_run_ms=cfg.onset_bigoni_min_run_ms,
+            walkback_sd_mult=cfg.onset_bigoni_walkback_sd,
+        )
+    else:
+        return detect_mep_onset_peak_fraction(
+            signal, fs,
+            pre_ms=cfg.pre_ms,
+            poststim_start_ms=cfg.ptp_start,
+            poststim_end_ms=cfg.ptp_end,
+            peak_frac=cfg.peak_fraction,
+            min_consecutive=5,
+            min_peak_amplitude=cfg.min_peak_amplitude,
+            slope_threshold=cfg.slope_threshold,
+        )
+
+
+def pipeline_detect_onsets(stim_type, segs_all, out_set,
+                           ptp_start_idx, ptp_end_idx, fs, cfg,
+                           log_callback=print):
+    """Single anchored MEP-onset pass for one stim-type sample.
+
+    This is the sole source of automatic onset values: it runs the configured
+    detector on every trial in ``segs_all``, optionally within a search window
+    anchored to the sample's MEDIAN waveform (onset anchoring feature). Returns
+    ``{trial_idx: onset_ms | None}``.
+
+    The result seeds both the interactive inspector and the saved output, so
+    what you see and what is written trace to one computation. The median
+    anchor is derived from OUTLIER-SCREENED trials only (``out_set``); user
+    exclusions are made later in the inspector and deliberately do not feed
+    back into the anchor (computed once, no recomputation).
+    """
+    onsets: dict = {}
+    if len(segs_all) == 0:
+        return onsets
+
+    _base_lat = cfg.latency_map.get(stim_type, (10.0, 50.0))
+    _min_lat0, _max_lat0 = _base_lat if _base_lat else (10.0, 50.0)
+    _eff_min_lat, _eff_max_lat = _min_lat0, _max_lat0
+
+    if getattr(cfg, "onset_anchor", False):
+        _clean = [segs_all[j] for j in range(len(segs_all))
+                  if j not in (out_set or set())]
+        _min_n = int(getattr(cfg, "onset_anchor_min_trials", 8))
+        if len(_clean) >= _min_n:
+            try:
+                _median = np.median(np.vstack(_clean), axis=0)
+                _med_ptp = _np_ptp(_median[ptp_start_idx:ptp_end_idx])
+            except Exception:
+                _median, _med_ptp = None, 0.0
+            if _median is not None and _med_ptp >= cfg.min_peak_amplitude:
+                try:
+                    _anchor = _detect_onset_dispatch(_median, fs, cfg, _min_lat0, _max_lat0)
+                except Exception:
+                    _anchor = None
+                if _anchor is not None and _min_lat0 <= _anchor <= _max_lat0:
+                    _hw = float(getattr(cfg, "onset_anchor_halfwidth_ms", 8.0))
+                    _eff_min_lat = max(_min_lat0, _anchor - _hw)
+                    _eff_max_lat = min(_max_lat0, _anchor + _hw)
+                    log_callback(
+                        f"🎯 Onset anchor '{stim_type}': median onset {_anchor:.1f} ms "
+                        f"→ search window {_eff_min_lat:.1f}–{_eff_max_lat:.1f} ms "
+                        f"(from {_min_lat0:.1f}–{_max_lat0:.1f} ms)"
+                    )
+                else:
+                    log_callback(
+                        f"🎯 Onset anchor '{stim_type}': no reliable median onset "
+                        f"— using full window {_min_lat0:.1f}–{_max_lat0:.1f} ms"
+                    )
+            else:
+                log_callback(
+                    f"🎯 Onset anchor '{stim_type}': median MEP below amplitude gate "
+                    f"({_med_ptp:.3f} < {cfg.min_peak_amplitude} mV) "
+                    f"— using full window {_min_lat0:.1f}–{_max_lat0:.1f} ms"
+                )
+        else:
+            log_callback(
+                f"🎯 Onset anchor '{stim_type}': only {len(_clean)} clean trial(s) "
+                f"(< {_min_n}) — using full window {_min_lat0:.1f}–{_max_lat0:.1f} ms"
+            )
+
+    for idx, seg in enumerate(segs_all):
+        onsets[idx] = _detect_onset_dispatch(seg, fs, cfg, _eff_min_lat, _eff_max_lat)
+    return onsets
+
+
 def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
                                 out_set, excluded_set, segments_metadata,
                                 ptp_start_idx, ptp_end_idx,
                                 fs, cfg: PipelineConfig,
-                                custom_labels, name):
+                                custom_labels, name, auto_onsets, log_callback=print):
     """Per-trial quantification of PTP, latency, silent period and AUC.
 
     Returns
@@ -329,60 +473,19 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
     latencies, silent_durs = [], []
     auc_vals_all, auc_vals_clean = [], []
 
+    # Onset comes exclusively from the single anchored pre-pass
+    # (pipeline_detect_onsets), so the automatic values used here are identical
+    # to those seeded into the inspector. Hard requirement — no inline re-detect.
+    if auto_onsets is None:
+        raise ValueError(
+            "pipeline_quantify_segments requires auto_onsets from "
+            "pipeline_detect_onsets (single source of truth for MEP onset)."
+        )
+
     for idx, seg in enumerate(segs_all):
         # ── automatic metrics ────────────────────────────────────────────
         auto_ptp = _np_ptp(seg[ptp_start_idx:ptp_end_idx])
-        _lat     = cfg.latency_map.get(stim_type, (10.0, 50.0))
-        _min_lat, _max_lat = _lat if _lat else (10.0, 50.0)
-
-        if cfg.onset_method == "bootstrap":
-            auto_lat = detect_mep_onset_bootstrap(
-                seg, fs,
-                pre_ms=cfg.prestim_ms,
-                peak_search_start_ms=cfg.ptp_start,
-                peak_search_end_ms=cfg.ptp_end,
-                min_latency_ms=_min_lat,
-                max_latency_ms=_max_lat,
-                min_peak_amplitude=cfg.min_peak_amplitude,
-                criterion=cfg.onset_bootstrap_crit,
-                n_boot=cfg.onset_bootstrap_n,
-            )
-        elif cfg.onset_method == "bigoni":
-            auto_lat = detect_mep_onset_bigoni(
-                seg, fs,
-                pre_ms=cfg.prestim_ms,
-                search_start_ms=cfg.ptp_start,
-                search_end_ms=cfg.ptp_end,
-                min_latency_ms=_min_lat,
-                max_latency_ms=_max_lat,
-                min_peak_amplitude=cfg.min_peak_amplitude,
-                smooth_window_ms=cfg.onset_bigoni_smooth_ms,
-                min_run_ms=cfg.onset_bigoni_min_run_ms,
-            )
-        elif cfg.onset_method == "bigoni_walkback":
-            auto_lat = detect_mep_onset_bigoni_walkback(
-                seg, fs,
-                pre_ms=cfg.prestim_ms,
-                search_start_ms=cfg.ptp_start,
-                search_end_ms=cfg.ptp_end,
-                min_latency_ms=_min_lat,
-                max_latency_ms=_max_lat,
-                min_peak_amplitude=cfg.min_peak_amplitude,
-                smooth_window_ms=cfg.onset_bigoni_smooth_ms,
-                min_run_ms=cfg.onset_bigoni_min_run_ms,
-                walkback_sd_mult=cfg.onset_bigoni_walkback_sd,
-            )
-        else:
-            auto_lat = detect_mep_onset_peak_fraction(
-                seg, fs,
-                pre_ms=cfg.prestim_ms,
-                poststim_start_ms=cfg.ptp_start,
-                poststim_end_ms=cfg.ptp_end,
-                peak_frac=cfg.peak_fraction,
-                min_consecutive=5,
-                min_peak_amplitude=cfg.min_peak_amplitude,
-                slope_threshold=cfg.slope_threshold,
-            )
+        auto_lat = auto_onsets.get(idx)
 
         # ── manual overrides from inspector ──────────────────────────────
         # Inspector segments start at -prestim_ms; segs_all start at -pre_ms.
@@ -394,11 +497,34 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
         def _ci(i): return min(max(0, i - _offset), _n - 1)
         mk = (stim_type, idx)
         if mk in segments_metadata:
-            m       = segments_metadata[mk]
-            man_ptp = seg[_ci(m["ptp_max_idx"])] - seg[_ci(m["ptp_min_idx"])]
-            man_lat = (m["onset_idx"] - _insp_sb) * 1000 / fs
+            m = segments_metadata[mk]
+            # Per-field override. A seed-only entry (from the anchored onset
+            # pre-pass) carries onset_idx but NOT the PTP marker indices —
+            # those are added by the inspector only for trials the user
+            # actually views. Fall back to the auto value for any field the
+            # metadata does not supply, so unviewed seeded trials behave
+            # exactly as auto (single source of truth) rather than raising.
+            if "ptp_max_idx" in m and "ptp_min_idx" in m:
+                man_ptp = seg[_ci(m["ptp_max_idx"])] - seg[_ci(m["ptp_min_idx"])]
+            else:
+                man_ptp = auto_ptp
+            if "onset_idx" in m:
+                man_lat = (m["onset_idx"] - _insp_sb) * 1000 / fs
+            else:
+                man_lat = auto_lat
         else:
             man_ptp, man_lat = auto_ptp, auto_lat
+
+        # A latency at or before the stimulus (≤ 0 ms) is not a physiological
+        # onset — it is a "no detection" placeholder (e.g. the inspector leaves
+        # the marker at the stim when its detector returns nothing, giving
+        # onset_idx == stim → 0.0 ms). Treat as undetected so it is written as
+        # "Not Detected" and excluded from mean/SD latency, rather than being
+        # counted as a real 0 ms latency. PTP is left untouched.
+        if auto_lat is not None and auto_lat <= 0:
+            auto_lat = None
+        if man_lat is not None and man_lat <= 0:
+            man_lat = None
 
         ptps[idx] = man_ptp
 
@@ -490,7 +616,9 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
         # [15] AUC, [16-17] PreStimRMS/PreStimPTP
         # [18] PTP_per_PreStimRMS
         # [19-21] Z scores, [22-25] detrended, [26] Outlier_Decision
-        # [27-31] normalisation (incl Normalised_PTP_per_PreStimRMS), [32] note
+        # [27-31] normalisation (incl Normalised_PTP_per_PreStimRMS)
+        # [32-33] Adjusted_PTP_QR / Normalised_Adjusted_PTP_QR
+        # [34-41] EMGComp_* diagnostics, [42] Manual_Note
         # cSP/MEP ratio (Orth & Rothwell 2004): cSP duration(ms) / MEP PTP(mV), in ms/mV
         _csp_mep = round(float(silent_dur) / float(man_ptp), 4) \
                    if (isinstance(silent_dur, (int, float)) and silent_dur >= 0
@@ -508,7 +636,9 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
             None, None, None, None,                                       # [22-25] Detrended x4
             decision,                                                     # [26] Outlier_Decision
             None, None, None, None, None,                                 # [27-31] norm cols (incl Norm_PTP_per_PreStimRMS)
-            note_txt,                                                     # [32] Manual_Note
+            None, None,                                                   # [32-33] Adjusted_PTP_QR / Normalised_Adjusted_PTP_QR
+            None, None, None, None, None, None, None, None,               # [34-41] EMGComp_* diagnostics
+            note_txt,                                                     # [42] Manual_Note
         ]
 
         auto_row   = common.copy()
@@ -745,6 +875,17 @@ LAT_COLS = [
     "Reference_N",        # trials contributing to reference mean
     "Normalised_PTP",     # PTP / Reference_Mean  (raw ratio)
     "Normalised_PTP_per_PreStimRMS", # Normalised_PTP / PreStimRMS (blank until normalised)
+    # EMG excitability compensation (Carson 2026, quantile regression) — clean trials only
+    "Adjusted_PTP_QR(mV)",            # excitability-compensated PTP (QR)
+    "Normalised_Adjusted_PTP_QR",     # Adjusted_PTP_QR / raw reference mean
+    "EMGComp_Method",                 # "qr" | fallback flag (insufficient_n, degenerate_rms, ...)
+    "EMGComp_N",                      # clean trials contributing to the per-sample fit
+    "EMGComp_Slope",                  # QR slope (mV per µV RMS)
+    "EMGComp_Intercept",              # QR intercept (mV)
+    "EMGComp_InterceptWeight",        # Wi in [0, 1]
+    "EMGComp_Adjustment(mV)",         # reference − mean(PTP)
+    "EMGComp_PseudoR2",               # Koenker–Machado pseudo-R²
+    "EMGComp_Rho_Post",               # Spearman rho(adjusted, RMS) — ≈ 0 when adequate
     # Annotations — always last
     "Manual_Note",
 ]
@@ -787,6 +928,13 @@ def pipeline_write_outputs(latency_manual, results_out, bids_prefix):
         # Detrended
         "Mean_PTP_Detrended_WithinCond(mV)", "SD_PTP_Detrended_WithinCond(mV)",
         "Mean_PTP_Detrended_Session(mV)",    "SD_PTP_Detrended_Session(mV)",
+        # EMG excitability compensation (per-sample diagnostics are constant
+        # within a StimType, so the summary reports the single sample value)
+        "Mean_Adjusted_PTP_QR(mV)", "SD_Adjusted_PTP_QR(mV)",
+        "Mean_Normalised_Adjusted_PTP_QR", "SD_Normalised_Adjusted_PTP_QR",
+        "EMGComp_Method", "EMGComp_N", "EMGComp_Slope", "EMGComp_Intercept",
+        "EMGComp_InterceptWeight", "EMGComp_Adjustment(mV)",
+        "EMGComp_PseudoR2", "EMGComp_Rho_Post",
     ]
 
     def _alpha_sort(df, col):
@@ -865,6 +1013,19 @@ def pipeline_write_outputs(latency_manual, results_out, bids_prefix):
                     _sd(_col(clean,"PTP_Detrended_WithinCond(mV)")),
                     _mn(_col(clean,"PTP_Detrended_Session(mV)")),
                     _sd(_col(clean,"PTP_Detrended_Session(mV)")),
+                    # EMG excitability compensation
+                    _mn(_col(clean,"Adjusted_PTP_QR(mV)")),
+                    _sd(_col(clean,"Adjusted_PTP_QR(mV)")),
+                    _mn(_col(clean,"Normalised_Adjusted_PTP_QR")),
+                    _sd(_col(clean,"Normalised_Adjusted_PTP_QR")),
+                    _str_col(clean,"EMGComp_Method"),
+                    _mn(_col(clean,"EMGComp_N")),
+                    _mn(_col(clean,"EMGComp_Slope")),
+                    _mn(_col(clean,"EMGComp_Intercept")),
+                    _mn(_col(clean,"EMGComp_InterceptWeight")),
+                    _mn(_col(clean,"EMGComp_Adjustment(mV)")),
+                    _mn(_col(clean,"EMGComp_PseudoR2")),
+                    _mn(_col(clean,"EMGComp_Rho_Post")),
                 ])
             return pd.DataFrame(rows, columns=SUM_HDR)
 
@@ -928,6 +1089,358 @@ def pipeline_generate_plots(trace_stats, time_axis, segments_metadata,
 
     return out_path   # return combined figure path for auto-open
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Averaged-waveform analysis (optional mode) — build step 1 of 4
+#
+# When average_mode is enabled, each condition (stim type) is collapsed to a
+# single mean waveform over its outlier-screened trials and measured ONCE,
+# mirroring the marker consumption of pipeline_quantify_segments so a mean is
+# measured identically to how a trial is measured. Produces a reduced column
+# set (single-waveform measures only); detrend/z-score/bootstrap columns are
+# omitted because they are inherently multi-trial.
+#
+# All arrays here are INSPECTOR-space (full prestim_ms pre-stim), i.e. the
+# exact segments fed to the inspector, so any user-adjusted marker indices
+# apply directly without offset conversion.
+# ─────────────────────────────────────────────────────────────────────────────
+
+AVERAGED_COLS = [
+    "File", "StimType", "Stim_Label", "Limb", "Measure",
+    "N_Trials_Averaged",
+    "PTP(mV)", "Latency(ms)",
+    "cSP_Duration(ms)", "cSP_MEP_Offset(ms)", "cSP_EMG_Return(ms)",
+    "cSP_MEP_Ratio(ms/mV)",
+    "AUC(mV*s)",
+    "PreStimRMS", "PreStimPTP",
+    "PTP_per_PreStimRMS",
+    # Normalisation (Stage 1a reference_map; blank if not configured)
+    "Reference_Type", "Reference_Mean(mV)", "Reference_N",
+    "Normalised_PTP", "Normalised_PTP_per_PreStimRMS",
+    "Manual_Note",
+]
+
+
+def pipeline_assemble_condition_means(stats_per_type, emg, time, fs, cfg,
+                                      log_callback=print):
+    """Collapse each condition to a mean waveform over its clean trials.
+
+    Built in INSPECTOR space (full prestim_ms pre-stim) directly from the raw
+    recording, indexed by the per-trial stim timestamps in
+    stats_per_type[...]["stim_times_s"] (which align 1:1 with segs_all and the
+    outlier_set). Outlier screening therefore stays correctly aligned no matter
+    how many edge trials the extraction windows drop, so the result never
+    depends on a segments_inspector count match.
+
+    Returns
+    -------
+    {stim_type: {"mean": np.ndarray, "individual": np.ndarray[n_clean, L],
+                 "n": int}}   Conditions with no usable clean trials are skipped.
+    """
+    _insp_sb = int(cfg.prestim_ms * fs / 1000)
+    _insp_sa = int(cfg.post_ms    * fs / 1000)
+    means = {}
+    for stim_type, info in stats_per_type.items():
+        stim_ts = info.get("stim_times_s", [])
+        out     = info.get("outlier_set", set()) or set()
+        clean   = []
+        for _i, _t0 in enumerate(stim_ts):
+            if _i in out:
+                continue
+            _ix  = int(np.argmin(np.abs(time - _t0)))
+            _seg = emg[max(0, _ix - _insp_sb):_ix + _insp_sa]
+            if len(_seg) == _insp_sb + _insp_sa:
+                clean.append(_seg)
+        if not clean:
+            log_callback(f"⚠️  Averaged mode: '{stim_type}' has no clean trials "
+                         f"with a full pre-stim window — skipped.")
+            continue
+        stack = np.asarray(clean, dtype=float)
+        means[stim_type] = {"mean": stack.mean(axis=0),
+                            "individual": stack,
+                            "n": stack.shape[0]}
+    return means
+
+
+def pipeline_quantify_averaged(means, segments_metadata, fs, cfg,
+                               custom_labels, name, log_callback=print):
+    """Measure each condition's mean waveform, returning reduced-column rows.
+
+    Inspector markers (keyed ``(stim_type, 0)``) take precedence; any measure
+    not supplied by the inspector is auto-detected on the mean. Indices are
+    inspector-space (stim at ``prestim_ms * fs / 1000``).
+    """
+    # prestim RMS/PTP computed inline (same convention as
+    # pipeline_quantify_segments) — no cross-module import needed.
+
+    insp_sb = int(cfg.prestim_ms * fs / 1000)          # stim index in the mean
+    ptp_s   = insp_sb + int(cfg.ptp_start * fs / 1000)
+    ptp_e   = insp_sb + int(cfg.ptp_end   * fs / 1000)
+    meta_all = segments_metadata or {}
+
+    rows = []
+    for stim_type, info in means.items():
+        seg = np.asarray(info["mean"], dtype=float)
+        n_clean = info["n"]
+        L = len(seg)
+        meta = meta_all.get((stim_type, 0), {})
+        label = custom_labels.get(stim_type, stim_type) if custom_labels else stim_type
+
+        def _clamp(i):
+            return min(max(0, int(i)), L - 1)
+
+        # ── PTP ──────────────────────────────────────────────────────────
+        if "ptp_max_idx" in meta and "ptp_min_idx" in meta:
+            ptp = float(seg[_clamp(meta["ptp_max_idx"])]
+                        - seg[_clamp(meta["ptp_min_idx"])])
+        else:
+            _e = min(ptp_e, L); _s = min(ptp_s, max(_e - 1, 0))
+            ptp = float(_np_ptp(seg[_s:_e])) if _e > _s else float("nan")
+
+        # ── Latency / onset ──────────────────────────────────────────────
+        onset_idx = None
+        if "onset_idx" in meta:
+            onset_idx = int(meta["onset_idx"])
+            lat = (onset_idx - insp_sb) * 1000.0 / fs
+        else:
+            _min, _max = cfg.latency_map.get(stim_type,
+                                             (cfg.ptp_start, cfg.ptp_end))
+            lat = _detect_onset_dispatch(seg, fs, cfg, _min, _max)
+            if lat is not None:
+                onset_idx = insp_sb + int(round(lat * fs / 1000))
+        if lat is not None and lat <= 0:
+            lat, onset_idx = None, None
+
+        # ── cSP ──────────────────────────────────────────────────────────
+        csp_dur = csp_off = csp_ret = None
+        csp_start_idx = None
+        if "silent_start_idx" in meta and "silent_end_idx" in meta:
+            ss = int(meta["silent_start_idx"]); se = int(meta["silent_end_idx"])
+            csp_dur = round((se - ss) * 1000.0 / fs, 2)
+            csp_off = round((ss - insp_sb) * 1000.0 / fs, 2)
+            csp_ret = round((se - insp_sb) * 1000.0 / fs, 2)
+            csp_start_idx = ss
+        elif stim_type in cfg.csp_types:
+            from .detection import detect_csp_bootstrap as _dcsp
+            _e = min(ptp_e, L); _s = min(ptp_s, max(_e - 1, 0))
+            if _e > _s:
+                _win = seg[_s:_e]
+                _peak = _s + int(max(np.argmin(_win), np.argmax(_win)))
+                _peak2ms = (_peak - insp_sb) * 1000.0 / fs
+                _t = np.linspace(-cfg.prestim_ms,
+                                 -cfg.prestim_ms + L * 1000.0 / fs,
+                                 L, endpoint=False)
+                _csp = _dcsp(seg, fs, _t,
+                             pre_ms=cfg.prestim_ms,
+                             search_start_ms=_peak2ms,
+                             search_end_ms=cfg.csp_search_end_ms,
+                             min_silence_ms=cfg.csp_min_silence_ms,
+                             min_return_ms=cfg.csp_min_return_ms,
+                             criterion=cfg.csp_criterion,
+                             significance=cfg.csp_significance,
+                             n_boot=cfg.csp_n_boot)
+                if _csp is not None:
+                    ss, se = int(_csp[0]), int(_csp[1])
+                    csp_dur = round((se - ss) * 1000.0 / fs, 2)
+                    csp_off = round((ss - insp_sb) * 1000.0 / fs, 2)
+                    csp_ret = round((se - insp_sb) * 1000.0 / fs, 2)
+                    csp_start_idx = ss
+
+        # ── AUC ──────────────────────────────────────────────────────────
+        auc_val = None
+        if "auc_start_idx" in meta and "auc_end_idx" in meta:
+            a0, a1 = _clamp(meta["auc_start_idx"]), _clamp(meta["auc_end_idx"])
+            if a1 > a0:
+                auc_val = float(_np_trapz(np.abs(seg[a0:a1]), dx=1 / fs))
+        elif onset_idx is not None and csp_start_idx is not None \
+                and csp_start_idx > onset_idx:
+            auc_val = float(_np_trapz(np.abs(seg[onset_idx:csp_start_idx]),
+                                      dx=1 / fs))
+
+        # ── baseline / ratios ────────────────────────────────────────────
+        prestim = seg[:insp_sb] if insp_sb > 0 else seg[:1]
+        rms = float(np.sqrt(np.mean(prestim ** 2))) if len(prestim) else 0.0
+        preptp = float(_np_ptp(prestim)) if len(prestim) else 0.0
+        ptp_per_rms = (ptp / rms) if (rms and not np.isnan(ptp)) else None
+        csp_ratio = (round(csp_dur / ptp, 4)
+                     if (csp_dur is not None and ptp and not np.isnan(ptp)
+                         and ptp != 0) else None)
+
+        rows.append({
+            "File": name, "StimType": stim_type, "Stim_Label": label,
+            "Limb": cfg.limb, "Measure": cfg.measure,
+            "N_Trials_Averaged": n_clean,
+            "PTP(mV)": round(ptp, 6) if not np.isnan(ptp) else None,
+            "Latency(ms)": round(lat, 2) if lat is not None else "Not Detected",
+            "cSP_Duration(ms)": csp_dur if csp_dur is not None else "Not Marked",
+            "cSP_MEP_Offset(ms)": csp_off,
+            "cSP_EMG_Return(ms)": csp_ret,
+            "cSP_MEP_Ratio(ms/mV)": csp_ratio,
+            "AUC(mV*s)": round(auc_val, 6) if auc_val is not None else None,
+            "PreStimRMS": round(rms, 6),
+            "PreStimPTP": round(preptp, 6),
+            "PTP_per_PreStimRMS": round(ptp_per_rms, 4)
+                                  if ptp_per_rms is not None else None,
+            "Reference_Type": "",
+            "Reference_Mean(mV)": None,
+            "Reference_N": None,
+            "Normalised_PTP": None,
+            "Normalised_PTP_per_PreStimRMS": None,
+            "Manual_Note": meta.get("note", ""),
+        })
+    return rows
+
+
+def pipeline_write_averaged(rows, results_out, bids_prefix):
+    """Write the reduced-column averaged-waveform CSV.
+
+    Output
+    ------
+    <prefix>_averaged.csv  — one row per condition (measured on the mean).
+    """
+    df = pd.DataFrame(rows, columns=AVERAGED_COLS)
+    out_path = os.path.join(results_out, f"{bids_prefix}_averaged.csv")
+    df.to_csv(out_path, index=False)
+    return out_path
+
+
+def pipeline_normalise_averaged(rows, cfg, log_callback=print):
+    """Fill normalisation columns on averaged rows (Stage 1a reference_map).
+
+    Simplified averaged-mode normalisation: each condition contributes a single
+    value — the PTP of its mean waveform — so a referenced condition is
+    normalised to the reference condition's mean-waveform PTP (no plateau
+    detection, which needs multiple trials):
+
+        Normalised_PTP = PTP(mean of X) / PTP(mean of reference)
+
+    Applied within one file's conditions (references are within-recording).
+    Fills the row dicts in place; rows without a configured reference are left
+    blank, exactly as the per-trial path leaves them.
+    """
+    if not rows or not cfg.reference_map:
+        return
+    ptp_by_type = {}
+    n_by_type   = {}
+    for r in rows:
+        st = r["StimType"]
+        try:
+            ptp_by_type[st] = float(r["PTP(mV)"])
+        except (TypeError, ValueError):
+            ptp_by_type[st] = None
+        n_by_type[st] = r.get("N_Trials_Averaged")
+    for r in rows:
+        st  = r["StimType"]
+        ref = cfg.reference_map.get(st, "")
+        if not ref or ref not in ptp_by_type:
+            continue
+        ref_ptp = ptp_by_type.get(ref)
+        try:
+            ptp_f = float(r["PTP(mV)"])
+        except (TypeError, ValueError):
+            continue
+        if ref_ptp is None or ref_ptp <= 0:
+            log_callback(f"⚠️  Averaged normalisation: reference '{ref}' "
+                         f"for '{st}' has no usable mean — left blank.")
+            continue
+        _norm = ptp_f / ref_ptp
+        r["Reference_Type"]     = f"{ref}_averaged"
+        r["Reference_Mean(mV)"] = round(ref_ptp, 4)
+        r["Reference_N"]        = n_by_type.get(ref)
+        r["Normalised_PTP"]     = round(_norm, 4)
+        try:
+            _rms = float(r.get("PreStimRMS"))
+            r["Normalised_PTP_per_PreStimRMS"] = (round(_norm / _rms, 4)
+                                                  if _rms > 0 else None)
+        except (TypeError, ValueError):
+            r["Normalised_PTP_per_PreStimRMS"] = None
+        log_callback(f"📐 Averaged '{st}' normalised to '{ref}' "
+                     f"(ref PTP {ref_ptp:.3f} mV): {r['Normalised_PTP']}")
+
+
+def pipeline_generate_averaged_plots(means, fs, cfg, figures_out, bids_prefix,
+                                     name, unit, log_callback=print):
+    """Save one figure per condition: individual clean traces faint, the mean
+    bold on top, and the stimulus line — the output-file companion to the
+    inspector's averaged view. Returns the list of written paths."""
+    os.makedirs(figures_out, exist_ok=True)
+    paths = []
+    for stim_type, info in means.items():
+        seg = np.asarray(info["mean"], dtype=float)
+        L   = len(seg)
+        t   = np.linspace(-cfg.prestim_ms, -cfg.prestim_ms + L * 1000.0 / fs,
+                          L, endpoint=False)
+        colour = cfg.color_map.get(stim_type, "tab:blue")
+        label  = cfg.custom_labels.get(stim_type, stim_type)
+        fig = matplotlib.figure.Figure(figsize=(12, 6))
+        ax  = fig.add_subplot(111)
+        for _tr in info["individual"]:
+            if len(_tr) == L:
+                ax.plot(t, _tr, color=colour, lw=0.4, alpha=0.20, zorder=1)
+        ax.plot(t, seg, color=colour, lw=2.0, zorder=3,
+                label=f"{label} mean (n={info['n']}, PTP {_np_ptp(seg):.2f})")
+        ax.axvline(0, color="k", ls="--")
+        ax.set_title(f"{name} – {label} (averaged waveform)")
+        ax.set_xlabel("Latency (ms)")
+        ax.set_ylabel(f"EMG ({unit})" if unit else "EMG")
+        ax.legend(loc="upper right", frameon=False)
+        _pth = os.path.join(figures_out,
+                            f"{bids_prefix}_stim-{stim_type}_averaged.png")
+        matplotlib.backends.backend_agg.FigureCanvasAgg(fig).print_figure(_pth, dpi=600)
+        fig.clf()
+        paths.append(_pth)
+    return paths
+
+
+def pipeline_write_segments_bundle(bundle, results_out, bids_prefix,
+                                   log_callback=print):
+    """Persist the per-trial waveform bundle (<prefix>_segments.npz) that
+    add-ons consume.
+
+    Format-agnostic by construction: the waveforms are the normalised segments
+    (post format-reader), so the file carries no trace of the original import
+    format — only arrays, fs, unit, and the pre/post window needed to rebuild
+    the millisecond time axis (0 ms = stimulus). Index-keyed groups support
+    mixed fs / length / unit across files in one run.
+
+    Layout
+    ------
+    manifest_file / manifest_stim / manifest_unit          (str,   one per group)
+    manifest_fs / manifest_pre_ms / manifest_post_ms       (float, one per group)
+    wav_{i}   [n_trials, n_samples] float32   per-trial waveforms (segs space)
+    out_{i}   [n_trials] bool                 outlier flag per trial
+    tidx_{i}  [n_trials] int                  trial index within (file, stim)
+    stime_{i} [n_trials] float                stim timestamp (s)
+    """
+    if not bundle:
+        return None
+    arrays = {}
+    g_file, g_stim, g_unit, g_fs, g_pre, g_post = [], [], [], [], [], []
+    for i, grp in enumerate(bundle):
+        wav = np.asarray(grp["waveforms"], dtype=np.float32)
+        arrays[f"wav_{i}"]   = wav
+        arrays[f"out_{i}"]   = np.asarray(grp["outlier"], dtype=bool)
+        arrays[f"tidx_{i}"]  = np.arange(wav.shape[0], dtype=int)
+        arrays[f"stime_{i}"] = np.asarray(grp["stim_time_s"], dtype=float)
+        g_file.append(str(grp["file"]));      g_stim.append(str(grp["stim_type"]))
+        g_unit.append(str(grp["unit"]))
+        g_fs.append(float(grp["fs"]))
+        g_pre.append(float(grp["pre_ms"]));   g_post.append(float(grp["post_ms"]))
+    # String arrays use numpy unicode dtype (not object) so the file loads
+    # without allow_pickle.
+    arrays["manifest_file"]    = np.asarray(g_file)
+    arrays["manifest_stim"]    = np.asarray(g_stim)
+    arrays["manifest_unit"]    = np.asarray(g_unit)
+    arrays["manifest_fs"]      = np.asarray(g_fs, dtype=float)
+    arrays["manifest_pre_ms"]  = np.asarray(g_pre, dtype=float)
+    arrays["manifest_post_ms"] = np.asarray(g_post, dtype=float)
+    os.makedirs(results_out, exist_ok=True)
+    out_path = os.path.join(results_out, f"{bids_prefix}_segments.npz")
+    np.savez_compressed(out_path, **arrays)
+    log_callback(f"💾 Waveform bundle written: {os.path.basename(out_path)} "
+                 f"({len(bundle)} group(s))")
+    return out_path
+
+
 def run_pipeline(input_path,
                  pre_ms,
                  post_ms,
@@ -964,6 +1477,9 @@ def run_pipeline(input_path,
                  onset_bigoni_min_run_ms=0.5,
                  onset_bigoni_walkback_sd=1.0,
                  latency_map=None,
+                 onset_anchor=False,
+                 onset_anchor_halfwidth_ms=8.0,
+                 onset_anchor_min_trials=8,
                  filter_harmonics=False,
                  enable_inspector=False,
                  gui_root=None,
@@ -985,6 +1501,7 @@ def run_pipeline(input_path,
                  csp_criterion=1.96, csp_significance=0.99,
                  csp_n_boot=1000, csp_search_end_ms=400.0,
                  csp_max_mep_offset_ms=100.0,
+                 average_mode=False,
                  existing_segments_metadata=None):
     """
     Orchestrate the full per-file MEP/CMAP analysis pipeline.
@@ -1014,6 +1531,9 @@ def run_pipeline(input_path,
         onset_bigoni_min_run_ms=onset_bigoni_min_run_ms,
         onset_bigoni_walkback_sd=onset_bigoni_walkback_sd,
         latency_map=latency_map or {},
+        onset_anchor=onset_anchor,
+        onset_anchor_halfwidth_ms=onset_anchor_halfwidth_ms,
+        onset_anchor_min_trials=onset_anchor_min_trials,
         outlier_threshold=outlier_threshold,
         enable_outlier_review=enable_outlier_review,
         custom_labels=custom_labels or {},
@@ -1037,6 +1557,7 @@ def run_pipeline(input_path,
         csp_n_boot=csp_n_boot,
         csp_search_end_ms=csp_search_end_ms,
         csp_max_mep_offset_ms=csp_max_mep_offset_ms,
+        average_mode=average_mode,
     )
 
     # ── BIDS output paths ─────────────────────────────────────────────────────
@@ -1103,6 +1624,8 @@ def run_pipeline(input_path,
     # ── Accumulators (across files) ───────────────────────────────────────────
     summary_rows, with_out_rows = [], []
     latency_auto, latency_manual = [], []
+    _averaged_rows = []          # averaged-mode: one row per (file, condition)
+    _segments_bundle = []        # add-on bundle: per (file, stim_type) waveforms
     ptp_data, rms_data, preptp_data, full_ptp_data = {}, {}, {}, {}
     rejected_outlier_log = []
     rng = default_rng(42)
@@ -1203,6 +1726,22 @@ def run_pipeline(input_path,
                     pre_segs  = pre_segs[keep]
                     stats_per_type[stim_type]["segs"] = emg_segs
 
+                # Accumulate this condition's per-trial waveforms for the
+                # add-on results bundle (<prefix>_segments.npz). segs_all is
+                # the normalised segment array — format-agnostic — and is
+                # 1:1 with outlier_set and stim_times_s.
+                _sb_all = stats_per_type[stim_type]["segs_all"]
+                _segments_bundle.append({
+                    "file": name, "stim_type": stim_type, "fs": fs,
+                    "unit": unit or "", "pre_ms": cfg.pre_ms,
+                    "post_ms": cfg.post_ms, "waveforms": _sb_all,
+                    "outlier": np.array([_i in outlier_set
+                                         for _i in range(len(_sb_all))],
+                                        dtype=bool),
+                    "stim_time_s": np.asarray(
+                        stats_per_type[stim_type]["stim_times_s"], dtype=float),
+                })
+
                 # Save clean CSV
                 df_clean = pd.DataFrame(emg_segs).T
                 df_clean = _add_time_and_digmark(df_clean, samples_before, fs)
@@ -1234,6 +1773,82 @@ def run_pipeline(input_path,
                 # the PTP analysis window (10-50ms) and would otherwise give ~0.
                 _full_ptps = _np_ptp(emg_segs[:, samples_before:], axis=1)
                 full_ptp_data.setdefault(stim_type, []).extend(_full_ptps.tolist())
+
+            # ── Stage 5c: Anchored onset pre-pass (single source of truth) ────
+            # One automatic onset pass per stim type, computed from
+            # outlier-screened trials. Feeds BOTH the inspector's starting
+            # markers and the saved output, so what you see and what is written
+            # are one computation. auto_onsets_by_type: {stim_type: {idx: ms}}.
+            auto_onsets_by_type = {}
+            for _st, _info in stats_per_type.items():
+                auto_onsets_by_type[_st] = pipeline_detect_onsets(
+                    _st, _info["segs_all"], _info["outlier_set"],
+                    ptp_start_idx, ptp_end_idx, fs, cfg,
+                    log_callback=log_callback)
+            # Seed for the inspector, in inspector index space (stim @ _insp_sb).
+            _insp_sb_seed = int(round(cfg.prestim_ms * fs / 1000))
+            auto_meta = {}
+            for _st, _onsets in auto_onsets_by_type.items():
+                for _idx, _oms in _onsets.items():
+                    if _oms is not None:
+                        auto_meta[(_st, _idx)] = {
+                            "onset_idx": _insp_sb_seed + int(round(_oms * fs / 1000))
+                        }
+
+            # ── Averaged-waveform analysis mode ───────────────────────────────
+            # Collapse each condition to its clean-trial mean, inspect/measure
+            # the mean once, accumulate reduced rows, then skip this file's
+            # per-trial quantify / detrend / bootstrap / plot stages. Rows are
+            # written once after the loop (the File column disambiguates files).
+            if cfg.average_mode:
+                _means = pipeline_assemble_condition_means(
+                    stats_per_type, emg, time, fs, cfg,
+                    log_callback=log_callback)
+                # Seed the inspector with an onset detected on each mean.
+                _avg_seed = {}
+                for _st, _mi in _means.items():
+                    _mn, _mx = cfg.latency_map.get(
+                        _st, (cfg.ptp_start, cfg.ptp_end))
+                    _oms = _detect_onset_dispatch(
+                        _mi["mean"], fs, cfg, _mn, _mx)
+                    if _oms is not None and _oms > 0:
+                        _avg_seed[(_st, 0)] = {
+                            "onset_idx": _insp_sb_seed
+                            + int(round(_oms * fs / 1000))}
+                _avg_meta = (dict(existing_segments_metadata)
+                             if existing_segments_metadata else {})
+                if (enable_inspector and show_inspector_cb
+                        and _means and file_i == 0):
+                    _avg_insp_segs = {
+                        _st: [_mi["mean"]]
+                        for _st, _mi in _means.items()}
+                    _avg_meta = show_inspector_cb(
+                        _avg_insp_segs, fs, cfg.prestim_ms, post_ms, unit,
+                        custom_labels, color_map, prestim_ms,
+                        extra_segs={},
+                        wide_window_s=cfg.wide_window_s,
+                        auto_meta=_avg_seed,
+                        underlays={_st: _mi["individual"]
+                                   for _st, _mi in _means.items()})
+                else:
+                    _avg_meta.update(_avg_seed)
+                _avg_rows = pipeline_quantify_averaged(
+                    _means, _avg_meta, fs, cfg,
+                    custom_labels or {}, name, log_callback=log_callback)
+                pipeline_normalise_averaged(_avg_rows, cfg,
+                                            log_callback=log_callback)
+                _averaged_rows.extend(_avg_rows)
+                # Output-file companion: per-condition mean + faint underlays.
+                if _means:
+                    try:
+                        pipeline_generate_averaged_plots(
+                            _means, fs, cfg, figures_out, _bids_prefix,
+                            name, unit, log_callback=log_callback)
+                    except Exception as _pe:
+                        log_callback(f"⚠️  Averaged plot error: {_pe}")
+                if progress_callback:
+                    progress_callback(((file_i + 1) / len(txt_files)) * 100)
+                continue
 
             # ── Stage 6: Data Inspector ───────────────────────────────────────
             # Seed with any previously saved metadata so manual edits
@@ -1300,7 +1915,8 @@ def run_pipeline(input_path,
                     _insp_segs, fs, cfg.prestim_ms, post_ms, unit,
                     custom_labels, color_map, prestim_ms,
                     extra_segs=_extra_segs,
-                    wide_window_s=cfg.wide_window_s)
+                    wide_window_s=cfg.wide_window_s,
+                    auto_meta=auto_meta)
 
             # Parse inspector metadata
             excluded_sets = defaultdict(set)
@@ -1321,7 +1937,9 @@ def run_pipeline(input_path,
                     info["outlier_set"], excluded_sets[stim_type],
                     segments_metadata,
                     ptp_start_idx, ptp_end_idx,
-                    fs, cfg, custom_labels or {}, name)
+                    fs, cfg, custom_labels or {}, name,
+                    auto_onsets_by_type.get(stim_type, {}),
+                    log_callback=log_callback)
 
                 latency_auto.extend(auto_r)
                 latency_manual.extend(man_r)
@@ -1362,6 +1980,51 @@ def run_pipeline(input_path,
 
         if progress_callback:
             progress_callback(((file_i + 1) / len(txt_files)) * 100)
+
+    # ── Add-on results bundle: per-trial waveforms (format-agnostic) ──────
+    pipeline_write_segments_bundle(_segments_bundle, results_out,
+                                   _bids_prefix, log_callback)
+
+    # ── Averaged mode: write the accumulated reduced CSV and return ────────
+    # The per-file branch skipped per-trial accumulation, so the aggregate
+    # stages below (compensation / normalisation / trial + summary CSVs) do not
+    # apply. Write <prefix>_averaged.csv once, then finish.
+    if cfg.average_mode:
+        if _averaged_rows:
+            os.makedirs(results_out, exist_ok=True)
+            _avg_path = pipeline_write_averaged(
+                _averaged_rows, results_out, _bids_prefix)
+            log_callback(f"\u2714\ufe0f  Averaged analysis written: "
+                         f"{os.path.basename(_avg_path)}")
+        else:
+            log_callback("\u26a0\ufe0f  Averaged mode: no rows produced \u2014 nothing written.")
+        if progress_callback:
+            progress_callback(100)
+        log_callback("\u2705 Averaged analysis complete.")
+        return
+
+    # ── Stage 9a: EMG excitability compensation (Carson 2026, QR) ─────────
+    # Runs unconditionally (independent of normalisation). Fits QR per StimType
+    # sample on clean trials only. EVERY stim type is compensated — including a
+    # single-pulse condition that serves as a paired-pulse normalisation
+    # reference, since the fit is within-stim-type and single-pulse MEPs are a
+    # valid target. (A reference stim gets Adjusted_PTP_QR but no
+    # Normalised_Adjusted_PTP_QR, because a reference is never normalised.)
+    # The one exception is genuine M-wave data — a direct muscle response, not
+    # spinally mediated, and typically a multi-intensity recruitment curve — so
+    # compensation is skipped when the run is designated 'M-wave'. (External
+    # Mmax reference files are never present in these trial rows.)
+    if (cfg.measure or "").strip().lower().replace(" ", "-") == "m-wave":
+        log_callback("🧮 EMG compensation skipped — measure is 'M-wave' "
+                     "(direct muscle response; not spinally mediated)")
+    else:
+        _emg_col_idx = {c: i for i, c in enumerate(LAT_COLS)}
+        apply_emg_compensation(
+            latency_manual, _emg_col_idx,
+            log_callback=log_callback)
+        apply_emg_compensation(
+            latency_auto, _emg_col_idx,
+            log_callback=lambda _: None)
 
     # ── Stage 9b: Apply normalisation (Mmax / paired-pulse ratios) ─────────
     if cfg.reference_map:

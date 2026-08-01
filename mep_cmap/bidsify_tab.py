@@ -29,6 +29,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 from .bids import StudyMetadata
+from .preferences import accent_button_kw
 from .bidsify import DatasetLayout, BidsifyItem, plan_bidsify, execute_plan
 from .bidsify_dialog import BidsifyDialog
 from .bidsify_state import (BidsifyState, STATUS_LABELS, STATUS_COLOURS,
@@ -106,7 +107,6 @@ class BidsifyTabMixin:
 
         row1 = tk.Frame(top); row1.pack(fill="x", pady=(0, 4))
         tk.Button(row1, text="✎  Edit shared defaults…",
-                  font=("TkDefaultFont", 9, "bold"),
                   command=self._bidsify_edit_defaults).pack(side="left")
         self._bidsify_defaults_lbl = tk.Label(row1, text="Not set yet", fg="#888")
         self._bidsify_defaults_lbl.pack(side="left", padx=(10, 0))
@@ -130,8 +130,7 @@ class BidsifyTabMixin:
         tk.Button(bar, text="✓ Accept defaults for selected",
                   command=self._bidsify_accept_defaults_selected).pack(side="left", padx=(0, 4))
         tk.Button(bar, text="▶  Convert ready files", command=self._bidsify_convert_ready,
-                  bg="#5cb85c", fg="white",
-                  font=("TkDefaultFont", 9, "bold")).pack(side="right", padx=(0, 4))
+                  **accent_button_kw("green")).pack(side="right", padx=(0, 4))
 
         cols = ("status", "sub", "ses", "cond", "modality", "missing", "path")
         tree_wrap = tk.Frame(mid); tree_wrap.pack(fill="both", expand=True)
@@ -345,7 +344,7 @@ class BidsifyTabMixin:
 
         btns = tk.Frame(win, bg="#f5f5f5"); btns.pack(fill="x", padx=12, pady=10)
         tk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
-        tk.Button(btns, text="Save", bg=_ACCENT, fg="white",
+        tk.Button(btns, text="Save", **accent_button_kw("blue"),
                   command=_save).pack(side="right", padx=(0, 8))
         tk.Button(btns, text="Validate", command=_validate).pack(side="right", padx=(0, 8))
 

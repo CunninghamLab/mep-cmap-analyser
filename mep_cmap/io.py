@@ -19,7 +19,7 @@ Adding a new format
 
 Public API
 ----------
-  detect_format(file_path)                     -> 'spike2' | 'spike2_smr' | 'labchart' | 'cfwb' | 'generic_tsv' | 'edf'
+  detect_format(file_path)                     -> 'spike2' | 'spike2_smr' | 'labchart' | 'cfwb' | 'generic_tsv'
   needs_wizard(file_path)                      -> bool
   list_waveform_channels(file_path)            -> list[str]
   list_event_channels(file_path)               -> list[str]
@@ -47,9 +47,13 @@ import os as _os
 from .formats import spike2      as _spike2
 from .formats import spike2_smr  as _spike2_smr
 from .formats import labchart    as _labchart
+from .formats import labchart_mat as _labchart_mat
+from .formats import brainsight  as _brainsight
+from .formats import acqknowledge_mat as _acqknowledge_mat
+from .formats import acqknowledge_acq as _acqknowledge_acq
+from .formats import brainvision  as _brainvision
 from .formats import cfwb        as _cfwb
 from .formats import generic_tsv as _generic_tsv
-from .formats import edf         as _edf
 
 def _generic_has_config(file_path: str) -> bool:
     return _generic_tsv.has_config(file_path)
@@ -128,12 +132,26 @@ def detect_format(file_path: str) -> str:
     ext = _os.path.splitext(file_path)[1].lower()
     if ext == '.smr':
         return 'spike2_smr'
-    if ext in ('.edf', '.bdf'):
-        return 'edf'
+    if ext == '.acq':
+        return 'acqknowledge_acq'
 
     # ── Binary formats: check magic bytes before opening as text ─────────────
     if _cfwb.is_cfwb(file_path):
         return 'cfwb'
+
+    # LabChart MATLAB export (.mat) — verify signature vars without loading data
+    if ext == '.mat' and _labchart_mat.is_labchart_mat(file_path):
+        return 'labchart_mat'
+    if ext == '.mat' and _acqknowledge_mat.is_acqknowledge_mat(file_path):
+        return 'acqknowledge_mat'
+
+    # Brainsight neuronavigation export (.txt) — header-signature sniff
+    if _brainsight.is_brainsight(file_path):
+        return 'brainsight'
+
+    # BrainVision (.vhdr/.vmrk/.eeg) — resolves via the sibling .vhdr header
+    if _brainvision.is_brainvision(file_path):
+        return 'brainvision'
 
     with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
         first_line = f.readline()
@@ -195,8 +213,16 @@ def list_waveform_channels(file_path: str) -> list:
     fmt = detect_format(file_path)
     if fmt == 'spike2_smr':
         return _spike2_smr.list_waveform_channels(file_path)
-    if fmt == 'edf':
-        return _edf.list_waveform_channels(file_path)
+    if fmt == 'acqknowledge_acq':
+        return _acqknowledge_acq.list_waveform_channels(file_path)
+    if fmt == 'acqknowledge_mat':
+        return _acqknowledge_mat.list_waveform_channels(file_path)
+    if fmt == 'brainvision':
+        return _brainvision.list_waveform_channels(file_path)
+    if fmt == 'brainsight':
+        return _brainsight.list_waveform_channels(file_path)
+    if fmt == 'labchart_mat':
+        return _labchart_mat.list_waveform_channels(file_path)
     if fmt == 'labchart':
         return _labchart.list_waveform_channels(file_path)
     if fmt == 'cfwb':
@@ -240,8 +266,16 @@ def extract_emg_waveform_and_fs(file_path: str, channel_idx: int = 0):
     fmt = detect_format(file_path)
     if fmt == 'spike2_smr':
         return _spike2_smr.extract_emg_waveform_and_fs(file_path, channel_idx)
-    if fmt == 'edf':
-        return _edf.extract_emg_waveform_and_fs(file_path, channel_idx)
+    if fmt == 'acqknowledge_acq':
+        return _acqknowledge_acq.extract_emg_waveform_and_fs(file_path, channel_idx)
+    if fmt == 'acqknowledge_mat':
+        return _acqknowledge_mat.extract_emg_waveform_and_fs(file_path, channel_idx)
+    if fmt == 'brainvision':
+        return _brainvision.extract_emg_waveform_and_fs(file_path, channel_idx)
+    if fmt == 'brainsight':
+        return _brainsight.extract_emg_waveform_and_fs(file_path, channel_idx)
+    if fmt == 'labchart_mat':
+        return _labchart_mat.extract_emg_waveform_and_fs(file_path, channel_idx)
     if fmt == 'labchart':
         return _labchart.extract_emg_waveform_and_fs(file_path, channel_idx)
     if fmt == 'cfwb':
@@ -271,8 +305,16 @@ def extract_stim_times(file_path: str, marker_name: str) -> dict:
     fmt = detect_format(file_path)
     if fmt == 'spike2_smr':
         return _spike2_smr.extract_stim_times(file_path, marker_name)
-    if fmt == 'edf':
-        return _edf.extract_stim_times(file_path, marker_name)
+    if fmt == 'acqknowledge_acq':
+        return _acqknowledge_acq.extract_stim_times(file_path, marker_name)
+    if fmt == 'acqknowledge_mat':
+        return _acqknowledge_mat.extract_stim_times(file_path, marker_name)
+    if fmt == 'brainvision':
+        return _brainvision.extract_stim_times(file_path, marker_name)
+    if fmt == 'brainsight':
+        return _brainsight.extract_stim_times(file_path, marker_name)
+    if fmt == 'labchart_mat':
+        return _labchart_mat.extract_stim_times(file_path, marker_name)
     if fmt == 'labchart':
         return _labchart.extract_stim_times(file_path, marker_name)
     if fmt == 'cfwb':

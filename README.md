@@ -1,6 +1,6 @@
 # MEP-CMAP Analyser
 
-**Version 1.0 | June 2026**  
+**Version 1.2 | August 2026**  
 *Author: Justin Andrushko PhD, Northumbria University*
 
 [![PyPI version](https://badge.fury.io/py/mep-cmap-analyser.svg)](https://pypi.org/project/mep-cmap-analyser/)
@@ -11,15 +11,49 @@
 **GitHub:** https://github.com/jandrushko/mep-cmap-analyser  
 **Bug reports:** https://github.com/jandrushko/mep-cmap-analyser/issues
 
-A BIDS-compliant, open-source desktop tool for processing, quantifying, and group-analysing TMS/EMG neurophysiology recordings. Built for researchers who need reproducible, auditable waveform analysis without writing custom scripts for every study.
+A BIDS-compliant, open-source, cross-platform desktop tool for processing, quantifying, and group-analysing TMS/EMG neurophysiology recordings. Built for researchers who need reproducible, auditable waveform analysis without writing custom scripts for every study — and extensible with community add-ons for analyses the core tool doesn't yet cover.
 
 ---
 
 ## Overview
 
-MEP-CMAP Analyser is a two-stage GUI pipeline for EMG data collected with transcranial magnetic stimulation (TMS) and peripheral nerve stimulation (PNS) paradigms. Stage 1 processes individual recordings — filtering, segmenting trials around stimulation events, detecting and quantifying response features, and allowing per-trial human review. Stage 2 merges all processed sessions into a single, statistics-ready output file. Every setting, decision, and manual edit is saved in a sidecar JSON so analyses are fully reproducible and can be re-run or audited at any time.
+MEP-CMAP Analyser is a GUI pipeline for EMG data collected with transcranial magnetic stimulation (TMS) and peripheral nerve stimulation (PNS) paradigms. It is organised around a neuroimaging-style **first-level / second-level** workflow:
+
+- **Setup** — open a dataset, manage the file queue, and (optionally) convert raw recordings into a BIDS-compliant layout.
+- **First Level: Single File** — process individual recordings: filter, segment trials around stimulation events, detect and quantify response features, review per trial, and run optional analysis add-ons.
+- **Second Level: Group** — merge all processed sessions into a single, statistics-ready table for mixed-effects modelling, and run optional group-level add-ons.
+
+Every setting, decision, and manual edit is saved in a sidecar JSON so analyses are fully reproducible and can be re-run or audited at any time.
 
 The tool is not limited to any single measure or paradigm. It handles motor evoked potentials (MEPs), compound muscle action potentials (CMAPs), cortical silent periods (cSPs), M-wave recruitment curves, paired-pulse protocols such as SICI and ICF, and any other time-locked EMG response measurable by peak-to-peak amplitude, onset latency, or area under the curve. It operates on continuous recordings, pre-epoched trial stacks, and EMG bursts recorded without stimulation.
+
+---
+
+## What's New in 1.2
+
+- **Extensible add-ons framework** — drop-in Python modules that run post-hoc on saved results and write their own new files, at two scopes: **single-file** (first level) and **group-level** (second level). Ships with a faithful port of **MEPFeatX** (morphological MEP features), a rectified-area example, and a group-summary example.
+- **Second Level add-ons tab** — group-level add-ons operate on the merged group table.
+- **Reorganised interface** — a clearer two-level tab structure (Setup / First Level / Second Level) with a persistent active-file header and step-by-step first-level sub-tabs (1a–1d + Add-ons).
+- **Check for updates** — Settings → Check for updates queries GitHub Releases and offers an assisted update (pip upgrade, or a link to the download page for compiled builds).
+- **BIDS-ify** — convert non-BIDS recordings into a BIDS-compliant `rawdata/` layout with shared, per-file editable stimulation metadata (NIBS BEP037).
+- **Broader format support** — added BIOPAC AcqKnowledge (`.acq` and `.mat`), Brainsight neuronavigation exports, BrainVision, and LabChart MATLAB exports.
+- **Cross-platform polish** — readable coloured action buttons on macOS, Windows, and Linux, and consistent font scaling across the interface.
+
+---
+
+## The Interface
+
+```
+Setup                         First Level: Single File            Second Level: Group
+├── Dataset                   ├── 1a  Labels & Analysis Setup      ├── Group Analysis (LME)
+└── BIDS-ify                  ├── 1b  Data Filtering               └── Add-ons
+                              ├── 1c  Feature Detection Setup
+                              │       (+ ▶ Run Analysis)
+                              ├── 1d  Normalisation (optional)
+                              └── Add-ons
+```
+
+The active file, channel, and event marker are shown in a persistent header above the First-Level sub-tabs, so context stays visible as you move between steps.
 
 ---
 
@@ -27,183 +61,177 @@ The tool is not limited to any single measure or paradigm. It handles motor evok
 
 ### Data Ingestion and Format Support
 
-The tool auto-detects the file format on open. Supported formats are:
+The tool auto-detects the file format on open (by extension, binary signature, or header sniff) and dispatches to the correct reader. Supported formats:
 
-#### Spike-2 text export (.txt)
-Exported from Spike-2 via **File → Export → Text**. Waveform channels are read along with DigMark event timestamps. Any number of stimulus types and marker codes are supported. File I/O is accelerated by the compiled Rust extension (`mep_cmap_io`).
+#### Spike-2 native (`.smr`) — *requires `neo`*
+Native Spike-2 binary files read directly via the [Neo](https://neo.readthedocs.io) library — no text-export step. On first open a dialog identifies the EMG channel and stim/trigger channel; the choice is saved to a sidecar (`.smr_config.json`) and not asked again. DigMark marker codes (A, B, C, …) are decoded from the event channel and each appears as a separate stimulus type. Neo is installed automatically with `pip install mep-cmap-analyser`.
 
-#### Spike-2 native (.smr) — *requires `neo` package*
-Native Spike-2 binary files are read directly via the [Neo](https://neo.readthedocs.io) library — no text export step required. On first open a dialog prompts the user to identify the EMG channel and stim/trigger channel. The choices are saved to a sidecar JSON (`.smr_config.json`) alongside the data file and are not asked again. DigMark marker codes (A, B, C, ...) are decoded from the event channel and each code appears as a separate stimulus type in Stage 1a, exactly as with the text export format.
+#### Spike-2 text export (`.txt`)
+Exported via **File → Export → Text**. Waveform channels are read along with DigMark event timestamps; any number of stimulus types and marker codes are supported. I/O is accelerated by the compiled Rust extension (`mep_cmap_io`).
 
-> **Note:** Install Neo before using this format: `pip install neo`. Neo is included automatically when installing via `pip install mep-cmap-analyser`.
+#### LabChart text export (`.txt`)
+Auto-detected from the `Interval=` header. Each recording block is treated as a pre-aligned trial; no trigger channel is required. Rust-accelerated.
 
-#### LabChart text export (.txt)
-Auto-detected from the `Interval=` header line. Each recording block is treated as a pre-aligned trial; no trigger channel is required. File I/O is accelerated by the Rust extension.
+#### LabChart MATLAB export (`.mat`)
+LabChart's MATLAB export is detected by its signature variables and read natively — no LabChart installation required.
 
-#### ADInstruments binary / CFWB (.adibin)
-Binary files exported from LabChart via **File → Export → ADInstruments Binary**. The CFWB format is fully documented and parsed natively in Rust — no LabChart installation required. Stimulation times are derived from a trigger/TTL channel which is auto-detected by channel name (keywords: `stim`, `trig`, `ttl`).
+#### ADInstruments CFWB binary (`.adibin`)
+Exported from LabChart via **File → Export → ADInstruments Binary**. The CFWB format is parsed natively in Rust. Stimulation times are derived from a trigger/TTL channel auto-detected by name (`stim`, `trig`, `ttl`). Rust-accelerated.
 
-#### KinEMG / NI-DAQ CSV export (.txt)
-Auto-detected from the `Author,KinEMG` header. Sampling rate and channel names (`Dev1/ai0` etc.) are parsed directly from the file header.
+#### BIOPAC AcqKnowledge (`.acq`)
+Native BIOPAC AcqKnowledge acquisition files, read via `bioread`. Channels and event markers are decoded directly from the file.
 
-#### Generic Format Wizard (.txt, .csv)
-For any other tabular text file (tab, space, or comma delimited). A one-time, four-step wizard configures:
-- **Column-wise** layouts (rows = time samples, columns = channels) — typical for most DAQ exports and continuous recordings
-- **Row-wise** layouts (rows = channels, columns = time samples) — used by Delsys Trigno and similar systems, where one row is a continuous TTL trigger signal and another row is the EMG recording
-- Automatic detection of non-numeric header lines, channel name rows, and embedded sampling rate metadata so the wizard pre-fills as much as possible before the user clicks through
-- Per-channel role assignment: EMG, Stim/Trigger, or Ignore
-- Configuration saved as a sidecar JSON; subsequent opens load instantly without re-running the wizard
+#### BIOPAC AcqKnowledge MATLAB export (`.mat`)
+AcqKnowledge's MATLAB export, detected by its signature variables and read without a BIOPAC installation.
+
+#### Brainsight neuronavigation export (`.txt`)
+Brainsight TMS neuronavigation session exports are recognised by their header signature, with stimulation events taken from the navigation record.
+
+#### BrainVision (`.vhdr` / `.vmrk` / `.eeg`)
+The BrainVision Core Data Format, resolved via the sibling `.vhdr` header and `.vmrk` markers.
+
+#### KinEMG / NI-DAQ CSV
+NI-DAQ / KinEMG CSV exports; sampling rate and channel names (`Dev1/ai0`, …) are read from the file header.
+
+#### Generic Format Wizard (`.txt`, `.csv`)
+For any other tabular text file (tab, space, or comma delimited). A one-time, four-step wizard configures **column-wise** layouts (rows = samples, columns = channels) or **row-wise** layouts (rows = channels, e.g. Delsys Trigno with one continuous TTL row and one EMG row), auto-detecting header lines, channel-name rows, and embedded sampling-rate metadata. Per-channel roles (EMG / Stim-Trigger / Ignore) are assigned once and saved to a sidecar; subsequent opens load instantly.
 
 #### Format detection summary
 
-| Extension | Format | Stim time source | Rust accelerated |
+| Input | Format | Stim time source | Rust accelerated |
 |---|---|---|---|
 | `.smr` | Spike-2 native (Neo) | DigMark / event channel | No (Neo) |
 | `.txt` | Spike-2 text export | DigMark timestamps | Yes |
 | `.txt` | LabChart text export | Interval resets | Yes |
-| `.txt` | KinEMG CSV | None (manual) | No |
-| `.txt` / `.csv` | Generic TSV (wizard) | Trigger channel | Yes |
-| `.adibin` | CFWB binary | TTL channel (auto-detected) | Yes |
+| `.mat` | LabChart MATLAB export | Comments / event channel | No |
+| `.adibin` | ADInstruments CFWB binary | TTL channel (auto-detected) | Yes |
+| `.acq` | BIOPAC AcqKnowledge | Event markers | No |
+| `.mat` | BIOPAC AcqKnowledge (MATLAB) | Event markers | No |
+| `.txt` | Brainsight neuronavigation | Navigation events | No |
+| `.vhdr` | BrainVision | `.vmrk` markers | No |
+| `.csv` / `.txt` | KinEMG / NI-DAQ CSV | Trigger channel (optional) | No |
+| `.txt` / `.csv` | Generic TSV (wizard) | Trigger channel / TTL row | Yes |
+
+New formats are easy to add: a single `formats/<name>.py` module with three public functions, plus two lines in `io.py`.
 
 ### Signal Processing
 
 - Bandpass filter (default 20–450 Hz, adjustable) using Butterworth or Chebyshev Type I designs, with independent highpass and lowpass orders
 - Notch filter at any frequency (e.g. 50 or 60 Hz) with adjustable Q factor
-- Humbug-style mains noise canceller with configurable harmonic count
-- Flexible bandpass mode for independent control of highpass and lowpass cutoff orders
-- Real-time filter preview showing frequency response and wavelet time-frequency decomposition of the raw signal
+- Humbug-style mains-noise canceller with configurable harmonic count
+- Real-time filter preview showing frequency response and a wavelet time-frequency decomposition of the raw signal
+- A **Confirm filter settings** step advances the guided first-level workflow from filtering to feature detection
 
 ### Trial Segmentation
 
 - Configurable pre-stimulus and post-stimulus windows (ms)
 - Per stimulus-type gap parameter to skip the TMS artefact period before onset search
-- Multi-stimulus support within a single recording: every marker/event label gets its own settings, colour, and output column
-- Stim times sourced from: DigMark timestamps (Spike-2 text and native .smr), interval resets (LabChart), TTL/trigger channel rising edges (CFWB binary, generic TTL rows), or manually entered
+- Multi-stimulus support within a single recording: every marker/event label gets its own settings, colour, and output columns
+- Stim times sourced from DigMark timestamps (Spike-2), interval resets (LabChart), TTL/trigger rising edges (CFWB, generic TTL rows), event markers (BIOPAC, BrainVision, Brainsight), or manual entry
 
 ### Response Quantification
 
 | Measure | Description |
 |---|---|
 | **PTP amplitude (mV)** | Peak-to-peak amplitude within the user-specified MEP/CMAP window |
-| **Onset latency (ms)** | MEP onset relative to stimulus, using peak-anchored backward scan or bootstrap threshold detection |
-| **AUC (mV·s)** | Area under the rectified EMG from onset to cSP start (or user-defined window via drag selector) |
-| **cSP duration (ms)** | Duration of the cortical silent period, from EMG suppression onset to EMG return |
+| **Onset latency (ms)** | MEP onset relative to stimulus (see onset detection methods) |
+| **AUC (mV·s)** | Area under the rectified EMG from onset to cSP start (or a user-defined window via drag selector) |
+| **cSP duration (ms)** | Cortical silent period, from EMG suppression onset to EMG return |
 | **cSP MEP offset (ms)** | Time from stimulus to start of cSP |
 | **cSP EMG return (ms)** | Time from stimulus to EMG recovery after cSP |
-| **cSP/MEP ratio** | cSP duration divided by MEP PTP amplitude, in ms/mV (Orth & Rothwell, 2004 [5]) |
-| **Normalised PTP** | PTP expressed as a fraction of an Mmax reference or single-pulse reference mean |
+| **cSP/MEP ratio (ms/mV)** | cSP duration divided by MEP PTP amplitude (Orth & Rothwell, 2004 [5]) |
+| **Normalised PTP** | PTP as a fraction of an Mmax or single-pulse reference mean |
 | **Paired-pulse ratio** | Conditioned / reference amplitude for SICI, ICF, or any custom pairing |
-| **Z-score (within type)** | Standardised amplitude within each stimulus type |
-| **Z-score (pooled)** | Standardised amplitude across all conditions in the file |
-| **Detrended PTP — within condition (mV)** | Linearly detrended amplitude within each stimulus type, removing condition-specific drift across trials |
-| **Detrended PTP — session (mV)** | Linearly detrended amplitude using a single trend fitted across all trials in chronological order, capturing session-wide drift such as fatigue or potentiation |
-| **Overall trial number** | Chronological trial index across all stimulus types, based on stimulus timestamp order |
-| **Stimulus time (s)** | Absolute timestamp of each stimulus in the recording (seconds from recording start) |
-| **Inter-stimulus interval (s)** | Time elapsed since the immediately preceding stimulus (any type); useful as a covariate when stimulation order is randomised or variable |
+| **Z-score (within / pooled)** | Standardised amplitude within each stimulus type, and pooled across conditions |
+| **Detrended PTP — within condition (mV)** | Linearly detrended amplitude within each stimulus type, removing condition-specific drift |
+| **Detrended PTP — session (mV)** | Linearly detrended using a single trend across all trials in chronological order (captures fatigue/potentiation) |
+| **Overall trial number** | Chronological trial index across all stimulus types, by stimulus timestamp order |
+| **Stimulus time (s)** | Absolute timestamp of each stimulus (seconds from recording start) |
+| **Inter-stimulus interval (s)** | Time since the immediately preceding stimulus (any type) — a useful covariate for variable ISIs |
 
 ### MEP Onset Detection
 
-Three detection methods are available. The global default is set in **Settings → Preferences → Detection** and can be overridden per file in Stage 1a without affecting the preference. All methods share the same physiological latency bounds (see [Physiological Latency Profiles](#physiological-latency-profiles)) and return `None` rather than a floor value when no confident onset is found, so ambiguous trials are flagged rather than silently mislabelled.
+Three detection methods are available. The global default is set in **Settings → Preferences → Detection** and can be overridden per file in 1a without affecting the preference. All methods share the same physiological latency bounds (see [Physiological Latency Profiles](#physiological-latency-profiles)) and return `None` rather than a floor value when no confident onset is found, so ambiguous trials are flagged rather than silently mislabelled.
 
-**Derivative-based method — Bigoni et al. 2022 (default)** — identifies the onset as the start of the longest sustained positive-derivative run in the rising edge of the MEP waveform. An optional Savitzky-Golay smoothing step reduces noise before differentiation. This method does not rely on pre-stimulus baseline statistics and therefore makes no assumptions about background EMG level, making it robust for both resting-state and active-contraction paradigms and for biphasic MEP waveforms of either polarity. The implementation follows the algorithm described in Bigoni et al. [6] with adaptations for variable sampling rates and variable muscle-group search windows. Two parameters are tuneable in Preferences: smoothing window (default 2 ms) and minimum positive-run length (default 1 ms).
+**Derivative-based method — Bigoni et al. 2022 (default)** — identifies onset as the start of the longest sustained positive-derivative run on the MEP rising edge, with optional Savitzky-Golay pre-smoothing. It makes no assumptions about background EMG level, so it is robust for both resting and active-contraction paradigms and for biphasic waveforms of either polarity. Follows Bigoni et al. [6] with adaptations for variable sampling rates and muscle-group windows. Tuneable: smoothing window (default 2 ms) and minimum positive-run length (default 1 ms).
 
-**Peak-fraction method** — finds the largest positive and negative peaks in the MEP window, then scans backward from the dominant peak to find where the signal first crosses a fraction of that peak (configurable, default 15%). A minimum peak amplitude threshold guards against noise false-positives. Works well on clean, high-amplitude MEPs with a near-silent pre-stimulus baseline.
+**Peak-fraction method** — finds the largest positive and negative peaks, then scans backward from the dominant peak to the point where the signal first crosses a fraction of that peak (default 15%), with a minimum-amplitude guard. Best on clean, high-amplitude MEPs with a near-silent baseline.
 
-**Bootstrap threshold method** — estimates a noise threshold from the pre-stimulus baseline using a bootstrap distribution, then scans backward from the dominant peak within a physiologically plausible latency window. More sensitive than the peak-fraction method on low-amplitude signals where the peak-fraction threshold is set too low relative to noise. Latency windows are defined per stimulus type and have built-in defaults based on published normative data (see [Physiological Latency Profiles](#physiological-latency-profiles)):
-
-| Stimulus / Muscle target | Latency window |
-|---|---|
-| TMS → deltoid / trapezius | 8–16 ms |
-| TMS → biceps / triceps brachii | 12–20 ms |
-| TMS → trunk / external oblique | 12–22 ms |
-| TMS → hand / FDI / APB / ADM | 18–28 ms |
-| TMS → forearm (FCR / ECR) | 16–26 ms |
-| TMS → vastus lateralis / quad | 18–30 ms |
-| TMS → hamstrings | 18–32 ms |
-| TMS → tibialis anterior / leg | 28–45 ms |
-| PNS → upper limb (M-wave) | 2–12 ms |
-| PNS → lower limb (M-wave) | 4–18 ms |
-
-Default windows and the pre-selected muscle group for new stimulus types can be changed globally in **Settings → Preferences → Latency Profiles**. Per-file overrides set in Stage 1a are saved independently and are not affected by preference changes. All three onset methods respect these bounds.
+**Bootstrap threshold method** — estimates a noise threshold from the pre-stimulus baseline via a bootstrap distribution, then scans backward within a physiologically plausible latency window. More sensitive on low-amplitude signals. Latency windows are per stimulus type with published normative defaults.
 
 ### Cortical Silent Period (cSP) Detection
 
-cSP detection uses a vectorised bootstrap method: a silence threshold is estimated from the pre-stimulus baseline and a search is conducted from a configurable offset after MEP onset. Detection criteria are configurable:
-
-- Minimum silence duration (default 25 ms)
-- Minimum EMG return window (default 40 ms)
-- Bootstrap criterion (default 1.96 SD)
-- Statistical significance level (default 99th percentile)
-- Maximum search window end (default 400 ms)
-- Maximum MEP-to-cSP offset (default 100 ms)
-
-cSP detection can be enabled or disabled per stimulus type and overridden per trial in the Data Inspector.
+A vectorised bootstrap method: a silence threshold is estimated from the pre-stimulus baseline and a search runs from a configurable offset after MEP onset. Configurable criteria include minimum silence duration (default 25 ms), minimum EMG-return window, bootstrap criterion (default 1.96 SD), significance level (default 99th percentile), search-window end, and maximum MEP-to-cSP offset. cSP detection can be enabled/disabled per stimulus type and overridden per trial in the Data Inspector. The 1c Feature Detection Setup tab exposes all of these with inline guidance.
 
 ### M-wave Normalisation and Mmax
 
-A separate Mmax file can be designated containing M-wave responses across a range of stimulus intensities. The tool automatically detects the plateau region using a robust algorithm that handles three real-world scenarios:
+A separate Mmax file can be designated containing M-waves across a range of intensities. The plateau region is detected robustly for three scenarios: a full recruitment curve (averages the plateau within a tolerance band, default ±10%), a few supramaximal pulses (averages the largest similar-amplitude cluster), or a single M-wave (used directly). Normalised PTP is then reported for all MEP trials as a fraction of Mmax.
 
-- **Full recruitment curve** — finds and averages the plateau region within a configurable tolerance band (default ±10%)
-- **A few supramaximal pulses** — averages the largest cluster of similar amplitudes
-- **Single M-wave** — uses that value directly
-
-Normalised PTP is then reported for all MEP trials as a fraction of Mmax.
+For designs where the background excitability of spinal motoneurones varies across trials — for example active-contraction paradigms — the tool also supports regression-based compensation of evoked-potential magnitude following the method of Carson (2026) [9], as an alternative or complement to Mmax normalisation.
 
 ### Paired-Pulse Protocols
 
-Any stimulus type can be designated as a conditioned stimulus and paired with a reference in Stage 1a. The tool computes conditioned/reference amplitude ratios (e.g. SICI at 2–6 ms ISI, ICF at 10–15 ms ISI) as a standard output column. Multiple reference assignments can be configured within a single file for complex designs.
+Any stimulus type can be designated as a conditioned stimulus and paired with a reference in 1a. Conditioned/reference ratios (e.g. SICI at 2–6 ms ISI, ICF at 10–15 ms ISI) are produced as a standard output column, with multiple reference assignments supported within a single file.
 
 ### Outlier Detection and Review
 
 - Z-score flagging on PTP amplitude and RMS with a configurable threshold (default ±1.96)
-- Interactive outlier review dialog showing the flagged waveform in context with the option to include, exclude, or note the trial
-- Outlier decisions persist across reruns — previously reviewed trials are not re-presented
-- All decisions are written to a separate outlier log CSV
+- Interactive review dialog showing the flagged waveform in context, with include / exclude / note options
+- Decisions persist across reruns — reviewed trials are not re-presented — and are recorded in the trial CSV's `Outlier_Decision` column
 
 ### Data Inspector
 
-Per-trial interactive review with:
+Per-trial interactive review with a zoomed trial view plus a wider context window; draggable onset, cSP-start, and cSP-end markers; a drag-to-select AUC window; per-trial notes; and keyboard navigation. All edits are saved to the session JSON and applied on every subsequent run without re-review.
 
-- Zoomed trial view plus a wider context window (configurable width, default ±3 s around stim)
-- Draggable onset marker
-- Draggable cSP start and end markers
-- Drag-to-select AUC window with a toggle button
-- Per-trial annotation notes
-- Keyboard navigation (next/previous trial, next stim type)
-- All edits saved to the session JSON and applied on every subsequent run without re-review
+### Add-ons (Extensible Analyses)
+
+Add-ons are optional, drop-in Python modules that run **after** processing, read the saved results, and write **their own new files** — they never modify core outputs. They come in two scopes:
+
+- **First-level (single-file) add-ons** run on each recording's saved waveform bundle (`<prefix>_segments.npz`) and appear on the **First Level → Add-ons** tab.
+- **Second-level (group-level) add-ons** run on the merged group table (`group_level_LME_ready.csv`) and appear on the **Second Level → Add-ons** tab.
+
+Built-in add-ons:
+
+| Add-on | Scope | What it does |
+|---|---|---|
+| **mepfeatx** | single-file | A faithful port of MEPFeatX (Nguyen et al. 2025 [10]): morphological MEP features — amplitude, latency, AUC, waveform thickness, number of turns and phases, duration, and the two dominant peaks (T1/T2) — with per-trial and per-condition diagnostic figures and a transparent rejection reason for every trial it can't quantify |
+| **rectified_area** | single-file | Rectified area under each MEP over the analysis window (a minimal example) |
+| **group_summary** | group-level | Per-condition mean, SD, and N of every metric across the group (a minimal example) |
+
+Add-ons can declare their own settings, which render as controls in the add-on's box (for example, MEPFeatX exposes a tunable noise-gate ratio for handling MEPs recorded during voluntary contraction). Point the tool at your own add-ons folder in **Settings → Preferences → Add-ons**; place first-level add-ons in a `single_file/` subfolder and group-level add-ons in a `group_level/` subfolder. See [Writing Add-ons](#writing-add-ons).
+
+### BIDS-ify
+
+The **Setup → BIDS-ify** tab converts non-BIDS recordings into a BIDS-compliant `rawdata/` layout. Shared stimulation metadata (following the NIBS BEP037 proposal) is edited once and applied to every file, with per-file overrides where needed. Files are reviewed, accepted, and converted from a persistent, status-coloured worklist, so a whole study can be brought into BIDS in one pass.
 
 ### Session Persistence and Reproducibility
 
-Every setting the user touches — filter parameters, time windows, onset detection method, latency maps, cSP thresholds, normalisation references, Inspector edits, outlier decisions, analysis options — is saved in a per-file session JSON alongside the derivatives. Reloading a file restores the exact state. Changing a filter or threshold and re-running produces a clean new result without losing the manual review work.
+Every setting the user touches — filter parameters, time windows, onset method, latency maps, cSP thresholds, normalisation references, Inspector edits, outlier decisions, analysis options — is saved in a per-file session JSON alongside the derivatives. Reloading restores the exact state; changing a setting and re-running produces a clean new result without losing manual review work. File paths in session JSONs are stored relative to the study root for portability across machines and cloud sync.
 
 ### Dataset Queue
 
-- Load a study folder or individual files; the tool auto-detects BIDS `rawdata/` and `derivatives/` subfolders
-- A persistent file queue tracks processing status: Not Started, In Progress, Needs Review, Complete, or Stale
-- Previously excluded files are remembered and not re-added on refresh
-- Right-click menu to restore excluded files, mark files for reprocessing, or open the derivatives folder
-- Queue state saved to `dataset_session.json`
+- Open a study folder or individual files; the tool auto-detects BIDS `rawdata/` and `derivatives/` subfolders
+- A persistent queue tracks status (Not Started, In Progress, Needs Review, Complete, Stale)
+- Excluded files are remembered and not re-added on refresh; a right-click menu restores them, marks files for reprocessing, or opens the derivatives folder
+- Process a highlighted recording with **Run selected**
+- Queue state is saved to `dataset_session.json`
 
-### Group Analysis (Stage 2)
+### Check for Updates
 
-Once any number of sessions are processed, Stage 2 merges them into a single LME-ready CSV:
-
-- Scans the derivatives folder to discover all completed sessions
-- User assigns study design columns (Group, Condition, Timepoint, or any custom factor)
-- Stim type roles are assigned globally (Reference, Conditioned, M-wave, etc.)
-- Output includes all trial-level data with Z-scores, detrended values, normalised amplitudes, and study design columns — ready for linear mixed effects models in R, Python, or SPSS
+**Settings → Check for updates** queries GitHub Releases in the background, compares the latest version to the one you're running, and — if you're behind — shows the release notes and offers an assisted update: a `pip install --upgrade` for source/pip installs, or a link to the download page for compiled builds. It fails gracefully offline and falls back to version tags if no formal release is published.
 
 ---
 
 ## Supported Use Cases
 
-The tool is general enough to handle any paradigm where a time-locked EMG response is expected within a defined post-stimulus window. Examples include but are not limited to:
+The tool handles any paradigm where a time-locked EMG response is expected within a defined post-stimulus window, including but not limited to:
 
-- **TMS MEP studies** — single-pulse, paired-pulse (SICI, ICF, LICI, SAI), or multi-intensity recruitment curves; cortical and cerebellar targets; any accessible muscle
-- **Peripheral nerve stimulation CMAPs** — M-wave recruitment curves for Mmax determination or peripheral motor nerve conduction
-- **Corticospinal excitability assays** — resting and active MEP series, pre/post intervention, crossover and parallel group designs
+- **TMS MEP studies** — single-pulse, paired-pulse (SICI, ICF, LICI, SAI), or multi-intensity recruitment curves; any accessible muscle
+- **Peripheral nerve stimulation CMAPs** — M-wave recruitment curves for Mmax determination or peripheral conduction
+- **Corticospinal excitability assays** — resting and active MEP series, pre/post intervention, crossover and parallel designs
 - **TMS-EMG silent period studies** — cSP duration, cSP/MEP ratio, and derived inhibitory indices
-- **Voluntary EMG bursts** — files with no stimulation events can be loaded for waveform inspection, RMS quantification, and trial-level output even without stim-triggered segmentation
+- **MEP waveform morphology** — via the MEPFeatX add-on (turns, phases, thickness, T1/T2)
+- **Voluntary EMG bursts** — files with no stimulation events can be loaded for waveform inspection, RMS quantification, and trial-level output
 
 ---
 
@@ -216,14 +244,14 @@ pip install mep-cmap-analyser
 mep-cmap
 ```
 
-Python 3.9 or later is required. Tkinter must be available on your system:
+Python 3.9 or later is required. Tkinter must be available:
 
 - **Windows / macOS** — included with standard Python installers
 - **Linux (Ubuntu / Debian)** — `sudo apt install python3-tk`
 
 ### Option 2: Compiled binaries (no Python required)
 
-Pre-built executables for all platforms are available on the [Releases page](https://github.com/jandrushko/mep-cmap-analyser/releases). Download, unzip, and run — no installation or Python knowledge needed.
+Pre-built builds for each platform are on the [Releases page](https://github.com/jandrushko/mep-cmap-analyser/releases). Download, unzip, and run.
 
 | Platform | File |
 |---|---|
@@ -244,72 +272,37 @@ python -m mep_cmap
 
 ## Workflow
 
-### Step 1 — Dataset Setup
+### 1. Setup → Dataset
 
-Open a study folder or an individual recording. The tool auto-detects whether the folder follows BIDS conventions (`rawdata/` present beside `derivatives/`) or sets up a new derivatives folder in the standard location. Files appear in the queue with their current status. Double-click any file to load it, or click **Run all unprocessed** to process the queue in sequence.
+Open a study folder or an individual recording. The tool auto-detects a BIDS layout (`rawdata/` beside `derivatives/`) or sets up a derivatives folder in the standard location. Files appear in the queue with their status; double-click any file to load it, or highlight one and click **Run selected**. Opening an unrecognised format launches the Format Wizard for a one-time configuration.
 
-If you open a file in a format the tool has not seen before, the Format Wizard launches automatically to guide you through a one-time configuration.
+### 2. Setup → BIDS-ify *(optional)*
 
-### Step 2 — Stage 1a: Labels and Analysis Setup
+If your data isn't yet in BIDS, use BIDS-ify to set shared stimulation metadata and convert the ready files into a `rawdata/` tree.
 
-For each stimulus type present in the recording, configure:
+### 3. First Level → 1a Labels & Analysis Setup
 
-- Display label and colour
-- Gap (ms) — samples to skip after the artefact before MEP onset search begins
-- Whether to run cSP detection on this stim type
-- Stimulus category and target muscle (sets physiological latency bounds)
-- Normalisation reference pairing (for paired-pulse or Mmax-relative output)
+For each stimulus type in the recording, configure the display label and colour, the artefact gap (ms), whether to run cSP detection, the stimulus category and target muscle (which set physiological latency bounds), and any normalisation/paired-pulse reference pairing. Click **✔ Confirm Setup** when ready. Settings carry over between files.
 
-Settings are preserved between files so you rarely need to re-enter them for a new session.
+### 4. First Level → 1b Data Filtering
 
-### Step 3 — Stage 1b: Processing
+Set bandpass, notch, and Humbug options, preview the filter, then click **✔ Confirm filter settings → Feature Detection**.
 
-Set filters, time windows, onset detection parameters, and cSP settings. Run the analysis. The tool extracts trials, quantifies all measures, detects outliers, presents flagged trials for review (if enabled), runs the Data Inspector for manual review (optional), and writes results to the derivatives folder.
+### 5. First Level → 1c Feature Detection Setup
 
-Reloading a previously processed file offers three options: reuse the saved crop range, select a new range, or use the full file. All prior edits and exclusions are restored automatically.
+Set time windows, onset-detection parameters, cSP settings, outlier detection, and analysis options, then click **▶ Run Analysis**. The tool extracts trials, quantifies all measures, flags outliers, optionally runs the Data Inspector, and writes results to the derivatives folder. Reloading a processed file offers to reuse the saved crop range, pick a new one, or use the full file, with all prior edits restored.
 
-### Step 4 — Stage 2: Group Analysis
+### 6. First Level → 1d Normalisation *(optional)* and Add-ons *(optional)*
 
-Navigate to the Stage 2 tab. The tool scans the derivatives folder and lists all completed sessions. Assign study design variables, configure stim roles, select sessions to include, and click **Build group analysis file** to produce the merged LME-ready CSV.
+Normalise processed results against a reference file, and/or run first-level add-ons (e.g. MEPFeatX) on the saved bundles.
 
----
+### 7. Second Level → Group Analysis (LME)
 
-## Input Formats
+The tool scans the derivatives folder and lists completed sessions. Assign study-design columns (Group, Condition, Timepoint, or any custom factor), configure stim roles, select sessions to include, and click **▶ Build group analysis file** to produce `group_level_LME_ready.csv`.
 
-### Spike-2 text export (`.txt`)
+### 8. Second Level → Add-ons *(optional)*
 
-Waveform channels (EMG, force, additional analogue inputs) plus DigMark event timestamps. Multiple stimulus types are distinguished by their DigMark codes or keyboard labels. Files should follow BIDS naming for automatic metadata parsing, though this is not required:
-
-```
-sub-001_ses-01_task-resting_limb-left_recording.txt
-```
-
-### LabChart text export (`.txt`)
-
-Auto-detected by the `Interval=` header. Each recording block is treated as a pre-aligned trial and no trigger channel is required. Both single-file sessions with multiple stimulus blocks and multi-file sessions (one file per condition) are supported.
-
-### KinEMG / NI-DAQ CSV (`.csv`)
-
-Auto-detected by `Author,KinEMG` in the first line. Sampling rate is read from the `Sample Clock Rate` row; NI-DAQ channel names (`Dev1/ai0`, `Dev1/ai1`, etc.) are read from the channel-name row. If a trigger channel is present in the data it can be assigned via the Format Wizard. If no trigger channel is present, analyses proceed on the continuous waveform.
-
-### Generic tab/space/comma delimited files
-
-Any numeric tabular file that is not recognised as one of the above formats opens the Format Wizard on first use. The wizard auto-detects:
-
-- Non-numeric header lines to skip (including embedded metadata such as `Sample Clock Rate,2000.00`)
-- Channel name rows, pre-populated as signal name defaults
-- Sampling rate from metadata lines matching common patterns
-
-The four wizard steps are:
-
-1. **Data preview and layout** — confirm delimiter, set skip rows, choose column-wise or row-wise orientation
-2. **Time axis** — select the time column/row if present, or enter the sampling rate manually
-3. **Channel definition** — assign a name, role (EMG / Stim/Trigger / Ignore), and unit to each channel; mini waveform thumbnails and auto-suggested roles assist this step
-4. **Summary and save** — review the configuration and save it as a sidecar JSON
-
-Subsequent opens of the same file read the sidecar directly — no wizard interaction needed.
-
-**Row-wise files (e.g. Delsys Trigno):** Files where each row is a channel and each column is a time sample are fully supported. A common pattern is row 0 = continuous TTL trigger signal (~5 V pulses), row 1 = continuous EMG recording. The tool detects TTL rising edges to find stimulus times, then epochs the EMG row around each event. The -0.75 V startup transient common to Delsys Trigno recordings is handled robustly and does not interfere with trigger detection.
+Run group-level add-ons (e.g. group_summary) on the merged group table.
 
 ---
 
@@ -323,70 +316,42 @@ study/
 │   └── sub-001/ses-01/sub-001_ses-01_recording.txt
 └── derivatives/
     ├── dataset_session.json               ← file queue and processing status
-    ├── study_design.json                  ← Stage 2 design configuration
-    ├── group_level_LME_ready.csv          ← merged group output (Stage 2)
+    ├── study_design.json                  ← Second-Level design configuration
+    ├── group_level_LME_ready.csv          ← merged group output (Second Level)
     └── sub-001/
         └── ses-01/
-            ├── sub-001_ses-01_session.json            ← full session state
-            └── results/
-                ├── sub-001_ses-01_All_stims_trial_summary.csv
-                ├── sub-001_ses-01_All_stims_trial_summary.json
-                ├── sub-001_ses-01_ptp_results.csv
-                ├── sub-001_ses-01_ptp_results_with_outliers.csv
-                └── sub-001_ses-01_<StimType>_trials.csv   ← one per stim type
+            ├── sub-001_ses-01_session.json           ← full session state
+            ├── results/
+            │   ├── sub-001_ses-01_<StimType>_trials.csv   ← one per stim type
+            │   ├── sub-001_ses-01_..._segments.npz        ← waveform bundle (add-on input)
+            │   └── ...                                    ← add-on outputs, e.g. *_mepfeatx.csv
+            └── figures/                                   ← add-on figures, e.g. MEPFeatX plots
 ```
 
-### Trial-level CSV columns
+### Trial-level CSV columns (selected)
 
 | Column | Description |
 |---|---|
-| `participant_id` | File or BIDS subject identifier |
-| `stim_type` | Stimulus type label as configured in Stage 1a |
-| `stim_label` | Custom display label |
-| `trial` | Trial index within this stimulus type (1-based) |
-| `Segment_Overall` | Chronological trial number across all stimulus types, ordered by stimulus timestamp |
-| `Stim_Time(s)` | Absolute timestamp of the stimulus in the recording (seconds from recording start) |
-| `Time_Since_Last_Stim(s)` | Time elapsed since the immediately preceding stimulus of any type; blank for the first trial. Useful as a covariate when stimulation order is randomised or inter-stimulus intervals vary |
-| `limb` | Limb identifier parsed from filename or entered manually |
-| `measure` | Measure label |
-| `PTP(mV)` | MEP / CMAP peak-to-peak amplitude |
-| `Latency(ms)` | Response onset latency relative to stimulus |
-| `AUC(mV·s)` | Area under the rectified EMG curve |
-| `cSP_Duration(ms)` | Cortical silent period duration |
-| `cSP_MEP_Offset(ms)` | Time from stimulus to cSP onset |
-| `cSP_EMG_Return(ms)` | Time from stimulus to EMG return after cSP |
-| `cSP_MEP_Ratio(ms/mV)` | cSP duration / MEP PTP amplitude |
-| `Normalised_PTP` | PTP expressed as a proportion of the reference |
-| `Reference_Type` | How the reference was computed (Mmax, single-pulse mean, etc.) |
-| `Reference_Mean(mV)` | Reference amplitude used |
-| `Z_PTP_Within` | Z-score within this stim type |
-| `Z_PTP_Pooled` | Z-score pooled across all stim types |
-| `PTP_Detrended_WithinCond(mV)` | Linearly detrended amplitude with the trend estimated separately within each stimulus type |
-| `PTP_Detrended_WithinCond_Z` | Z-score of the within-condition detrend residuals |
-| `PTP_Detrended_Session(mV)` | Linearly detrended amplitude with a single trend fitted across all trials in chronological order |
-| `PTP_Detrended_Session_Z` | Z-score of the session-level detrend residuals |
-| `Outlier_Decision` | Include / Exclude / Reviewed |
-| `Manual_Note` | Annotation from the Data Inspector |
+| `participant_id`, `StimType`, `Stim_Label`, `Trial` | Identifiers and per-condition trial index |
+| `Segment_Overall` | Chronological trial number across all stimulus types |
+| `Stim_Time(s)`, `Time_Since_Last_Stim(s)` | Absolute stimulus time and inter-stimulus interval |
+| `Limb` | Limb identifier (from filename or entered) |
+| `PTP(mV)`, `Latency(ms)`, `AUC(mV·s)` | Core response measures |
+| `cSP_Duration(ms)`, `cSP_MEP_Offset(ms)`, `cSP_EMG_Return(ms)`, `cSP_MEP_Ratio(ms/mV)` | Silent-period measures |
+| `Normalised_PTP`, `Reference_Type`, `Reference_Mean(mV)` | Normalisation |
+| `Z_PTP_Within`, `Z_PTP_Pooled` | Standardised amplitudes |
+| `PTP_Detrended_WithinCond(mV)`, `PTP_Detrended_Session(mV)` (+ their Z-scores) | Detrended amplitudes |
+| `Outlier_Decision`, `Manual_Note` | Review decisions and annotations |
 
 ### Group-level LME-ready CSV
 
-All trial-level columns from every processed session, plus:
-
-| Column | Description |
-|---|---|
-| `session` | Session label |
-| `task` | Task label (if assigned) |
-| `timepoint` | Timepoint label (if assigned) |
-| `Stim_Role` | Role assigned in Stage 2 (Reference, Conditioned, M-wave, etc.) |
-| `[custom columns]` | Any user-defined between/within-subject factors from Stage 2 |
-
-The output is at the trial level with outlier Z-scores included as covariates, rather than pre-excluding outliers, so that the analyst retains full control of trial-level modelling decisions.
+Every trial-level column from every included session, prefixed with design columns — `participant_id`, `session`, `task`, `timepoint`, `Stim_Role`, and any custom between/within-subject factors defined at the second level. Output is at the trial level (outliers retained with their Z-scores as covariates rather than pre-excluded), so the analyst keeps full control of trial-level modelling. This file is also the input for group-level add-ons.
 
 ---
 
 ## Physiological Latency Profiles
 
-The derivative-based (Bigoni), bootstrap, and peak-fraction onset detectors all search for MEP onset within a per-muscle physiological window. Default windows are listed below; all assume contralateral cortical stimulation with active muscle facilitation (resting latencies are typically 1–3 ms longer). Windows can be overridden per stimulus type in Stage 1a, and the global defaults can be edited in **Settings → Preferences → Latency Profiles**.
+The derivative-based (Bigoni), bootstrap, and peak-fraction onset detectors all search within a per-muscle physiological window. Defaults assume contralateral cortical stimulation with active facilitation (resting latencies are typically 1–3 ms longer). Windows can be overridden per stimulus type in 1a, and the global defaults edited in **Settings → Preferences → Latency Profiles**.
 
 | Stimulus type / Muscle target | Window (ms) | Reference(s) |
 |---|---|---|
@@ -401,7 +366,48 @@ The derivative-based (Bigoni), bootstrap, and peak-fraction onset detectors all 
 | PNS → upper limb (M-wave) | 2–12 | [1] |
 | PNS → lower limb (M-wave) | 4–18 | [1] |
 
-**Notes.** Latency scales positively with height and age, particularly for lower-limb muscles. The lower bound for each window is set conservatively to exclude the TMS artefact; the upper bound captures the ±2 SD range of normative cohort data while avoiding the late oligosynaptic MEP that can appear at 60–70 ms in resting quadriceps and hamstrings. The trunk window is anchored to the contralateral onset latency of 15.8 ± 1.4 ms reported by Miyano et al. [3] using an antero-medially directed double-cone coil during active contraction; ipsilateral responses average ~2 ms longer.
+**Notes.** Latency scales positively with height and age, particularly for lower-limb muscles. The lower bound excludes the TMS artefact; the upper bound captures the ±2 SD range of normative cohort data while avoiding late oligosynaptic MEPs. The trunk window is anchored to the contralateral onset latency of 15.8 ± 1.4 ms reported by Miyano et al. [3].
+
+---
+
+## Writing Add-ons
+
+An add-on is a small Python module exposing an `ADDON_NAME`, an optional description/version/author, an optional `ADDON_SCOPE` (`"single_file"` or `"group_level"`), optional `ADDON_SETTINGS`, and a `run(context)` function. It reads from the context and writes **new** files into `context.results_dir`.
+
+**First-level (`single_file`)** add-ons receive a context with the per-trial waveforms grouped by stimulus type, sampling rate, unit, a stimulus-aligned time axis, the per-trial table, the analysis config, and output paths:
+
+```python
+ADDON_NAME  = "my_addon"
+ADDON_SCOPE = "single_file"
+
+def run(context):
+    import os, numpy as np
+    rows = []
+    for stim_type, stack in context.segments.items():   # stack: (n_trials, n_samples)
+        for i, trace in enumerate(stack):
+            rows.append((stim_type, i, float(np.ptp(trace))))
+    out = os.path.join(context.results_dir, f"{context.bids_prefix}_my_addon.csv")
+    # ... write `rows` to `out` ...
+    context.log(f"my_addon → {os.path.basename(out)}")
+    return [out]
+```
+
+**Second-level (`group_level`)** add-ons receive `context.group_table` (the merged group DataFrame), with `design_columns` / `metric_columns` split out for convenience:
+
+```python
+ADDON_NAME  = "my_group_addon"
+ADDON_SCOPE = "group_level"
+
+def run(context):
+    import os
+    summary = context.group_table.groupby("StimType")[context.metric_columns].mean()
+    out = os.path.join(context.results_dir, f"{context.bids_prefix}_my_group_addon.csv")
+    summary.to_csv(out)
+    context.log(f"my_group_addon → {os.path.basename(out)}")
+    return [out]
+```
+
+Put your modules in the matching subfolder (`single_file/` or `group_level/`) of the add-ons folder set in **Settings → Preferences → Add-ons**. The built-in add-ons (`mepfeatx`, `rectified_area`, `group_summary`) are good starting templates.
 
 ---
 
@@ -411,14 +417,16 @@ The derivative-based (Bigoni), bootstrap, and peak-fraction onset detectors all 
 # Windows
 python build_windows.py
 
+# macOS
+python3 build_mac.py
+
 # Linux
 python3 -m venv venv_linux && source venv_linux/bin/activate
 pip install -r requirements.txt
 python3 build_linux.py
-
-# macOS
-python3 build_mac.py
 ```
+
+The build scripts create a local virtual environment, compile the Rust I/O extension (`mep_cmap_io`) if a Rust toolchain is present, and run PyInstaller with the platform spec. The bundled add-ons and BIDS schema ship automatically.
 
 ---
 
@@ -427,15 +435,18 @@ python3 build_mac.py
 | Package | Purpose |
 |---|---|
 | `numpy` | Numerical arrays and signal operations |
-| `scipy` | Filtering, statistics, signal processing |
+| `scipy` | Filtering, statistics, interpolation, signal processing |
 | `pandas` | CSV I/O and data manipulation |
-| `matplotlib` | Waveform plotting and interactive figures |
-| `pywt` | Wavelet time-frequency display in filter preview |
+| `matplotlib` | Waveform plotting, interactive figures, add-on figures |
+| `statsmodels` | Regression utilities for excitability compensation (Carson, 2026 [9]) |
+| `PyWavelets` | Wavelet time-frequency display in filter preview |
 | `Pillow` | Image handling for splash screen and icons |
-| `neo` | Native Spike-2 `.smr` file reading |
+| `neo` | Native Spike-2 `.smr` reading |
+| `pyedflib` | EDF/BDF handling for BIDS-ify |
+| `bioread` | BIOPAC AcqKnowledge `.acq` reading |
 | `tkinter` | GUI (bundled with standard Python) |
 
-The Rust extension `mep_cmap_io` is compiled automatically during the build process (`python build_windows.py`) and provides accelerated I/O for Spike-2 text, LabChart text, Generic TSV, and CFWB binary formats. It is not required — all formats fall back to pure Python if the extension is unavailable.
+The optional Rust extension `mep_cmap_io` provides accelerated I/O for the Spike-2 text, LabChart text, Generic TSV, and CFWB binary formats; all formats fall back to pure Python if it is unavailable.
 
 ---
 
@@ -443,7 +454,7 @@ The Rust extension `mep_cmap_io` is compiled automatically during the build proc
 
 If you use MEP-CMAP Analyser in published research, please cite:
 
-> Andrushko, J.W. (2026). MEP-CMAP Analyser (Version 1.0) [Software].
+> Andrushko, J.W. (2026). MEP-CMAP Analyser (Version 1.2) [Software].
 > Northumbria University. https://github.com/jandrushko/mep-cmap-analyser
 
 ---
@@ -465,6 +476,10 @@ If you use MEP-CMAP Analyser in published research, please cite:
 [7] Hupfeld, K.E., Swanson, C.W., Fling, B.W., & Seidler, R.D. (2021). TMS-induced silent periods: A review of methods and call for consistency. *Journal of Neuroscience Methods*, 346, 108950. https://doi.org/10.1016/j.jneumeth.2020.108950
 
 [8] Rossini, P.M., et al. (2015). Non-invasive electrical and magnetic stimulation of the brain, spinal cord, roots and peripheral nerves: Basic principles and procedures for routine clinical and research application. *Clinical Neurophysiology*, 126(6), 1071–1107. https://doi.org/10.1016/j.clinph.2015.02.001
+
+[9] Carson, R.G. (2026). A method of compensating for the excitability of spinal motoneurones when estimating the magnitude of potentials evoked in skeletal muscles. *The Journal of Physiology*, 604, 5731–5757. https://doi.org/10.1113/JP290979
+
+[10] Nguyen, T.D., et al. (2025). MEPFeatX: feature extraction for motor evoked potentials. *Frontiers in Neuroscience*, 18, 1415257. https://doi.org/10.3389/fnins.2024.1415257
 
 ---
 

@@ -60,6 +60,8 @@ class FileBidsRecord:
     converted:     bool = False
     converted_at:  str = ""
     output_prefix: str = ""            # last written BIDS prefix (for reference)
+    marker_names:  list = field(default_factory=list)  # per-file stim codes (scan & pick)
+    stim_channel:  str = ""            # per-file stim event channel (scan & pick)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -73,6 +75,8 @@ class FileBidsRecord:
             converted=bool(d.get("converted", False)),
             converted_at=d.get("converted_at", ""),
             output_prefix=d.get("output_prefix", ""),
+            marker_names=list(d.get("marker_names", []) or []),
+            stim_channel=d.get("stim_channel", ""),
         )
 
 

@@ -191,9 +191,12 @@ class BidsifyDialog:
                  fg=_FG).pack(side="left")
         tk.Entry(row, textvariable=self.powerline_var, width=6).pack(side="left")
 
-        tk.Label(row, text="   Stim marker label:", bg="#ececec",
+        tk.Label(row, text="   Stim marker label(s):", bg="#ececec",
                  fg=_FG).pack(side="left")
-        tk.Entry(row, textvariable=self.marker_var, width=6).pack(side="left")
+        tk.Entry(row, textvariable=self.marker_var, width=16).pack(side="left")
+        tk.Label(row, text="(one or more codes, comma-separated, e.g. A,B,C,D; "
+                 "or the stim channel name for all codes)", bg="#ececec",
+                 fg="#666", font="TkSmallCaptionFont").pack(side="left", padx=(6, 0))
 
         btns = tk.Frame(opt, bg="#ececec")
         btns.pack(fill="x", padx=14, pady=(0, 10))

@@ -182,6 +182,7 @@ class Recording:
 # ── Builder over io.py's existing public API ──────────────────────────────────
 def build_recording(path: str,
                     marker_names: Optional[Sequence[str]] = None,
+                    stim_channel: Optional[str] = None,
                     channel_indices: Optional[Sequence[int]] = None,
                     io_module: Any = None,
                     fs_rtol: float = 1e-6) -> Recording:
@@ -242,7 +243,7 @@ def build_recording(path: str,
     if marker_names:
         for marker in marker_names:
             try:
-                stim = io_module.extract_stim_times(path, marker) or {}
+                stim = io_module.extract_stim_times(path, marker, stim_channel=stim_channel) or {}
             except Exception as exc:
                 rec.warnings.append(f"extract_stim_times({marker!r}) failed: {exc}")
                 continue

@@ -294,7 +294,7 @@ def extract_emg_waveform_and_fs(file_path: str, channel_idx: int = 0):
     return _spike2.extract_emg_waveform_and_fs(file_path, channel_idx)
 
 
-def extract_stim_times(file_path: str, marker_name: str) -> dict:
+def extract_stim_times(file_path: str, marker_name: str, stim_channel: str = None) -> dict:
     """
     Return stimulation timestamps.
 
@@ -313,7 +313,7 @@ def extract_stim_times(file_path: str, marker_name: str) -> dict:
     file_path = _resolve_path(file_path)
     fmt = detect_format(file_path)
     if fmt == 'spike2_smr':
-        return _spike2_smr.extract_stim_times(file_path, marker_name)
+        return _spike2_smr.extract_stim_times(file_path, marker_name, stim_channel=stim_channel)
     if fmt == 'acqknowledge_acq':
         return _acqknowledge_acq.extract_stim_times(file_path, marker_name)
     if fmt == 'acqknowledge_mat':

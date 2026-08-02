@@ -102,6 +102,7 @@ class BidsifyItem:
     modality:          str = "TMS"
     sidecar_values:    dict = field(default_factory=dict)
     marker_names:      Optional[list] = None
+    stim_channel:      Optional[str] = None
     participant_extra: dict = field(default_factory=dict)   # extra participants.tsv cols
     task_name:         str = ""    # for _emg.json TaskName; falls back to metadata.task
     prefix_override:   Optional[str] = None   # explicit BIDS prefix (preserves source-stem tokens)
@@ -434,7 +435,9 @@ def write_events_tsv(pf: PlannedFile, rec: Recording) -> None:
     rows = []
     for ev in rec.events_table():
         tt = ev["trial_type"]
-        if tt in (None, "", "n/a") or len(str(tt)) <= 1:
+        # Use the fallback only when the code is genuinely empty. Single-
+        # character DigMark codes (A/B/C/D) are valid labels - do NOT collapse.
+        if tt in (None, "", "n/a"):
             tt = fallback_type
         rows.append({"onset": ev["onset"], "duration": ev["duration"],
                      "trial_type": tt})
@@ -550,6 +553,7 @@ def execute_plan(plan: Plan,
             # 2) full read into a Recording
             rec = build_recording(pf.item.source_path,
                                   marker_names=pf.item.marker_names,
+                                  stim_channel=pf.item.stim_channel,
                                   io_module=io_module)
 
             # resolve per-channel type + unit (reader unit wins over fallback)

@@ -302,6 +302,92 @@ class BidsifyTabMixin:
         for r, fld in enumerate(schema.fields_for(modality, scope="file")):
             file_vars[fld.key] = _add_field(f1, fld, existing.get(fld.key, ""), r)
 
+        # ── Stim events (this file) — scan & pick ─────────────────────────────
+        fe = tk.LabelFrame(win, text="Stim events (this file)", bg="#f5f5f5",
+                           padx=8, pady=6)
+        fe.pack(fill="x", padx=12, pady=4)
+        _scan = {"cache": {}, "traced": False,
+                 "chan": tk.StringVar(value=(rec.stim_channel if rec else "")),
+                 "codes": list(rec.marker_names if rec else []),
+                 "code_vars": {}}
+        _scan_info = tk.Label(fe, justify="left", bg="#f5f5f5", fg="#777", wraplength=560,
+            text=("Click \u201cScan file\u201d to see the stim markers in this recording, "
+                  "then pick your stim channel and tick the codes that are your stimuli. "
+                  "Leave unset to use the shared Stim marker label."))
+        _scan_info.pack(anchor="w")
+        if rec and rec.marker_names:
+            _scan_info.config(fg="#333",
+                text=("Saved for this file \u2014 channel \u201c%s\u201d, codes: %s.  "
+                      "Click \u201cScan file\u201d to change." %
+                      (rec.stim_channel, ", ".join(rec.marker_names))))
+        _chan_row  = tk.Frame(fe, bg="#f5f5f5")
+        _codes_row = tk.Frame(fe, bg="#f5f5f5")
+
+        def _render_codes(*_a):
+            for w in _codes_row.winfo_children():
+                w.destroy()
+            _scan["code_vars"] = {}
+            codes = _scan["cache"].get(_scan["chan"].get(), {})
+            if not codes:
+                tk.Label(_codes_row, text="(this channel has no coded markers)",
+                         bg="#f5f5f5", fg="#999").pack(anchor="w")
+                return
+            tk.Label(_codes_row, text="Stim codes (tick your stimuli):",
+                     bg="#f5f5f5").pack(anchor="w")
+            grid = tk.Frame(_codes_row, bg="#f5f5f5"); grid.pack(anchor="w")
+            for i, (code, n) in enumerate(sorted(codes.items())):
+                v = tk.BooleanVar(value=(code in _scan["codes"]))
+                _scan["code_vars"][code] = v
+                tk.Checkbutton(grid, text="%s  (%d)" % (code, n), variable=v,
+                               bg="#f5f5f5").grid(row=i // 6, column=i % 6,
+                                                  sticky="w", padx=4, pady=1)
+
+        def _do_scan():
+            from . import io as _io
+            try:
+                fmt = _io.detect_format(path)
+            except Exception as exc:
+                _scan_info.config(fg="#d9534f", text="Could not read file: %s" % exc)
+                return
+            if fmt != "spike2_smr":
+                _scan_info.config(fg="#d9534f",
+                    text=("Event scanning currently supports Spike2 (.smr) files "
+                          "(this file is \u201c%s\u201d). Use the shared Stim marker "
+                          "label field instead." % fmt))
+                return
+            try:
+                from .formats import spike2_smr as _smr
+                _scan["cache"] = _smr.list_event_codes(path) or {}
+                cfg = _smr.load_config(path) if _smr.has_config(path) else {}
+            except Exception as exc:
+                _scan_info.config(fg="#d9534f", text="Scan failed: %s" % exc)
+                return
+            if not _scan["cache"]:
+                _scan_info.config(fg="#d9534f",
+                                  text="No event channels found in this file.")
+                return
+            chans = list(_scan["cache"].keys())
+            if _scan["chan"].get() not in chans:
+                best = (cfg.get("stim_channel") if cfg.get("stim_channel") in chans
+                        else max(chans, key=lambda c: len(_scan["cache"][c])))
+                _scan["chan"].set(best)
+            _scan_info.config(fg="#333",
+                text=("Pick the stim channel, then tick the codes that are your stimuli "
+                      "(counts in brackets). Saved for THIS file only."))
+            for w in _chan_row.winfo_children():
+                w.destroy()
+            tk.Label(_chan_row, text="Stim channel:", bg="#f5f5f5").pack(side="left")
+            ttk.Combobox(_chan_row, textvariable=_scan["chan"], values=chans,
+                         state="readonly", width=18).pack(side="left", padx=(4, 8))
+            _chan_row.pack(anchor="w", pady=(4, 2))
+            _codes_row.pack(anchor="w")
+            if not _scan["traced"]:
+                _scan["chan"].trace_add("write", _render_codes)
+                _scan["traced"] = True
+            _render_codes()
+
+        tk.Button(fe, text="\U0001F50D  Scan file", command=_do_scan).pack(anchor="w", pady=(4, 0))
+
         # Inherited defaults (session-scoped) — collapsible override section
         show_over = tk.BooleanVar(value=False)
         f2 = tk.LabelFrame(win, text="Shared defaults (inherited — override only if this file differs)",
@@ -338,6 +424,11 @@ class BidsifyTabMixin:
 
         def _save():
             state.set_overrides(path, _collect(), reviewed=True)
+            _r = state.record_for(path, create=True)
+            if _scan["code_vars"]:          # user scanned this session -> apply pick
+                picked = [c for c, v in _scan["code_vars"].items() if v.get()]
+                _r.marker_names = picked
+                _r.stim_channel = _scan["chan"].get() if picked else ""
             state.save()
             self._bidsify_tab_refresh()
             win.destroy()
@@ -352,6 +443,16 @@ class BidsifyTabMixin:
         win.minsize(560, 400)
 
     # ---- conversion -----------------------------------------------------------
+    def _bidsify_marker_names_for(self, state, path):
+        """Per-file scan-and-pick codes take priority; else the shared marker
+        label (comma-separated codes or a channel name)."""
+        rec = state.record_for(path, create=False)
+        if rec and getattr(rec, "marker_names", None):
+            return list(rec.marker_names)
+        if state.marker_name:
+            return [m.strip() for m in state.marker_name.split(",") if m.strip()]
+        return None
+
     def _bidsify_convert_ready(self):
         state = self._get_bidsify_state()
         schema = self._bidsify_schema
@@ -384,10 +485,12 @@ class BidsifyTabMixin:
                 timepoint=parsed['timepoint'], limb=parsed['limb'],
                 measure=parsed['measure'], acq=parsed['acq'])
             prefix = _make_bids_prefix(meta.bids_prefix(), Path(p).stem)
+            _rec = state.record_for(p, create=False)
             items.append(BidsifyItem(
                 source_path=p, metadata=meta, modality=state.modality,
                 sidecar_values=state.effective_values(p),
-                marker_names=[state.marker_name] if state.marker_name else None,
+                marker_names=self._bidsify_marker_names_for(state, p),
+                stim_channel=(_rec.stim_channel if _rec else None),
                 prefix_override=prefix))
 
         ds_name = (os.path.basename(os.path.dirname(rawroot.rstrip("/\\")))

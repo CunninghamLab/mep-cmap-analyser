@@ -309,7 +309,8 @@ def extract_emg_waveform_and_fs(file_path: str, channel_idx: int = 0) -> tuple:
     return emg, fs, unit
 
 
-def extract_stim_times(file_path: str, marker_name: str = "A") -> dict:
+def extract_stim_times(file_path: str, marker_name: str = "A",
+                       stim_channel: str = None) -> dict:
     """
     Return stim times grouped by marker code, normalised to t=0.
 
@@ -324,8 +325,14 @@ def extract_stim_times(file_path: str, marker_name: str = "A") -> dict:
           if seg.analogsignals
           else float(seg.t_start.rescale("s").magnitude))
 
-    stim_ch = (load_config(file_path).get("stim_channel", marker_name)
-               if has_config(file_path) else marker_name)
+    # An explicit stim_channel (e.g. picked in BIDS-ify "Scan file") wins; else
+    # fall back to the saved sidecar config, else treat marker_name as the channel.
+    if stim_channel:
+        stim_ch = stim_channel
+    elif has_config(file_path):
+        stim_ch = load_config(file_path).get("stim_channel", marker_name)
+    else:
+        stim_ch = marker_name
 
     sl = stim_ch.lower()
     ml = marker_name.lower()
@@ -384,3 +391,24 @@ def extract_stim_times(file_path: str, marker_name: str = "A") -> dict:
     label = marker_name[:1].upper() if len(marker_name) == 1 else marker_name
     times = ((edges + 1) / fs_trig + t0_trig - t0).tolist()
     return {label: [t for t in times if t >= 0]} if times else {}
+
+
+def list_event_codes(file_path: str) -> dict:
+    """Return {channel_name: {code: count}} for every event channel in the file.
+
+    Powers the BIDS-ify "scan file" picker so users can see what stim markers
+    exist and choose their stimuli, instead of typing a code blind. Codes are
+    normalised the same way as extract_stim_times.
+    """
+    from collections import Counter
+    seg, _analogue_names = _load(file_path)
+    out = {}
+    evt_all = list(seg.events) + list(seg.epochs) + list(seg.spiketrains)
+    for ch in evt_all:
+        try:
+            codes = _get_event_codes(ch)
+        except Exception:
+            codes = []
+        cnt = Counter(str(c) for c in codes if str(c) != "")
+        out[str(ch.name)] = dict(cnt)
+    return out

@@ -52,6 +52,7 @@ from .formats import brainsight  as _brainsight
 from .formats import acqknowledge_mat as _acqknowledge_mat
 from .formats import acqknowledge_acq as _acqknowledge_acq
 from .formats import brainvision  as _brainvision
+from .formats import edf          as _edf
 from .formats import cfwb        as _cfwb
 from .formats import generic_tsv as _generic_tsv
 
@@ -153,6 +154,10 @@ def detect_format(file_path: str) -> str:
     if _brainvision.is_brainvision(file_path):
         return 'brainvision'
 
+    # EDF / BDF (.edf/.bdf) - written by BIDS-ify; stim times from sibling _events.tsv
+    if _edf.is_edf(file_path):
+        return 'edf'
+
     with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
         first_line = f.readline()
         second_line = f.readline()
@@ -219,6 +224,8 @@ def list_waveform_channels(file_path: str) -> list:
         return _acqknowledge_mat.list_waveform_channels(file_path)
     if fmt == 'brainvision':
         return _brainvision.list_waveform_channels(file_path)
+    if fmt == 'edf':
+        return _edf.list_waveform_channels(file_path)
     if fmt == 'brainsight':
         return _brainsight.list_waveform_channels(file_path)
     if fmt == 'labchart_mat':
@@ -272,6 +279,8 @@ def extract_emg_waveform_and_fs(file_path: str, channel_idx: int = 0):
         return _acqknowledge_mat.extract_emg_waveform_and_fs(file_path, channel_idx)
     if fmt == 'brainvision':
         return _brainvision.extract_emg_waveform_and_fs(file_path, channel_idx)
+    if fmt == 'edf':
+        return _edf.extract_emg_waveform_and_fs(file_path, channel_idx)
     if fmt == 'brainsight':
         return _brainsight.extract_emg_waveform_and_fs(file_path, channel_idx)
     if fmt == 'labchart_mat':
@@ -311,6 +320,8 @@ def extract_stim_times(file_path: str, marker_name: str) -> dict:
         return _acqknowledge_mat.extract_stim_times(file_path, marker_name)
     if fmt == 'brainvision':
         return _brainvision.extract_stim_times(file_path, marker_name)
+    if fmt == 'edf':
+        return _edf.extract_stim_times(file_path, marker_name)
     if fmt == 'brainsight':
         return _brainsight.extract_stim_times(file_path, marker_name)
     if fmt == 'labchart_mat':

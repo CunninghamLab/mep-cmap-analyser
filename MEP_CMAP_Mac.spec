@@ -105,13 +105,13 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='MEP-CMAP Analyser.app',
-    icon='MEP.icns',           # macOS uses .icns format; remove line if you don't have one
+    icon='MEP.ico',           # macOS uses .icns format; remove line if you don't have one
     bundle_identifier='com.northumbria.mep-cmap-analyser',
     info_plist={
         'CFBundleName':              'MEP-CMAP Analyser',
         'CFBundleDisplayName':       'MEP-CMAP Analyser',
-        'CFBundleVersion':           '1.2.2',
-        'CFBundleShortVersionString':'1.2.2',
+        'CFBundleVersion':           '1.2.3',
+        'CFBundleShortVersionString':'1.2.3',
         'NSHighResolutionCapable':   True,
         'NSRequiresAquaSystemAppearance': False,  # supports dark mode
     },

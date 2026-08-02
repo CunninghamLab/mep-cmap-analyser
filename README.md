@@ -1,6 +1,6 @@
 # MEP-CMAP Analyser
 
-**Version 1.2.1 | August 2026**  
+**Version 1.2.3 | August 2026**  
 *Author: Justin Andrushko PhD, Northumbria University*  
 *Collaborators: [David Cunningham PhD](https://fescenter.org/team/investigators/cunningham-david-phd/) ([TMS Analysis ToolBox](https://github.com/CunninghamLab/TMSAnalysisToolBox)) · [Nicholas Holmes PhD](https://www.birmingham.ac.uk/staff/profiles/sportex/holmes-nick) · [TMSMultiLab](https://github.com/TMSMultiLab/TMSMultiLab/wiki)*
 
@@ -39,6 +39,8 @@ The tool is not limited to any single measure or paradigm. It handles motor evok
 - **BIDS-ify** — convert non-BIDS recordings into a BIDS-compliant `rawdata/` layout with shared, per-file editable stimulation metadata (NIBS BEP037).
 - **Broader format support** — added BIOPAC AcqKnowledge (`.acq` and `.mat`), Brainsight neuronavigation exports, BrainVision, and LabChart MATLAB exports.
 - **Cross-platform polish** — readable coloured action buttons on macOS, Windows, and Linux, and consistent font scaling across the interface.
+
+**Point releases (1.2.1–1.2.3):** EDF/BDF files (including BIDS-ify output) now load correctly, plus release-pipeline and repository cleanup.
 
 ---
 
@@ -168,7 +170,7 @@ A vectorised bootstrap method: a silence threshold is estimated from the pre-sti
 
 A separate Mmax file can be designated containing M-waves across a range of intensities. The plateau region is detected robustly for three scenarios: a full recruitment curve (averages the plateau within a tolerance band, default ±10%), a few supramaximal pulses (averages the largest similar-amplitude cluster), or a single M-wave (used directly). Normalised PTP is then reported for all MEP trials as a fraction of Mmax.
 
-For designs where the background excitability of spinal motoneurones varies across trials — for example active-contraction paradigms — the tool also supports regression-based compensation of evoked-potential magnitude following the method of Carson (2026) [9], as an alternative or complement to Mmax normalisation.
+For designs where the background excitability of spinal motoneurones varies across trials — for example active-contraction paradigms — the tool also compensates evoked-potential magnitude for pre-stimulus excitability by quantile regression, following the method of Carson (2026) [9]. It is reported per trial as `Adjusted_PTP_QR(mV)` (and a reference-normalised form) alongside the regression diagnostics, as an alternative or complement to Mmax normalisation.
 
 ### Paired-Pulse Protocols
 
@@ -329,20 +331,29 @@ study/
             └── figures/                                   ← add-on figures, e.g. MEPFeatX plots
 ```
 
-### Trial-level CSV columns (selected)
+### Trial-level CSV columns
 
-| Column | Description |
+Each `<prefix>_<StimType>_trials.csv` contains the full column set below. Which
+columns are *populated* depends on what you enabled — cSP columns fill only when
+cSP detection is on, normalisation columns when a reference file is set, and the
+excitability-compensation block when that option is run.
+
+| Column(s) | Description |
 |---|---|
-| `participant_id`, `StimType`, `Stim_Label`, `Trial` | Identifiers and per-condition trial index |
-| `Segment_Overall` | Chronological trial number across all stimulus types |
+| `File`, `StimType`, `Stim_Label` | Recording identifier and stimulus-type code / display label |
+| `Segment`, `Segment_Overall` | Trial index within the condition, and chronological index across all conditions |
 | `Stim_Time(s)`, `Time_Since_Last_Stim(s)` | Absolute stimulus time and inter-stimulus interval |
 | `Limb` | Limb identifier (from filename or entered) |
-| `PTP(mV)`, `Latency(ms)`, `AUC(mV·s)` | Core response measures |
-| `cSP_Duration(ms)`, `cSP_MEP_Offset(ms)`, `cSP_EMG_Return(ms)`, `cSP_MEP_Ratio(ms/mV)` | Silent-period measures |
-| `Normalised_PTP`, `Reference_Type`, `Reference_Mean(mV)` | Normalisation |
-| `Z_PTP_Within`, `Z_PTP_Pooled` | Standardised amplitudes |
-| `PTP_Detrended_WithinCond(mV)`, `PTP_Detrended_Session(mV)` (+ their Z-scores) | Detrended amplitudes |
-| `Outlier_Decision`, `Manual_Note` | Review decisions and annotations |
+| `PTP(mV)`, `Latency(ms)`, `AUC(mV*s)` | Core response: peak-to-peak amplitude, onset latency (`Not Marked` when unresolved), and area under the rectified EMG |
+| `Measure` | Optional auxiliary / manual measurement (blank unless used) |
+| `cSP_Duration(ms)`, `cSP_MEP_Offset(ms)`, `cSP_EMG_Return(ms)`, `cSP_MEP_Ratio(ms/mV)` | Silent-period duration (`Not Marked` when absent), stimulus→cSP-start, stimulus→EMG-return, and cSP ÷ PTP ratio (Orth & Rothwell, 2004 [5]) |
+| `PreStimRMS`, `PreStimPTP`, `PTP_per_PreStimRMS`, `Z_PreStimRMS` | Pre-stimulus baseline EMG: RMS, peak-to-peak, PTP-per-RMS, and standardised RMS |
+| `Z_PTP_Within`, `Z_PTP_Pooled` | PTP z-scores within each condition and pooled across conditions |
+| `PTP_Detrended_WithinCond(mV)` + `_Z`, `PTP_Detrended_Session(mV)` + `_Z` | Amplitude detrended within condition and across the whole session (fatigue / potentiation), each with its z-score |
+| `Reference_Type`, `Reference_Mean(mV)`, `Reference_N`, `Normalised_PTP`, `Normalised_PTP_per_PreStimRMS` | Mmax / reference normalisation: reference used, its mean and N, and the normalised amplitudes |
+| `Adjusted_PTP_QR(mV)`, `Normalised_Adjusted_PTP_QR` | **Excitability-compensated PTP** — adjusted for spinal motoneurone excitability by quantile regression on pre-stimulus EMG (Carson, 2026 [9]), raw and reference-normalised |
+| `EMGComp_Method`, `EMGComp_N`, `EMGComp_Slope`, `EMGComp_Intercept`, `EMGComp_InterceptWeight`, `EMGComp_Adjustment(mV)`, `EMGComp_PseudoR2`, `EMGComp_Rho_Post` | Excitability-compensation fit: method / status, N, regression coefficients and intercept weighting, per-trial adjustment, and diagnostics (pseudo-R² and residual PTP–EMG correlation) |
+| `Outlier_Decision`, `Manual_Note` | Review outcome (`Not flagged` or your include / exclude decision) and free-text annotation |
 
 ### Group-level LME-ready CSV
 
@@ -455,7 +466,7 @@ The optional Rust extension `mep_cmap_io` provides accelerated I/O for the Spike
 
 If you use MEP-CMAP Analyser in published research, please cite:
 
-> Andrushko, J.W. (2026). MEP-CMAP Analyser (Version 1.2.1) [Software].
+> Andrushko, J.W. (2026). MEP-CMAP Analyser (Version 1.2.3) [Software].
 > Northumbria University. https://github.com/jandrushko/mep-cmap-analyser
 
 ---

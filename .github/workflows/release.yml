@@ -42,7 +42,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install system deps
-        run: sudo apt-get install -y python3-tk tk-dev binutils
+        run: sudo apt-get update && sudo apt-get install -y python3-tk tk-dev binutils
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
@@ -70,7 +70,10 @@ jobs:
       - name: Build
         run: pyinstaller MEP_CMAP_Mac.spec --clean
       - name: Zip
-        run: zip -r MEP-CMAP_Analyser_Mac.zip "dist/MEP-CMAP Analyser"
+        # Package the .app bundle (double-clickable) using ditto, the macOS
+        # tool for zipping app bundles — the spec produces both a raw onedir
+        # folder and the .app; users want the .app.
+        run: ditto -c -k --keepParent "dist/MEP-CMAP Analyser.app" MEP-CMAP_Analyser_Mac.zip
       - uses: actions/upload-artifact@v4
         with:
           name: mac-build

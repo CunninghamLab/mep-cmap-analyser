@@ -11,10 +11,15 @@ block_cipher = None
 datas = []
 datas += collect_data_files('matplotlib')
 datas += collect_data_files('pywt')
+datas += collect_data_files('statsmodels')   # EMG excitability compensation (QR)
 datas += [('mep_cmap', 'mep_cmap')]
 # BIDS-ify (BEP037) schema asset - explicit, in case the whole-package
 # data bundling above ever changes. The app hard-depends on this JSON.
 datas += [('mep_cmap/schema/nibs_bep037.json', 'mep_cmap/schema')]
+# Built-in add-ons (mepfeatx, rectified_area, __init__) - explicit so they
+# ship even if the whole-package bundling above ever changes. The add-on
+# loader discovers these by file path at runtime.
+datas += [('mep_cmap/add_ons', 'mep_cmap/add_ons')]
 
 hiddenimports = []
 hiddenimports += collect_submodules('mep_cmap')
@@ -25,12 +30,19 @@ hiddenimports += collect_submodules('pandas')
 hiddenimports += collect_submodules('pywt')
 hiddenimports += collect_submodules('mpl_toolkits')
 hiddenimports += collect_submodules('pyedflib')   # BIDS-ify EDF/BDF writer (C ext)
+hiddenimports += collect_submodules('statsmodels') # EMG excitability compensation (QR)
+hiddenimports += collect_submodules('patsy')       # statsmodels formula dependency
 hiddenimports += [
     'scipy.signal',
     'scipy.signal.windows',
     'scipy.stats',
     'scipy.optimize',
     'scipy.fft',
+    'scipy.interpolate',   # MEPFeatX add-on: CubicSpline upsampling
+    'statsmodels.api',
+    'statsmodels.regression.quantile_regression',
+    'statsmodels.tools',
+    'patsy',
     'matplotlib.backends.backend_tkagg',
     'matplotlib.backends.backend_agg',
     'mpl_toolkits.axes_grid1',

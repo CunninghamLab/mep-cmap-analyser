@@ -20,9 +20,24 @@ the momentary excitability of the spinal motoneurone pool. Per participant
 sample (one StimType at a single TMS intensity) the amplitude is regressed on
 pre-stimulus RMS via median (tau=0.5) quantile regression; each trial's
 residual is expressed relative to an uncertainty-weighted reference value
-(a blend of the regression intercept and the sample mean). The adjusted
-amplitude is the estimate of what the response would have been had background
-excitability been at that common reference level. Units are unchanged (mV).
+(a blend of the regression intercept and the central tendency of the fitted
+values). The adjusted amplitude is the estimate of what the response would
+have been had background excitability been at that common reference level.
+Units are unchanged (mV).
+
+Correspondence with the author's reference code
+-----------------------------------------------
+Verified against ``annotated_QR_example_code.R`` and ``example_data.csv``
+(Carson 2026, https://doi.org/10.5281/zenodo.20037178). Because QR estimates a
+conditional MEDIAN, the reference value must be anchored on ``median(fitted)``
+and the second standard error evaluated at the RMS value that produces it, not
+on the arithmetic mean of the raw amplitudes. Anchoring on the mean inflates
+the reference for right-skewed MEP samples (mean > median) and pushes every
+adjusted value upward. On the author's example data the median anchor
+reproduces his reference value of 27.15 uV exactly; a mean anchor gives 35.84.
+The corresponding LSR script (``annotated_LSR_example_code.R``) uses
+``mean(fitted)``, which for least squares is identically ``mean(y)`` — the two
+scripts are consistent, they simply match the central tendency to the model.
 """
 
 from __future__ import annotations
@@ -214,6 +229,7 @@ def fit_qr_compensation(
         ptp:  np.ndarray | list,
         tau:  float = 0.5,
         min_trials: int = 8,
+        low_n_trials: int = 15,
 ) -> dict:
     """
     Per-sample quantile-regression compensation of evoked-response amplitude
@@ -222,31 +238,54 @@ def fit_qr_compensation(
     Regresses ``ptp`` on ``rms`` using median (tau=0.5) quantile regression,
     then expresses each trial's residual relative to an uncertainty-weighted
     reference value. The reference is a blend of the regression intercept and
-    the sample mean amplitude, weighted by the relative standard error of the
-    fitted ordinate at the intercept (RMS = 0) versus at the mean of RMS:
+    the central tendency of the FITTED values, weighted by the relative
+    standard error of the fitted ordinate at the intercept (RMS = 0) versus at
+    the RMS value that yields that central tendency:
 
-        SEi  = SE of the fitted ordinate at RMS = 0        (intercept)
-        SEm  = SE of the fitted ordinate at RMS = mean(RMS)
-        SET  = SEi + SEm
-        Wi   = 1 - SEi/SET + SEm/SET     (weight on the intercept)
-        Wm   = SEi/SET - SEm/SET         (weight on the sample mean)
-        reference = Wi * intercept + Wm * mean(ptp)
+        ct        = median(fitted)            (QR estimates a conditional median)
+        x_ct      = RMS at which fitted == ct (identically median(RMS), see note)
+        SEi       = SE of the fitted ordinate at RMS = 0     (the intercept)
+        SEc       = SE of the fitted ordinate at RMS = x_ct
+        SET       = SEi + SEc
+        Wi        = 1 - SEi/SET + SEc/SET     (weight on the intercept)
+        Wc        = SEi/SET - SEc/SET         (weight on the central tendency)
+        reference = Wi * intercept + Wc * ct
         adjusted  = residual + reference
 
-    When the intercept is uncertain (or the slope is near zero) Wi -> 0 and the
-    reference converges on the sample mean, so the adjustment vanishes — the
-    scheme is self-limiting where no association is present.
+    Because the fitted values are a monotone linear function of RMS, the median
+    of the fitted values is attained at the median of RMS, so ``x_ct`` is
+    computed as ``median(rms)`` directly. This is algebraically identical to the
+    author's ``(median(fitted) - intercept) / slope`` and avoids dividing by a
+    near-zero slope.
+
+    Matching the anchor to the model matters. QR centres its residuals on the
+    conditional median, so anchoring the reference on the arithmetic mean of the
+    raw amplitudes mixes scales: MEP samples are strongly right-skewed, mean >
+    median, and every adjusted value in the sample is inflated by the
+    difference. The equivalent LSR implementation anchors on ``mean(fitted)``,
+    which for least squares is identically ``mean(y)``.
+
+    As the standard error of the intercept grows, Wi -> 0 and the reference
+    converges on the central tendency of the fitted values. Independently, as
+    the slope tends to zero the intercept itself converges on that central
+    tendency, so the reference converges regardless of Wi. The scheme is
+    self-limiting in both cases: where no association is present, the
+    adjustment vanishes.
 
     Standard errors of the fitted ordinate are computed analytically from the
-    parameter covariance (equivalent to converting the prediction CIs to SEs,
-    as in the paper): SE_fit(x) = sqrt([1, x] · cov(β) · [1, x]ᵀ).
+    parameter covariance: SE_fit(x) = sqrt([1, x] · cov(β) · [1, x]ᵀ). The
+    author converts rq() prediction CIs to SEs instead; only the RATIOS
+    SEi/SET and SEc/SET enter the weights, so any common scaling cancels.
 
     Parameters
     ----------
-    rms        : pre-stimulus r.m.s. EMG per trial (same order as ``ptp``)
-    ptp        : evoked-response peak-to-peak amplitude per trial (mV)
-    tau        : quantile for QR (0.5 = median; matches Carson 2026)
-    min_trials : minimum trials required to attempt a fit (paper floor = 8)
+    rms          : pre-stimulus r.m.s. EMG per trial (same order as ``ptp``)
+    ptp          : evoked-response peak-to-peak amplitude per trial (mV)
+    tau          : quantile for QR (0.5 = median; matches Carson 2026)
+    min_trials   : minimum trials required to attempt a fit (paper floor = 8)
+    low_n_trials : below this n the fit is still performed but ``low_n`` is set,
+                   because with two parameters the standard errors, and hence
+                   Wi, are unstable (the paper's median sample was 20 trials)
 
     Returns
     -------
@@ -255,11 +294,16 @@ def fit_qr_compensation(
                       | "unavailable"
         method      : "qr" (with a suffix for non-ok status)
         n           : int   — trials used in the fit
-        slope       : float — QR slope (mV per µV RMS)  | None
+        low_n       : bool  — n < low_n_trials (weights poorly determined)
+        slope       : float — QR slope, amplitude units per RMS unit | None
+                      (PTP and PreStimRMS share a unit, so a slope of ~26
+                      corresponds to the paper's 26 µV per µV)
         intercept   : float — QR intercept (mV)         | None
         w_intercept : float — Wi in [0, 1]              | None
-        adjustment  : float — reference - mean(ptp), mV | None
+        central     : float — median of the fitted values (mV) | None
+        adjustment  : float — reference - median(fitted), mV | None
         pseudo_r2   : float — Koenker–Machado pseudo-R²  | None
+        rho_pre     : float — Spearman rho(ptp, rms) before adjustment
         rho_post    : float — Spearman rho(adjusted, rms) (≈ 0 when adequate)
         reference   : float — reference value (mV)      | None
         adjusted    : list[float] — per-trial adjusted amplitude (mV);
@@ -272,9 +316,10 @@ def fit_qr_compensation(
         # No adjustment possible → adjusted == raw (clearly flagged via status).
         return dict(
             status=status, method=f"qr_{suffix}", n=int(len(ptp)),
-            slope=None, intercept=None, w_intercept=None, adjustment=0.0,
-            pseudo_r2=None, rho_post=None,
-            reference=(float(np.mean(ptp)) if len(ptp) else None),
+            low_n=bool(len(ptp) < low_n_trials),
+            slope=None, intercept=None, w_intercept=None, central=None,
+            adjustment=0.0, pseudo_r2=None, rho_pre=None, rho_post=None,
+            reference=(float(np.median(ptp)) if len(ptp) else None),
             adjusted=ptp.tolist(),
         )
 
@@ -303,19 +348,31 @@ def fit_qr_compensation(
             v = np.array([1.0, x0])
             return float(np.sqrt(max(v @ cov @ v, 0.0)))
 
+        fitted = np.asarray(res.predict(X), dtype=float)
+
+        # QR estimates a conditional median, so the reference is anchored on the
+        # median of the fitted values and the second SE evaluated at the RMS
+        # that produces it. fitted is monotone in rms, so that RMS is median(rms)
+        # exactly — algebraically identical to the author's
+        # (median(fitted) - intercept) / slope, without the near-zero division.
+        x_ct = float(np.median(rms))
+        ct   = b0 + b1 * x_ct                          # == median(fitted)
+
         se_i = _se_fit(0.0)
-        se_m = _se_fit(float(np.mean(rms)))
-        se_t = se_i + se_m
+        se_c = _se_fit(x_ct)
+        se_t = se_i + se_c
         if not np.isfinite(se_t) or se_t <= 0:
             return _fallback("error", "error")
 
-        w_i = 1.0 - (se_i / se_t) + (se_m / se_t)      # weight on intercept
-        w_m = (se_i / se_t) - (se_m / se_t)            # weight on sample mean
-        mean_ptp = float(np.mean(ptp))
-        reference = w_i * b0 + w_m * mean_ptp
+        w_i = 1.0 - (se_i / se_t) + (se_c / se_t)      # weight on intercept
+        # SEi >= SEc in every well-behaved fit, so Wi is confined to [0, 1];
+        # clamp as a cheap guard against a pathological covariance estimate and
+        # keep the two weights complementary.
+        w_i = float(np.clip(w_i, 0.0, 1.0))
+        w_c = 1.0 - w_i                                # weight on median(fitted)
+        reference = w_i * b0 + w_c * ct
 
-        fitted = res.predict(X)
-        residuals = ptp - np.asarray(fitted, dtype=float)
+        residuals = ptp - fitted
         adjusted = residuals + reference
 
         try:
@@ -323,9 +380,14 @@ def fit_qr_compensation(
         except Exception:
             pseudo_r2 = None
 
-        rho_post = None
+        # rho before and after adjustment: the association being removed, and
+        # the residual association left behind (should be ~0 when adequate).
+        rho_pre = rho_post = None
         try:
             from scipy.stats import spearmanr
+            if np.std(ptp) > 1e-12:
+                _rho, _ = spearmanr(ptp, rms)
+                rho_pre = float(_rho) if np.isfinite(_rho) else None
             if np.std(adjusted) > 1e-12:
                 _rho, _ = spearmanr(adjusted, rms)
                 rho_post = float(_rho) if np.isfinite(_rho) else None
@@ -334,16 +396,26 @@ def fit_qr_compensation(
 
         return dict(
             status="ok", method="qr", n=int(len(ptp)),
+            low_n=bool(len(ptp) < low_n_trials),
             slope=round(b1, 6), intercept=round(b0, 6),
-            w_intercept=round(w_i, 4),
-            adjustment=round(reference - mean_ptp, 4),
+            w_intercept=round(w_i, 4), central=round(ct, 6),
+            adjustment=round(reference - ct, 4),
             pseudo_r2=(round(pseudo_r2, 4) if pseudo_r2 is not None else None),
+            rho_pre=(round(rho_pre, 4) if rho_pre is not None else None),
             rho_post=(round(rho_post, 4) if rho_post is not None else None),
             reference=round(reference, 6),
-            adjusted=[round(float(a), 4) for a in adjusted],
+            adjusted=[round(float(a), 6) for a in adjusted],
         )
     except Exception:
         return _fallback("error", "error")
+
+
+# Outlier_Decision values that take a trial out of the regression sample.
+# "Kept" means flagged by the z-screen but retained by the reviewer, and
+# "Not flagged" was never flagged; both belong in the fit. Retaining as many
+# datapoints as possible is one of the stated benefits of the method, so only
+# trials actively removed or excluded are dropped.
+EXCLUDED_DECISIONS: tuple[str, ...] = ("Removed", "Excluded")
 
 
 def apply_emg_compensation(
@@ -353,32 +425,43 @@ def apply_emg_compensation(
         method: str = "qr",
         tau: float = 0.5,
         min_trials: int = 8,
+        extra_group_cols=None,
+        excluded_decisions: tuple[str, ...] = EXCLUDED_DECISIONS,
         log_callback=print,
 ) -> None:
     """
     Fill EMG-excitability-compensation columns in-place in a trial row list.
 
     Groups rows by StimType (each StimType is assumed to be a single TMS
-    intensity — the paper's requirement) and, for every group not designated
-    as a normalisation reference, fits :func:`fit_qr_compensation` on the
-    *clean* trials (Outlier_Decision != "Outlier"). Only clean trials receive
-    values; outlier rows are left untouched (blank) in all compensation
-    columns.
+    intensity — the paper's requirement, since MEP amplitude variance changes
+    with stimulator output) plus any columns named in ``extra_group_cols``, and
+    fits :func:`fit_qr_compensation` on each group. A group must be a single
+    *sample* in the paper's sense: one participant, one intensity, one block or
+    condition. If a recording contains, say, pre- and post-intervention trials
+    under one StimType label, pass the column that distinguishes them via
+    ``extra_group_cols`` so they are fitted separately, as the paper does.
+
+    Trials whose Outlier_Decision is in ``excluded_decisions`` are left out of
+    the fit and receive no compensation values. All other trials, including
+    those flagged by the z-screen but kept, contribute to the fit.
 
     Columns written (by name; silently skipped if absent from ``col``):
         Adjusted_PTP_QR(mV), EMGComp_Method, EMGComp_N, EMGComp_Slope,
         EMGComp_Intercept, EMGComp_InterceptWeight, EMGComp_Adjustment(mV),
-        EMGComp_PseudoR2, EMGComp_Rho_Post
+        EMGComp_PseudoR2, EMGComp_Rho_Pre, EMGComp_Rho_Post
 
     Parameters
     ----------
-    latency_rows  : list of rows indexed by ``col``
-    col           : {column_name: row_index}
-    exclude_stims : iterable of StimType values to skip (M-wave / Mmax
-                    references — not spinally mediated and often multi-intensity)
-    method        : compensation backend; only "qr" is supported in v1
-    tau           : quantile for QR (0.5 = median)
-    min_trials    : minimum clean trials per sample to attempt a fit
+    latency_rows       : list of rows indexed by ``col``
+    col                : {column_name: row_index}
+    exclude_stims      : iterable of StimType values to skip (M-wave / Mmax
+                         references — not spinally mediated and often
+                         multi-intensity)
+    method             : compensation backend; only "qr" is supported in v1
+    tau                : quantile for QR (0.5 = median)
+    min_trials         : minimum trials per sample to attempt a fit
+    extra_group_cols   : additional column names forming the sample key
+    excluded_decisions : Outlier_Decision values that drop a trial from the fit
     """
     if not latency_rows:
         return
@@ -403,18 +486,22 @@ def apply_emg_compensation(
     ri_wi   = col.get("EMGComp_InterceptWeight")
     ri_adjm = col.get("EMGComp_Adjustment(mV)")
     ri_pr2  = col.get("EMGComp_PseudoR2")
+    ri_rho0 = col.get("EMGComp_Rho_Pre")
     ri_rho  = col.get("EMGComp_Rho_Post")
 
-    def _is_clean(row) -> bool:
-        return ri_out is None or row[ri_out] != "Outlier"
+    ri_extra = [col[c] for c in (extra_group_cols or ()) if c in col]
+    dropped  = set(excluded_decisions or ())
 
-    # ── Group clean-trial indices by StimType ─────────────────────────────────
+    def _in_sample(row) -> bool:
+        return ri_out is None or row[ri_out] not in dropped
+
+    # ── Group trial indices by sample key ─────────────────────────────────────
     groups: dict = {}
     for i, row in enumerate(latency_rows):
         st = row[ri_st]
         if st in exclude:
             continue
-        if not _is_clean(row):
+        if not _in_sample(row):
             continue
         try:
             _p = float(row[ri_ptp])
@@ -423,10 +510,13 @@ def apply_emg_compensation(
             continue
         if not (np.isfinite(_p) and np.isfinite(_r)):
             continue
-        groups.setdefault(st, []).append(i)
+        key = (st,) + tuple(row[j] for j in ri_extra)
+        groups.setdefault(key, []).append(i)
 
     # ── Fit + write per group ─────────────────────────────────────────────────
-    for st, idxs in groups.items():
+    for key, idxs in groups.items():
+        st    = key[0]
+        label = " / ".join(str(k) for k in key)
         rms_vals = [float(latency_rows[i][ri_rms]) for i in idxs]
         ptp_vals = [float(latency_rows[i][ri_ptp]) for i in idxs]
 
@@ -443,16 +533,38 @@ def apply_emg_compensation(
             if ri_wi   is not None: row[ri_wi]   = r["w_intercept"]
             if ri_adjm is not None: row[ri_adjm] = r["adjustment"]
             if ri_pr2  is not None: row[ri_pr2]  = r["pseudo_r2"]
+            if ri_rho0 is not None: row[ri_rho0] = r["rho_pre"]
             if ri_rho  is not None: row[ri_rho]  = r["rho_post"]
 
         if r["status"] == "ok":
             log_callback(
-                f"🧮 EMG compensation '{st}': n={r['n']}, slope={r['slope']:.3f}, "
-                f"Wi={r['w_intercept']:.2f}, adjustment={r['adjustment']:+.2f} mV, "
-                f"pseudo-R²={r['pseudo_r2']}, post-rho={r['rho_post']}"
+                f"🧮 EMG compensation '{label}': n={r['n']}, "
+                f"slope={r['slope']:.3f}, Wi={r['w_intercept']:.2f}, "
+                f"adjustment={r['adjustment']:+.4f} mV, "
+                f"pseudo-R²={r['pseudo_r2']}, "
+                f"rho {r['rho_pre']} → {r['rho_post']}"
             )
+            if r["low_n"]:
+                log_callback(
+                    f"⚠️  EMG compensation '{label}': only {r['n']} trials — the "
+                    f"intercept weighting is poorly determined below ~15 "
+                    f"(Carson's median sample was 20)"
+                )
+            if r["rho_post"] is not None and abs(r["rho_post"]) > 0.10:
+                log_callback(
+                    f"⚠️  EMG compensation '{label}': residual rho="
+                    f"{r['rho_post']:+.2f} — the association was not fully "
+                    f"removed; inspect the fit before using adjusted values"
+                )
+            if r["slope"] is not None and r["slope"] < 0:
+                log_callback(
+                    f"ℹ️  EMG compensation '{label}': slope is negative, so the "
+                    f"reference sits above the sample median and adjusted "
+                    f"amplitudes are LARGER than unadjusted. This is expected "
+                    f"(74 of Carson's 182 participants behaved this way)."
+                )
         else:
             log_callback(
-                f"🧮 EMG compensation '{st}': {r['status']} "
+                f"🧮 EMG compensation '{label}': {r['status']} "
                 f"(n={r['n']}) — adjusted = raw amplitude"
             )

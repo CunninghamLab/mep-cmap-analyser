@@ -68,6 +68,7 @@ from .filters import adaptive_mains_cancel
 from .detection import detect_mep_onset_peak_fraction
 from .inspector import DataInspectorWindow
 from .pipeline       import run_pipeline
+from .normalisation import EXCLUDED_DECISIONS
 from .preferences    import prefs, apply_scaling, accent_button_kw
 from .stage2         import Stage2Mixin
 from .filter_preview import FilterPreviewMixin
@@ -2722,7 +2723,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                     df_sum[col] = _np.nan
                 df_sum[col] = df_sum[col].astype(object)
 
-            clean = trials_df[trials_df["Outlier_Decision"] != "Outlier"].copy()
+            clean = trials_df[~trials_df["Outlier_Decision"].isin(EXCLUDED_DECISIONS)].copy()
             for col in ["Normalised_PTP", "PTP_per_PreStimRMS",
                         "Normalised_PTP_per_PreStimRMS",
                         "Normalised_Adjusted_PTP_QR",
@@ -2772,7 +2773,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                     continue  # user chose to skip this stim type
 
                 # Reference pool: clean trials of ref_st in df_ref
-                ref_mask = (df_ref["StimType"] == ref_st) &                            (df_ref["Outlier_Decision"] != "Outlier")
+                ref_mask = (df_ref["StimType"] == ref_st) &                            (~df_ref["Outlier_Decision"].isin(EXCLUDED_DECISIONS))
                 ref_ptps = _pd.to_numeric(
                     df_ref.loc[ref_mask, _ptp_col], errors='coerce').dropna().tolist()
 
@@ -2790,7 +2791,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                     continue
 
                 # Apply to matching main stim type
-                main_mask = (df_main["StimType"] == main_st) &                             (df_main["Outlier_Decision"] != "Outlier")
+                main_mask = (df_main["StimType"] == main_st) &                             (~df_main["Outlier_Decision"].isin(EXCLUDED_DECISIONS))
                 ptps = _pd.to_numeric(df_main.loc[main_mask, _ptp_col], errors='coerce')
                 df_main.loc[main_mask, _norm_col]  = (ptps / ref_mean).round(4)
                 df_main.loc[main_mask, _rtype_col] = ref_type
@@ -2820,7 +2821,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
 
         else:
             # Single pool — use all clean ref trials regardless of stim type
-            ref_mask = df_ref["Outlier_Decision"] != "Outlier"
+            ref_mask = ~df_ref["Outlier_Decision"].isin(EXCLUDED_DECISIONS)
             ref_ptps = _pd.to_numeric(
                 df_ref.loc[ref_mask, _ptp_col], errors='coerce').dropna().tolist()
 
@@ -2837,7 +2838,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                 return (f"⚠️  {os.path.basename(ref_csv)}: "
                         f"could not compute reference mean")
 
-            mask = df_main["Outlier_Decision"] != "Outlier"
+            mask = ~df_main["Outlier_Decision"].isin(EXCLUDED_DECISIONS)
             ptps = _pd.to_numeric(df_main.loc[mask, _ptp_col], errors='coerce')
             df_main.loc[mask, _norm_col]  = (ptps / ref_mean).round(4)
             df_main.loc[mask, _rtype_col] = ref_type

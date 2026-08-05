@@ -46,7 +46,8 @@ from .detection     import (detect_mep_onset_peak_fraction,
                              detect_mep_onset_bigoni,
                              detect_mep_onset_bigoni_walkback,
                              compute_bootstrap_threshold)
-from .normalisation import compute_mmax, apply_normalisation, apply_emg_compensation
+from .normalisation import (compute_mmax, apply_normalisation,
+                            apply_emg_compensation, EXCLUDED_DECISIONS)
 
 @dataclass
 class PipelineConfig:
@@ -57,6 +58,15 @@ class PipelineConfig:
     ptp_start:         int   = 10
     ptp_end:           int   = 50
     prestim_ms:        int   = 100
+    # Pre-stimulus baseline (background EMG) quantification
+    # Carson (2026) estimated r.m.s. EMG over the 100 ms ending 3 ms before the
+    # stimulus. The guard keeps the stimulus artefact out of the window; the
+    # effective guard is max(rms_guard_ms, this stim type's gap_ms).
+    rms_guard_ms:      float = 3.0
+    # Remove the DC offset of the pre-stimulus window before taking its r.m.s.
+    # An offset is not motoneurone activity, and carrying it into the RMS adds
+    # between-trial variance that masks the association with MEP amplitude.
+    prestim_rms_demean: bool = True
     # Filter
     apply_filter:      bool  = True
     apply_bandpass:    bool  = True
@@ -221,6 +231,28 @@ def pipeline_apply_filters(emg, fs, cfg: PipelineConfig):
     return emg
 
 
+def pipeline_prestim_rms(prestim, cfg: PipelineConfig = None, axis=None):
+    """r.m.s. of the pre-stimulus window, DC offset removed by default.
+
+    Single definition shared by outlier screening, per-trial quantification and
+    averaged mode, so PreStimRMS means the same thing everywhere — including
+    when it is used as the regressor in the Carson (2026) compensation. Any
+    residual DC offset would otherwise enter the r.m.s. as between-trial
+    variance unrelated to the state of the motoneurone pool, which attenuates
+    the association the method is designed to remove.
+
+    ``axis=None`` for a single 1-D window; ``axis=1`` for a (trials, samples)
+    stack, returning one value per trial.
+    """
+    x = np.asarray(prestim, dtype=float)
+    if x.size == 0:
+        return 0.0 if axis is None else np.zeros(0)
+    if cfg is None or getattr(cfg, "prestim_rms_demean", True):
+        x = x - np.mean(x, axis=axis, keepdims=(axis is not None))
+    return (float(np.sqrt(np.mean(x ** 2))) if axis is None
+            else np.sqrt(np.mean(x ** 2, axis=axis)))
+
+
 def pipeline_extract_segments(time, emg, stim_times, stim_types, fs,
                                cfg: PipelineConfig):
     """Extract per-trial EMG and pre-stim segments for every stim type.
@@ -238,10 +270,17 @@ def pipeline_extract_segments(time, emg, stim_times, stim_types, fs,
     prestim_samples = int(cfg.prestim_ms * fs / 1000)
 
     result = {}
+    guard_samples = int(round(max(cfg.rms_guard_ms, 0.0) * fs / 1000))
+
     for stim_type in stim_types:
         valid_times = [t for t in stim_times[stim_type]
                        if time.min() <= t <= time.max()]
         gap_samples = int(cfg.gap_ms_map.get(stim_type, 0.0) * fs / 1000)
+        # The background-EMG window must clear the stimulus artefact. Use the
+        # larger of the configured guard and this stim type's artefact gap, so a
+        # rig that already needs a long gap keeps it (Carson 2026: 103 ms to
+        # 3 ms before the pulse).
+        pre_offset = max(gap_samples, guard_samples)
         segs = []
         for stim_time in valid_times:
             idx   = int(np.argmin(np.abs(time - stim_time)))
@@ -250,8 +289,8 @@ def pipeline_extract_segments(time, emg, stim_times, stim_types, fs,
             if (end - start) != (samples_before + samples_after):
                 continue          # incomplete window — skip
             seg_emg = emg[start:end]
-            pre_start = max(0, idx - prestim_samples - gap_samples)
-            pre_end   = max(0, idx - gap_samples)
+            pre_end   = max(0, idx - pre_offset)
+            pre_start = max(0, pre_end - prestim_samples)
             seg_pre   = emg[pre_start:pre_end]
             segs.append((seg_emg, seg_pre, stim_time))
         if segs:
@@ -270,7 +309,7 @@ def pipeline_detect_outliers(emg_segments, prestim_segments,
     outlier_indices        : list[int]   indices where |z| > threshold
     """
     ptps     = _np_ptp(emg_segments[:, ptp_start_idx:ptp_end_idx], axis=1)
-    rms_vals = np.sqrt(np.mean(prestim_segments ** 2, axis=1))
+    rms_vals = pipeline_prestim_rms(prestim_segments, cfg, axis=1)
     preptp   = _np_ptp(prestim_segments, axis=1)
     rms_z    = zscore(rms_vals) if len(rms_vals) > 1 else np.zeros_like(rms_vals)
     ptp_z    = zscore(ptps)     if len(ptps)     > 1 else np.zeros_like(ptps)
@@ -463,7 +502,7 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
     with_out_row : list  one summary row (all trials including outliers)
     ptps_array   : np.ndarray  per-trial PTP (all trials)
     """
-    rms_all    = np.sqrt(np.mean(prestim_all ** 2, axis=1))
+    rms_all    = pipeline_prestim_rms(prestim_all, cfg, axis=1)
     preptp_all = _np_ptp(prestim_all, axis=1)
     rms_z_full = (zscore(rms_all) if len(rms_all) > 1
                   else np.zeros_like(rms_all))
@@ -618,7 +657,7 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
         # [19-21] Z scores, [22-25] detrended, [26] Outlier_Decision
         # [27-31] normalisation (incl Normalised_PTP_per_PreStimRMS)
         # [32-33] Adjusted_PTP_QR / Normalised_Adjusted_PTP_QR
-        # [34-41] EMGComp_* diagnostics, [42] Manual_Note
+        # [34-42] EMGComp_* diagnostics, [43] Manual_Note
         # cSP/MEP ratio (Orth & Rothwell 2004): cSP duration(ms) / MEP PTP(mV), in ms/mV
         _csp_mep = round(float(silent_dur) / float(man_ptp), 4) \
                    if (isinstance(silent_dur, (int, float)) and silent_dur >= 0
@@ -637,8 +676,8 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
             decision,                                                     # [26] Outlier_Decision
             None, None, None, None, None,                                 # [27-31] norm cols (incl Norm_PTP_per_PreStimRMS)
             None, None,                                                   # [32-33] Adjusted_PTP_QR / Normalised_Adjusted_PTP_QR
-            None, None, None, None, None, None, None, None,               # [34-41] EMGComp_* diagnostics
-            note_txt,                                                     # [42] Manual_Note
+            None, None, None, None, None, None, None, None, None,         # [34-42] EMGComp_* diagnostics
+            note_txt,                                                     # [43] Manual_Note
         ]
 
         auto_row   = common.copy()
@@ -875,16 +914,18 @@ LAT_COLS = [
     "Reference_N",        # trials contributing to reference mean
     "Normalised_PTP",     # PTP / Reference_Mean  (raw ratio)
     "Normalised_PTP_per_PreStimRMS", # Normalised_PTP / PreStimRMS (blank until normalised)
-    # EMG excitability compensation (Carson 2026, quantile regression) — clean trials only
+    # EMG excitability compensation (Carson 2026, quantile regression).
+    # Blank for trials excluded from the sample (Removed / Excluded).
     "Adjusted_PTP_QR(mV)",            # excitability-compensated PTP (QR)
     "Normalised_Adjusted_PTP_QR",     # Adjusted_PTP_QR / raw reference mean
     "EMGComp_Method",                 # "qr" | fallback flag (insufficient_n, degenerate_rms, ...)
-    "EMGComp_N",                      # clean trials contributing to the per-sample fit
-    "EMGComp_Slope",                  # QR slope (mV per µV RMS)
+    "EMGComp_N",                      # trials contributing to the per-sample fit
+    "EMGComp_Slope",                  # QR slope, PTP units per PreStimRMS unit
     "EMGComp_Intercept",              # QR intercept (mV)
     "EMGComp_InterceptWeight",        # Wi in [0, 1]
-    "EMGComp_Adjustment(mV)",         # reference − mean(PTP)
+    "EMGComp_Adjustment(mV)",         # reference − median(fitted): the shift applied
     "EMGComp_PseudoR2",               # Koenker–Machado pseudo-R²
+    "EMGComp_Rho_Pre",                # Spearman rho(PTP, RMS) — association removed
     "EMGComp_Rho_Post",               # Spearman rho(adjusted, RMS) — ≈ 0 when adequate
     # Annotations — always last
     "Manual_Note",
@@ -934,7 +975,7 @@ def pipeline_write_outputs(latency_manual, results_out, bids_prefix):
         "Mean_Normalised_Adjusted_PTP_QR", "SD_Normalised_Adjusted_PTP_QR",
         "EMGComp_Method", "EMGComp_N", "EMGComp_Slope", "EMGComp_Intercept",
         "EMGComp_InterceptWeight", "EMGComp_Adjustment(mV)",
-        "EMGComp_PseudoR2", "EMGComp_Rho_Post",
+        "EMGComp_PseudoR2", "EMGComp_Rho_Pre", "EMGComp_Rho_Post",
     ]
 
     def _alpha_sort(df, col):
@@ -946,13 +987,13 @@ def pipeline_write_outputs(latency_manual, results_out, bids_prefix):
 
     # ── Trial-level files ─────────────────────────────────────────────────────
     if latency_manual:
-        # Separate clean vs all-trials using Outlier_Decision column
         df_all = _alpha_sort(
             pd.DataFrame(latency_manual, columns=LAT_COLS),
             "StimType").sort_values(["StimType", "File", "Segment"])
-        df_clean = df_all[df_all["Outlier_Decision"] != "Outlier"]
-        df_clean.to_csv(_p("trials.csv"), index=False)
-        # _trials_with_outliers.csv removed — use _trials.csv with Outlier_Decision column
+        # trials.csv deliberately carries EVERY trial; Outlier_Decision is the
+        # filter column so the analyst keeps control of trial-level modelling.
+        # (_trials_with_outliers.csv was retired for this reason.)
+        df_all.to_csv(_p("trials.csv"), index=False)
 
     # ── Summary files — build from trial-level data for consistency ───────────
     # This ensures summary and trial files always report the same variables.
@@ -986,7 +1027,7 @@ def pipeline_write_outputs(latency_manual, results_out, bids_prefix):
             rows = []
             for (fname, st, lbl), grp in df.groupby(
                     ["File", "StimType", "Stim_Label"], sort=False):
-                clean = grp[grp["Outlier_Decision"] != "Outlier"]
+                clean = grp[~grp["Outlier_Decision"].isin(EXCLUDED_DECISIONS)]
                 n_tot = len(grp)
                 n_inc = len(clean)
                 n_out = n_tot - n_inc
@@ -1025,12 +1066,13 @@ def pipeline_write_outputs(latency_manual, results_out, bids_prefix):
                     _mn(_col(clean,"EMGComp_InterceptWeight")),
                     _mn(_col(clean,"EMGComp_Adjustment(mV)")),
                     _mn(_col(clean,"EMGComp_PseudoR2")),
+                    _mn(_col(clean,"EMGComp_Rho_Pre")),
                     _mn(_col(clean,"EMGComp_Rho_Post")),
                 ])
             return pd.DataFrame(rows, columns=SUM_HDR)
 
         df_all = pd.DataFrame(latency_manual, columns=LAT_COLS)
-        df_clean_only = df_all[df_all["Outlier_Decision"] != "Outlier"]
+        df_clean_only = df_all[~df_all["Outlier_Decision"].isin(EXCLUDED_DECISIONS)]
 
         _build_summary(df_clean_only) \
             .to_csv(_p("summary.csv"),               index=False)
@@ -1257,8 +1299,12 @@ def pipeline_quantify_averaged(means, segments_metadata, fs, cfg,
                                       dx=1 / fs))
 
         # ── baseline / ratios ────────────────────────────────────────────
-        prestim = seg[:insp_sb] if insp_sb > 0 else seg[:1]
-        rms = float(np.sqrt(np.mean(prestim ** 2))) if len(prestim) else 0.0
+        # Clear the stimulus artefact from the baseline window, matching
+        # pipeline_extract_segments (Carson 2026: ends 3 ms before the pulse).
+        _guard = int(round(max(cfg.rms_guard_ms, 0.0) * fs / 1000))
+        _pre_e = max(0, insp_sb - _guard)
+        prestim = seg[:_pre_e] if _pre_e > 0 else seg[:1]
+        rms = pipeline_prestim_rms(prestim, cfg) if len(prestim) else 0.0
         preptp = float(_np_ptp(prestim)) if len(prestim) else 0.0
         ptp_per_rms = (ptp / rms) if (rms and not np.isnan(ptp)) else None
         csp_ratio = (round(csp_dur / ptp, 4)
@@ -2005,7 +2051,9 @@ def run_pipeline(input_path,
 
     # ── Stage 9a: EMG excitability compensation (Carson 2026, QR) ─────────
     # Runs unconditionally (independent of normalisation). Fits QR per StimType
-    # sample on clean trials only. EVERY stim type is compensated — including a
+    # sample on every trial except those Removed or Excluded, so as much of the
+    # design's power is retained as possible (a stated benefit of the method).
+    # EVERY stim type is compensated — including a
     # single-pulse condition that serves as a paired-pulse normalisation
     # reference, since the fit is within-stim-type and single-pulse MEPs are a
     # valid target. (A reference stim gets Adjusted_PTP_QR but no

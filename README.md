@@ -1,7 +1,8 @@
 # MEP-CMAP Analyser
 
-**Version 1.2.4 | August 2026**  
+**Version 1.2.5 | August 2026**  
 *Author: [*Justin Andrushko PhD, Northumbria University*](https://researchportal.northumbria.ac.uk/en/persons/justin-w-andrushko/)
+
 *Collaborators:* [*David Cunningham PhD*](https://fescenter.org/team/investigators/cunningham-david-phd/) *(*[*TMS Analysis ToolBox*](https://github.com/CunninghamLab/TMSAnalysisToolBox)*) ·* [*Nicholas Holmes PhD*](https://www.birmingham.ac.uk/staff/profiles/sportex/holmes-nick) *·* [*TMSMultiLab*](https://github.com/TMSMultiLab/TMSMultiLab/wiki)
 
 [!\[PyPI version](https://badge.fury.io/py/mep-cmap-analyser.svg)](https://pypi.org/project/mep-cmap-analyser/)
@@ -40,7 +41,7 @@ The tool is not limited to any single measure or paradigm. It handles motor evok
 * **Broader format support** — added BIOPAC AcqKnowledge (`.acq` and `.mat`), Brainsight neuronavigation exports, BrainVision, and LabChart MATLAB exports.
 * **Cross-platform polish** — readable coloured action buttons on macOS, Windows, and Linux, and consistent font scaling across the interface.
 
-**Point releases (1.2.1–1.2.4):** EDF/BDF files (including BIDS-ify output) now load correctly, plus release-pipeline and repository cleanup.
+**Point releases (1.2.1–1.2.5):** EDF/BDF files (including BIDS-ify output) now load correctly, plus release-pipeline and repository cleanup.
 
 \---
 
@@ -181,7 +182,32 @@ A vectorised bootstrap method: a silence threshold is estimated from the pre-sti
 
 A separate Mmax file can be designated containing M-waves across a range of intensities. The plateau region is detected robustly for three scenarios: a full recruitment curve (averages the plateau within a tolerance band, default ±10%), a few supramaximal pulses (averages the largest similar-amplitude cluster), or a single M-wave (used directly). Normalised PTP is then reported for all MEP trials as a fraction of Mmax.
 
-For designs where the background excitability of spinal motoneurones varies across trials — for example active-contraction paradigms — the tool also compensates evoked-potential magnitude for pre-stimulus excitability by quantile regression, following the method of Carson (2026) \[9]. It is reported per trial as `Adjusted\\\_PTP\\\_QR(mV)` (and a reference-normalised form) alongside the regression diagnostics, as an alternative or complement to Mmax normalisation.
+For designs where the background excitability of spinal motoneurones varies across trials, for example active-contraction paradigms, the tool also compensates evoked-potential magnitude for pre-stimulus excitability by quantile regression, following the method of Carson (2026) \[9], as an alternative or complement to Mmax normalisation.
+
+### EMG Excitability Compensation (Carson 2026)
+
+MEP amplitude covaries positively with the level of background EMG in the period immediately preceding the pulse, over a range far below any conventional rejection threshold. Rather than discarding trials, the amplitude is regressed on pre-stimulus r.m.s. EMG by median quantile regression within each sample (one participant, one stimulus type, one intensity, one block), and each trial's residual is re-expressed relative to an uncertainty-weighted reference value. The reference blends the regression intercept with the median of the fitted values, weighted by the relative standard error of the fitted ordinate at each point, so where no association is present the adjustment vanishes.
+
+The implementation is verified against the author's own reference code and example data (`annotated_QR_example_code.R`, Zenodo 20037178); `tests/test_carson_compensation.py` locks the slope, intercept, intercept weighting and reference value to his published values.
+
+Reported per trial:
+
+| Column | Description |
+| --- | --- |
+| `Adjusted_PTP_QR(mV)` | Excitability-compensated PTP |
+| `Normalised_Adjusted_PTP_QR` | Adjusted PTP as a fraction of the reference mean |
+| `EMGComp_Slope`, `EMGComp_Intercept` | Fitted relationship, in PTP units per PreStimRMS unit |
+| `EMGComp_InterceptWeight` | Wi, the weight given to the intercept in the reference value |
+| `EMGComp_Adjustment(mV)` | reference minus median(fitted): the shift applied to the sample |
+| `EMGComp_N`, `EMGComp_Method` | Trials in the fit, and the backend or fallback reason |
+| `EMGComp_PseudoR2` | Koenker-Machado pseudo-R-squared |
+| `EMGComp_Rho_Pre`, `EMGComp_Rho_Post` | Spearman rho with pre-stimulus RMS before and after adjustment; the second should be near zero |
+
+Two points worth knowing when reading the output. First, adjusted amplitudes **larger** than unadjusted are expected, not a fault: within any sample the low-RMS trials always shift upward, and a whole sample shifts upward whenever `EMGComp_Slope` is negative (74 of Carson's 182 participants). Second, the per-trial shift is exactly `reference - (intercept + slope * PreStimRMS)`, so plotting `Adjusted_PTP_QR(mV) - PTP(mV)` against `PreStimRMS` must give a straight line with slope `-EMGComp_Slope`. That is the quickest check that a suspicious file is behaving correctly. Before comparing adjusted values across conditions, check that the slopes and intercepts are comparable, as the paper recommends.
+
+Background EMG is quantified as the r.m.s. of a `prestim_ms` window (default 100 ms) ending `rms_guard_ms` before the pulse (default 3 ms, matching the paper, and widened automatically if a stimulus type needs a longer artefact gap). The window's DC offset is removed first, since an offset is not motoneurone activity and carrying it into the r.m.s. adds between-trial variance that masks the association the method exists to remove.
+
+Compensation is skipped for M-wave runs, which are direct muscle responses rather than spinally mediated, and typically span multiple intensities. Trials marked Removed or Excluded are left out of the fit and receive no compensation values; trials flagged by the z-screen but kept by the reviewer stay in, since retaining datapoints is one of the stated benefits of the method.
 
 ### Paired-Pulse Protocols
 
@@ -477,7 +503,7 @@ The optional Rust extension `mep\\\_cmap\\\_io` provides accelerated I/O for the
 
 If you use MEP-CMAP Analyser in published research, please cite:
 
-> Andrushko, J.W. (2026). MEP-CMAP Analyser (Version 1.2.4) \\\[Software].
+> Andrushko, J.W. (2026). MEP-CMAP Analyser (Version 1.2.5) \\\[Software].
 > Northumbria University. https://github.com/jandrushko/mep-cmap-analyser
 
 \---

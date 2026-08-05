@@ -1,6 +1,6 @@
 # MEP-CMAP Analyser
 
-**Version 1.2.6 | August 2026**  
+**Version 1.2.7 | August 2026**  
 *Author:* [*Justin Andrushko PhD, Northumbria University*](https://researchportal.northumbria.ac.uk/en/persons/justin-w-andrushko/)
 
 *Collaborators:* [*David Cunningham PhD*](https://fescenter.org/team/investigators/cunningham-david-phd/) *(*[*TMS Analysis ToolBox*](https://github.com/CunninghamLab/TMSAnalysisToolBox)*) ·* [*Nicholas Holmes PhD*](https://www.birmingham.ac.uk/staff/profiles/sportex/holmes-nick) *·* [*TMSMultiLab*](https://github.com/TMSMultiLab/TMSMultiLab/wiki)
@@ -41,7 +41,7 @@ The tool is not limited to any single measure or paradigm. It handles motor evok
 * **Broader format support** — added BIOPAC AcqKnowledge (`.acq` and `.mat`), Brainsight neuronavigation exports, BrainVision, and LabChart MATLAB exports.
 * **Cross-platform polish** — readable coloured action buttons on macOS, Windows, and Linux, and consistent font scaling across the interface.
 
-**Point releases (1.2.1–1.2.6):** EDF/BDF files (including BIDS-ify output) now load correctly, plus release-pipeline and repository cleanup.
+**Point releases (1.2.1–1.2.7):** EDF/BDF files (including BIDS-ify output) now load correctly, plus release-pipeline and repository cleanup.
 
 \---
 
@@ -503,7 +503,7 @@ The optional Rust extension `mep\\\_cmap\\\_io` provides accelerated I/O for the
 
 If you use MEP-CMAP Analyser in published research, please cite:
 
-> Andrushko, J.W. (2026). MEP-CMAP Analyser (Version 1.2.6) \\\[Software].
+> Justin W. Andrushko. (2026). jandrushko/mep-cmap-analyser: MEP-CMAP Analyser (Version v1.2.6) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.21810844
 > Northumbria University. https://github.com/jandrushko/mep-cmap-analyser
 
 \---

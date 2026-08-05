@@ -19,7 +19,7 @@ repository-code: "https://github.com/jandrushko/mep-cmap-analyser"
 url: "https://pypi.org/project/mep-cmap-analyser/"
 identifiers:
   - type: doi
-    value: ""
+    value: "10.5281/zenodo.21810844"
     description: "Archived release of version 1.2.6"
   - type: url
     value: "https://pypi.org/project/mep-cmap-analyser/"

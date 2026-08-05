@@ -1,13 +1,13 @@
 # MEP-CMAP Analyser
 
-**Version 1.2.5 | August 2026**  
-*Author: [*Justin Andrushko PhD, Northumbria University*](https://researchportal.northumbria.ac.uk/en/persons/justin-w-andrushko/)
+**Version 1.2.6 | August 2026**  
+*Author:* [*Justin Andrushko PhD, Northumbria University*](https://researchportal.northumbria.ac.uk/en/persons/justin-w-andrushko/)
 
 *Collaborators:* [*David Cunningham PhD*](https://fescenter.org/team/investigators/cunningham-david-phd/) *(*[*TMS Analysis ToolBox*](https://github.com/CunninghamLab/TMSAnalysisToolBox)*) ·* [*Nicholas Holmes PhD*](https://www.birmingham.ac.uk/staff/profiles/sportex/holmes-nick) *·* [*TMSMultiLab*](https://github.com/TMSMultiLab/TMSMultiLab/wiki)
 
-[!\[PyPI version](https://badge.fury.io/py/mep-cmap-analyser.svg)](https://pypi.org/project/mep-cmap-analyser/)
-[!\[License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/jandrushko/mep-cmap-analyser/blob/main/LICENSE)
-[!\[Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![PyPI version](https://badge.fury.io/py/mep-cmap-analyser.svg)](https://pypi.org/project/mep-cmap-analyser/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/jandrushko/mep-cmap-analyser/blob/main/LICENSE)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 
 **PyPI:** https://pypi.org/project/mep-cmap-analyser/  
 **GitHub:** https://github.com/jandrushko/mep-cmap-analyser  
@@ -41,20 +41,20 @@ The tool is not limited to any single measure or paradigm. It handles motor evok
 * **Broader format support** — added BIOPAC AcqKnowledge (`.acq` and `.mat`), Brainsight neuronavigation exports, BrainVision, and LabChart MATLAB exports.
 * **Cross-platform polish** — readable coloured action buttons on macOS, Windows, and Linux, and consistent font scaling across the interface.
 
-**Point releases (1.2.1–1.2.5):** EDF/BDF files (including BIDS-ify output) now load correctly, plus release-pipeline and repository cleanup.
+**Point releases (1.2.1–1.2.6):** EDF/BDF files (including BIDS-ify output) now load correctly, plus release-pipeline and repository cleanup.
 
 \---
 
 ## The Interface
 
 ```
-Setup                         First Level: Single File            Second Level: Group
+Setup                         First Level: Single File                  Second Level: Group
 ├── Dataset                   ├── 1a  Labels \\\& Analysis Setup      ├── Group Analysis (LME)
-└── BIDS-ify                  ├── 1b  Data Filtering               └── Add-ons
-                              ├── 1c  Feature Detection Setup
-                              │       (+ ▶ Run Analysis)
-                              ├── 1d  Normalisation (optional)
-                              └── Add-ons
+└── BIDS-ify                  ├── 1b  Data Filtering                  └── Add-ons
+                               ├── 1c  Feature Detection Setup
+                               │       (+ ▶ Run Analysis)
+                               ├── 1d  Normalisation (optional)
+                               └── Add-ons
 ```
 
 The active file, channel, and event marker are shown in a persistent header above the First-Level sub-tabs, so context stays visible as you move between steps.
@@ -503,7 +503,7 @@ The optional Rust extension `mep\\\_cmap\\\_io` provides accelerated I/O for the
 
 If you use MEP-CMAP Analyser in published research, please cite:
 
-> Andrushko, J.W. (2026). MEP-CMAP Analyser (Version 1.2.5) \\\[Software].
+> Andrushko, J.W. (2026). MEP-CMAP Analyser (Version 1.2.6) \\\[Software].
 > Northumbria University. https://github.com/jandrushko/mep-cmap-analyser
 
 \---

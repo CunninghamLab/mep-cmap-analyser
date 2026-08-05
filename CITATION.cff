@@ -1,0 +1,45 @@
+cff-version: 1.2.0
+message: "If you use MEP-CMAP Analyser in published research, please cite it as below."
+title: "MEP-CMAP Analyser"
+type: software
+version: "1.2.6"
+date-released: "2026-08-05"
+license: MIT
+# After publishing on Zenodo, open the record page and look under "Cite all
+# versions". If the concept DOI shown there differs from the value below, put
+# the concept DOI here so the citation always resolves to the latest release,
+# and leave the version-specific DOI in `identifiers`.
+doi: "10.5281/zenodo.21810702"
+authors:
+  - family-names: "Andrushko"
+    given-names: "Justin W."
+    orcid: "https://orcid.org/0000-0003-2258-1689"
+    affiliation: "School of Sport, Exercise and Rehabilitation, Northumbria University, Newcastle upon Tyne, UK"
+repository-code: "https://github.com/jandrushko/mep-cmap-analyser"
+url: "https://pypi.org/project/mep-cmap-analyser/"
+identifiers:
+  - type: doi
+    value: ""
+    description: "Archived release of version 1.2.6"
+  - type: url
+    value: "https://pypi.org/project/mep-cmap-analyser/"
+    description: "Python Package Index release"
+abstract: >-
+  A cross-platform graphical application for quantifying time-locked
+  electromyographic responses. It measures motor evoked potentials (MEPs),
+  compound muscle action potentials (CMAPs), cortical silent periods, M-wave
+  recruitment curves and paired-pulse protocols such as SICI and ICF, reporting
+  peak-to-peak amplitude, onset latency and area under the curve. Features
+  include configurable filtering, automated and reviewable outlier screening, an
+  interactive per-trial data inspector, Mmax normalisation with robust plateau
+  detection, compensation of evoked-potential magnitude for pre-stimulus spinal
+  motoneurone excitability by quantile regression, and BIDS-compatible output.
+keywords:
+  - electromyography
+  - transcranial magnetic stimulation
+  - motor evoked potential
+  - compound muscle action potential
+  - cortical silent period
+  - corticospinal excitability
+  - neurophysiology
+  - signal processing

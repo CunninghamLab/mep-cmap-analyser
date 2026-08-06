@@ -95,8 +95,37 @@ jobs:
             mac-build/MEP-CMAP_Analyser_Mac.zip
           generate_release_notes: true
 
+  test:
+    # Real gate for the PyPI release: the wheel is pure Python, so a successful
+    # PyInstaller build says nothing about whether the code works. Running the
+    # suite does. Kept in this workflow (rather than depending on tests.yml)
+    # because cross-workflow `needs` is not supported.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+          pip install mne || echo "MNE unavailable - parity test will skip"
+      - name: Tag must match TOOL_VERSION
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VER=$(python -c "import re,pathlib;print(re.search(r'TOOL_VERSION\s*=\s*[\"\']([^\"\']+)',pathlib.Path('mep_cmap/bids.py').read_text()).group(1))")
+          echo "tag=$TAG  TOOL_VERSION=$VER"
+          test "$TAG" = "$VER"
+      - name: Version + README consistency
+        run: python check_release.py
+      - name: Run tests
+        run: python -m pytest tests/ -q
+
   publish-pypi:
-    needs: release
+    needs: test
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

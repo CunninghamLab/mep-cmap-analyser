@@ -47,6 +47,13 @@ STRIP_NOISE = re.compile(
 # characters, which is how MEP_CMAP_Windows.spec was missed on the first pass.
 VERSION_RE = re.compile(r"(?<![\d.])\d+\.\d+\.\d+(?![\d.])")
 
+# A backslash before a markdown-escapable character is corruption from a
+# rich-text round-trip, never intentional in this repo (verified: no fenced
+# code block here contains a legitimate backslash). The damage compounds on
+# each round-trip, 1 -> 3 -> 7 -> 15 backslashes (n -> 2n+1), silently
+# breaking tables, headings, horizontal rules and code blocks.
+ESCAPE_RE = re.compile(r"\\+([\]\[()#*_&|<>~`.+\-!{}\"\'])")
+
 
 def tool_version():
     text = (ROOT / "mep_cmap" / "bids.py").read_text(encoding="utf-8")
@@ -56,7 +63,73 @@ def tool_version():
     return m.group(1)
 
 
+CONFLICT_RE = re.compile(r"^(<{7}|={7}|>{7})(\s|$)", re.M)
+
+
+def check_conflict_markers():
+    """
+    Flag unresolved git conflict markers in tracked text files.
+
+    An aborted merge or rebase leaves <<<<<<< / ======= / >>>>>>> in the file,
+    which means BOTH sides of the conflict are present: content is silently
+    duplicated. Never auto-repaired here, because choosing a side is a
+    judgement call.
+    """
+    bad = 0
+    for name in FILES + ["mep_cmap/bids.py"]:
+        path = ROOT / name
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        hits = [(n, line) for n, line in enumerate(text.splitlines(), 1)
+                if CONFLICT_RE.match(line)]
+        if not hits:
+            continue
+        bad += len(hits)
+        print(f"  CONFLICT {name}  {len(hits)} unresolved conflict marker(s)")
+        for n, line in hits[:3]:
+            print(f"            line {n}: {line.strip()[:70]}")
+        if len(hits) > 3:
+            print(f"            ... and {len(hits) - 3} more")
+        print("            resolve the merge/rebase, or restore a clean copy")
+    if not bad:
+        print("  ok       no unresolved conflict markers")
+    return bad
+
+
+def check_markdown_escapes(fix=False):
+    """Report (and optionally repair) backslash-escaped markdown in README.md."""
+    path = ROOT / "README.md"
+    if not path.is_file():
+        return 0
+    text = path.read_text(encoding="utf-8")
+    hits = ESCAPE_RE.findall(text)
+    if not hits:
+        print("  ok       README.md  (markdown not escaped)")
+        return 0
+
+    depth = max(len(m.group(0)) - 1 for m in ESCAPE_RE.finditer(text))
+    print(f"  MISMATCH README.md  {len(hits)} escaped character(s), "
+          f"up to {depth} backslashes deep")
+    for n, line in enumerate(text.splitlines(), 1):
+        if ESCAPE_RE.search(line):
+            print(f"            first at line {n}: {line.strip()[:70]}")
+            break
+
+    if fix:
+        path.write_text(ESCAPE_RE.sub(r"\1", text), encoding="utf-8")
+        print(f"            FIXED: removed {len(hits)} escape sequence(s)")
+        return 0
+
+    print("            run  python check_release.py --fix  to repair")
+    return len(hits)
+
+
 def main():
+    fix = "--fix" in sys.argv
     want = tool_version()
     print(f"TOOL_VERSION (source of truth): {want}\n")
 
@@ -89,10 +162,19 @@ def main():
             problems.append((name, n, found))
 
     print()
-    if problems:
-        print(f"{len(problems)} version string(s) out of sync — fix before releasing.")
+    conflicts = check_conflict_markers()
+    escapes = check_markdown_escapes(fix=fix)
+    print()
+    if problems or escapes or conflicts:
+        if problems:
+            print(f"{len(problems)} version string(s) out of sync.")
+        if conflicts:
+            print(f"{conflicts} unresolved git conflict marker(s).")
+        if escapes:
+            print(f"{escapes} escaped markdown character(s) in README.md.")
+        print("Fix before releasing.")
         return 1
-    print("All version strings agree.")
+    print("All version strings agree; no conflict markers; markdown is clean.")
     return 0
 
 

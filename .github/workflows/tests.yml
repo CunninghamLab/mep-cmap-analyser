@@ -1,0 +1,37 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest supported and current, so the format-coverage guard runs on both.
+        python-version: ["3.9", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy scipy pandas matplotlib pytest
+          # MNE is an optional extra: it powers the reader parity check, which
+          # is what originally caught the 1-based .vmrk marker bug. Without it
+          # that single test skips and the rest still run.
+          python -m pip install mne || echo "MNE unavailable — parity test will skip"
+
+      - name: Run tests
+        # tests/conftest.py stubs tkinter when python3-tk is unavailable, so
+        # the suite runs headless without installing a GUI toolkit.
+        run: python -m pytest tests/ -v --no-header

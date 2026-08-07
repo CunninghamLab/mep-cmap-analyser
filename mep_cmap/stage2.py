@@ -20,6 +20,129 @@ from .bids import StudyMetadata
 from .preferences import accent_button_kw
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Add-on sidecar join
+# ─────────────────────────────────────────────────────────────────────────────
+# Core first-level outputs that live beside <prefix>_trials.csv and must never be
+# treated as add-on sidecars.
+_S2_CORE_SUFFIXES = (
+    "_trials.csv", "_trials_with_outliers.csv",
+    "_summary.csv", "_summary_with_outliers.csv",
+    "_bootstrap.csv",
+)
+
+# A sidecar must carry these to be joinable per trial. Segment is 1-based and
+# indexes segs_all, so it is stable even if a table is filtered or re-sorted.
+_S2_JOIN_KEYS = ("StimType", "Segment")
+
+
+def _s2_join_addon_sidecars(df, trials_csv_path, note):
+    """Left-join any per-trial add-on outputs sitting beside <prefix>_trials.csv.
+
+    An add-on sidecar is any other CSV in the same results folder sharing the
+    session prefix and carrying the (StimType, Segment) join keys — the columns
+    an add-on emits so its per-trial rows can be matched back to core trials.
+
+    Purely additive: only columns absent from `df` are brought in, so an add-on
+    can never overwrite a core measurement. Any sidecar that fails to load or
+    join is skipped with a note; the group merge always proceeds.
+    """
+    import glob
+
+    base = os.path.basename(trials_csv_path)
+    if not base.endswith("_trials.csv"):
+        return df
+    prefix   = base[: -len("_trials.csv")]
+    res_dir  = os.path.dirname(trials_csv_path)
+
+    keys = [k for k in _S2_JOIN_KEYS if k in df.columns]
+    if len(keys) < len(_S2_JOIN_KEYS):
+        return df
+    if "File" in df.columns:
+        keys = ["File"] + keys
+
+    for path in sorted(glob.glob(os.path.join(res_dir, f"{prefix}_*.csv"))):
+        fn = os.path.basename(path)
+        if any(fn.endswith(suf) for suf in _S2_CORE_SUFFIXES):
+            continue
+        try:
+            side = pd.read_csv(path)
+        except Exception as e:
+            note(f"{fn}: unreadable ({e})")
+            continue
+        if side.empty or not set(_S2_JOIN_KEYS).issubset(side.columns):
+            continue
+
+        use = [k for k in keys if k in side.columns]
+        if not set(_S2_JOIN_KEYS).issubset(use):
+            continue
+
+        # Already joined? Every non-key column present means this sidecar has
+        # been merged into `df` on a previous pass. Skip it, otherwise its own
+        # columns would collide with themselves and get namespaced twice.
+        plain = [c for c in side.columns if c not in use]
+        if plain and all(c in df.columns for c in plain):
+            continue
+
+        # Columns that clash with an existing name are NAMESPACED rather than
+        # dropped. MEPFeatX, for example, emits its own 'Latency(ms)' computed
+        # by a different algorithm than the core pipeline's; silently discarding
+        # it would lose data, and silently overwriting would corrupt the core
+        # measurement. It arrives as 'mepfeatx_Latency(ms)' instead.
+        tag = fn[len(prefix) + 1:-4] if len(fn) > len(prefix) + 5 else "addon"
+        rename, new_cols = {}, []
+        for c in side.columns:
+            if c in use:
+                continue
+            target = c if c not in df.columns else f"{tag}_{c}"
+            while target in df.columns or target in new_cols:
+                target = f"{tag}_{target}"
+            rename[c] = target
+            new_cols.append(target)
+        if not new_cols:
+            continue
+
+        # Merge on TEMPORARY normalised key columns. Coercing the real key
+        # columns in place would rewrite core dtypes (e.g. 'Latency(ms)' holds
+        # the string 'Not Detected' alongside floats), so the originals are left
+        # exactly as read and the temp keys are dropped afterwards.
+        def _norm(series, key):
+            if key == "Segment":
+                return pd.to_numeric(series, errors="coerce").astype("Int64")
+            return series.astype(str).str.strip()
+
+        tmp = [f"__s2join_{k}" for k in use]
+        try:
+            left  = df.copy()
+            right = side.copy()
+            for k, tk in zip(use, tmp):
+                left[tk]  = _norm(left[k],  k)
+                right[tk] = _norm(right[k], k)
+            right = (right.rename(columns=rename)[new_cols + tmp]
+                          .drop_duplicates(subset=tmp, keep="first"))
+
+            # A sidecar whose keys don't actually line up would otherwise append
+            # a block of all-NaN columns and look like it worked. Detect that and
+            # skip loudly instead — a wrong File value is the usual cause.
+            n_match = left[tmp].merge(right[tmp], on=tmp, how="inner").shape[0]
+            if n_match == 0:
+                note(f"{fn}: join keys matched no trials — skipped")
+                continue
+
+            merged = left.merge(right, on=tmp, how="left", validate="one_to_one")
+            merged = merged.drop(columns=tmp)
+        except Exception as e:
+            note(f"{fn}: could not join ({e})")
+            continue
+
+        df = merged
+        renamed = sum(1 for c, t in rename.items() if c != t)
+        note(f"{fn}: +{len(new_cols)} column(s)"
+             + (f" ({renamed} namespaced '{tag}_*' to avoid clashes)" if renamed else ""))
+
+    return df
+
+
 class Stage2Mixin:
     """
     Mixin providing the Stage 2 (Group Analysis) tab functionality.
@@ -711,6 +834,7 @@ class Stage2Mixin:
         # ── Load and annotate each session ────────────────────────────────────
         all_frames = []
         skipped    = []
+        sidecar_notes = []
 
         for row in included:
             csv_path = row.get("_trials_csv", "")
@@ -728,6 +852,12 @@ class Stage2Mixin:
             if df.empty:
                 skipped.append(row.get("participant_id", "?") + " (empty CSV)")
                 continue
+
+            # ── Join per-trial add-on outputs (temporal_decomposition, ...) ────
+            # Additive only: add-on columns are appended, core columns untouched.
+            _who = f"{row.get('participant_id','?')}/{row.get('session','?')}"
+            df = _s2_join_addon_sidecars(
+                df, csv_path, lambda m, w=_who: sidecar_notes.append(f"{w} {m}"))
 
             # ── Append Stim_Role from Configure dialog ─────────────────────────
             cfg = row.get("_config", {})
@@ -799,6 +929,11 @@ class Stage2Mixin:
                f"Total trials:     {n_trials}\n"
                f"Columns:          {n_cols}\n\n"
                f"Saved to:\n{out_path}")
+        if sidecar_notes:
+            _shown = sidecar_notes[:8]
+            msg += (f"\n\nAdd-on columns joined ({len(sidecar_notes)}):\n"
+                    + "\n".join(_shown)
+                    + ("\n…" if len(sidecar_notes) > len(_shown) else ""))
         if skipped:
             msg += f"\n\nSkipped ({len(skipped)}):\n" + "\n".join(skipped)
         messagebox.showinfo("Done", msg, parent=self.root)

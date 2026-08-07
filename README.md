@@ -1,6 +1,6 @@
 # MEP-CMAP Analyser
 
-**Version 1.2.9 | August 2026**  
+**Version 1.3.0 | August 2026**  
 *Author:* [*Justin Andrushko PhD, Northumbria University*](https://researchportal.northumbria.ac.uk/en/persons/justin-w-andrushko/)
 
 *Collaborators:* [*David Cunningham PhD*](https://fescenter.org/team/investigators/cunningham-david-phd/) *(*[*TMS Analysis ToolBox*](https://github.com/CunninghamLab/TMSAnalysisToolBox)*) ·* [*Nicholas Holmes PhD*](https://www.birmingham.ac.uk/staff/profiles/sportex/holmes-nick) *·* [*TMSMultiLab*](https://github.com/TMSMultiLab/TMSMultiLab/wiki)
@@ -31,6 +31,12 @@ The tool is not limited to any single measure or paradigm. It handles motor evok
 
 ---
 
+## What's New in 1.3
+
+* **Temporal MEP decomposition add-on** — splits each MEP into successive bins from onset (2 ms by default) and aggregates them into an **early** and a **late** phase, following the approach used to dissociate fast-conducting corticospinal from slower, polysynaptic cortico-reticulospinal transmission. The analysis window is clamped to the detected MEP offset so the late phase cannot run into the silent period, background EMG is subtracted over each window, and per-condition diagnostic figures show the onset-aligned mean trace and bin profile. Bin width, window length, and the early/late boundary are all settings — the bin profile is the primary output and the boundary is a derived convenience, not a baked-in assumption.
+* **Add-on results reach the group table** — Second Level ▸ Group Analysis now joins per-trial add-on outputs onto the merged table automatically. Any add-on writing `File`, `StimType`, and `Segment` alongside its measurements is picked up with no configuration. The join is additive: core measurements are never overwritten, and a column whose name clashes with an existing one is namespaced after its add-on (for example `mepfeatx_Latency(ms)`) rather than dropped. A sidecar whose keys match no trials is skipped with a note instead of appending a block of empty columns.
+* **MEPFeatX outputs are now joinable** — the add-on emits a 1-based `Segment` key matching the core per-trial table, and reports the source file name in `File` rather than the BIDS prefix. The 0-based `Trial` index is retained.
+
 ## What's New in 1.2
 
 * **Extensible add-ons framework** — drop-in Python modules that run post-hoc on saved results and write their own new files, at two scopes: **single-file** (first level) and **group-level** (second level). Ships with a faithful port of **MEPFeatX** (morphological MEP features), a rectified-area example, and a group-summary example.
@@ -41,7 +47,7 @@ The tool is not limited to any single measure or paradigm. It handles motor evok
 * **Broader format support** — added BIOPAC AcqKnowledge (`.acq` and `.mat`), Brainsight neuronavigation exports, BrainVision, and LabChart MATLAB exports.
 * **Cross-platform polish** — readable coloured action buttons on macOS, Windows, and Linux, and consistent font scaling across the interface.
 
-**Point releases (1.2.1–1.2.9):** EDF/BDF files (including BIDS-ify output) now load correctly, plus release-pipeline and repository cleanup.
+**Point releases in the 1.2 series:** EDF/BDF files (including BIDS-ify output) now load correctly, plus release-pipeline and repository cleanup.
 
 ---
 
@@ -296,8 +302,35 @@ Pre-built builds for each platform are on the [Releases page](https://github.com
 |Platform|File|
 |-|-|
 |Windows|`MEP-CMAP_Analyser_Windows.zip`|
-|macOS|`MEP-CMAP_Analyser_Mac.zip`|
+|macOS (Apple Silicon)|`MEP-CMAP_Analyser_Mac_apple-silicon.zip`|
+|macOS (Intel)|`MEP-CMAP_Analyser_Mac_intel.zip`|
 |Linux|`MEP-CMAP_Analyser_Linux.tar.gz`|
+
+Apple Silicon Macs are M1 and later; choose the Intel build for anything older.
+If you pick the wrong one macOS reports a "bad CPU type in executable" error —
+download the other file rather than anything else being wrong.
+
+#### First launch on macOS
+
+The macOS app is **not notarized by Apple**, so the first time you open it
+macOS will refuse and may claim the app is *damaged*. Nothing is damaged: this
+is Gatekeeper blocking any app downloaded from the internet that has not been
+through Apple's paid notarization service. Two ways past it, both one-time:
+
+* **Right-click** (or Control-click) the app, choose **Open**, then **Open**
+  again in the dialog. This records your consent and normal double-clicking
+  works from then on.
+* Or clear the download quarantine flag from Terminal:
+
+  ```bash
+  xattr -dr com.apple.quarantine "MEP-CMAP Analyser.app"
+  ```
+
+If neither works, macOS may have quarantined the zip's contents on extraction —
+move the app to `/Applications` first, then repeat.
+
+Running from source (Option 3) or installing from PyPI (Option 1) avoids
+Gatekeeper entirely and is the simplest route on macOS.
 
 ### Option 3: Run from source
 
@@ -503,7 +536,7 @@ The optional Rust extension `mep_cmap_io` provides accelerated I/O for the Spike
 
 If you use MEP-CMAP Analyser in published research, please cite:
 
-> Justin W. Andrushko. (2026). jandrushko/mep-cmap-analyser: MEP-CMAP Analyser (Version v1.2.9) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.21810844
+> Justin W. Andrushko. (2026). jandrushko/mep-cmap-analyser: MEP-CMAP Analyser (Version v1.3.0) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.21810844
 > Northumbria University. https://github.com/jandrushko/mep-cmap-analyser
 
 ---

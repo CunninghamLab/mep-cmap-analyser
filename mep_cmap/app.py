@@ -16,6 +16,15 @@ Builds the Tkinter GUI, manages background analysis threads,
 and wires together all the pipeline, inspector, and BIDS modules.
 """
 
+# Annotations are evaluated lazily (PEP 563). Several signatures in this module
+# use the PEP 604 shorthand `dict | None`, which only exists as a runtime type
+# expression from Python 3.10. Without this import, Python 3.9 evaluates those
+# annotations at function-definition time and raises TypeError on import, so the
+# app could not start at all on the oldest version pyproject.toml claims to
+# support. Nothing in the test suite imports this module, so CI never saw it.
+# Keep this as the first statement after the docstring.
+from __future__ import annotations
+
 import gc
 import os
 import re
@@ -143,7 +152,11 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         self._build_menu()
         self._build_scrollable_container()
         self.setup_gui()
-        self.root.title(f"MEP-CMAP Analyser, Version {TOOL_VERSION} - May 2026")
+        # Deliberately no release date here. bump_version.py has no rule for
+        # this line and check_release.py only validates X.Y.Z patterns, so a
+        # month/year written here goes stale silently and did so across several
+        # releases. TOOL_VERSION is the single source of truth for a build.
+        self.root.title(f"MEP-CMAP Analyser, Version {TOOL_VERSION}")
         self.root.after(0, self._make_window_adaptive)
         # ─── BIDS / derivatives ──────────────────────────────────────────────
         self.study_metadata   = StudyMetadata()
@@ -468,12 +481,26 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         self.main_frame = self._filter_body
 
         def _on_mousewheel(event):
-            # Scroll whichever processing body (1b or 1c) is currently on screen.
-            for _cv in (self.canvas_filter, self.canvas_detect):
-                if _cv.winfo_ismapped():
-                    delta = event.delta if event.delta else (-120 if event.num == 5 else 120)
-                    _cv.yview_scroll(int(-delta / 120), "units")
-                    break
+            # Scroll whichever registered scrollable body is currently on screen
+            # (1b, 1c, or either Add-ons tab). Canvases belonging to tabs that
+            # have been rebuilt no longer exist, so they are pruned here rather
+            # than raising TclError on winfo_ismapped().
+            live = []
+            target = None
+            for _cv in getattr(self, "_scroll_canvases", []):
+                try:
+                    if not _cv.winfo_exists():
+                        continue
+                    live.append(_cv)
+                    if target is None and _cv.winfo_ismapped():
+                        target = _cv
+                except tk.TclError:
+                    continue
+            self._scroll_canvases = live
+            if target is None:
+                return
+            delta = event.delta if event.delta else (-120 if event.num == 5 else 120)
+            target.yview_scroll(int(-delta / 120), "units")
         for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
             self.tab_detect.bind_all(seq, _on_mousewheel)
 
@@ -892,7 +919,8 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
 
     def _make_scroll_body(self, parent, max_content_w=1100):
         """Create a vertically-scrollable, width-capped, centred body frame inside
-        `parent`. Returns (body_frame, canvas). Used for the 1b/1c processing bodies."""
+        `parent`. Returns (body_frame, canvas). Used for the 1b/1c processing bodies
+        and both Add-ons tabs."""
         scroll_area = ttk.Frame(parent)
         scroll_area.pack(side="top", fill="both", expand=True)
         vscroll = ttk.Scrollbar(scroll_area, orient="vertical")
@@ -911,6 +939,14 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         canvas.bind("<Configure>", _resize)
         body.bind("<Configure>",
                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        # Register for wheel scrolling. The handler is a single global binding
+        # that dispatches to whichever registered canvas is currently on screen,
+        # so every scrollable body gets the wheel without each one installing its
+        # own competing bind_all. Tabs that rebuild (both Add-ons tabs) create a
+        # fresh canvas each time; dead entries are pruned in the handler.
+        if not hasattr(self, "_scroll_canvases"):
+            self._scroll_canvases = []
+        self._scroll_canvases.append(canvas)
         return body, canvas
 
     def setup_gui(self):
@@ -2116,14 +2152,30 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
     # Add-ons tab  (modular post-hoc analyses; see mep_cmap/addons.py)
     # ───────────────────────────────────────────────────────────────
     def _build_addons_tab(self, parent):
-        """Build the Add-ons tab. Content is (re)built on selection."""
+        """Build the Add-ons tab. Content is (re)built on selection.
+
+        The log is pinned to the bottom and everything above it scrolls. An
+        add-on declaring several settings would otherwise push the log off the
+        bottom of the tab with no way to reach it — and third-party add-ons can
+        declare any number of settings.
+        """
         self._addons_entries = []
         self._addons_setting_vars = {}
         for w in parent.winfo_children():
             w.destroy()
-        tk.Label(parent, text="Add-ons",
+
+        # Packed FIRST with side="bottom" so Tk reserves the footer before the
+        # scroll area claims the remaining space.
+        self._addons_log_text = tk.Text(parent, height=8, wrap="word")
+        self._addons_log_text.pack(side="bottom", fill="x", padx=16, pady=(0, 12))
+        tk.Label(parent, text="Log:", anchor="w").pack(
+            side="bottom", anchor="w", padx=16)
+
+        body, _ = self._make_scroll_body(parent)
+
+        tk.Label(body, text="Add-ons",
                  font=("TkDefaultFont", 13, "bold")).pack(pady=(12, 2))
-        tk.Label(parent,
+        tk.Label(body,
             text="Run optional analysis add-ons on your processed results.\n"
                  "Add-ons read the saved waveform bundle (<prefix>_segments.npz)\n"
                  "and write their own new files — they never change core outputs.\n"
@@ -2131,16 +2183,13 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             justify="left", fg="grey").pack(anchor="w", padx=16, pady=(0, 8))
         # Add-ons read the BIDS derivatives folder configured for the session
         # (File \u2192 Set Derivatives Folder) \u2014 not a per-run option.
-        self._addons_status = tk.Label(parent, anchor="w", justify="left", fg="grey")
+        self._addons_status = tk.Label(body, anchor="w", justify="left", fg="grey")
         self._addons_status.pack(anchor="w", padx=16, pady=(0, 4))
-        _br = tk.Frame(parent); _br.pack(fill="x", padx=16, pady=(0, 4))
+        _br = tk.Frame(body); _br.pack(fill="x", padx=16, pady=(0, 4))
         tk.Button(_br, text="Rescan add-ons",
                   command=self._addons_discover).pack(side="left")
-        self._addons_list_frame = tk.Frame(parent)
+        self._addons_list_frame = tk.Frame(body)
         self._addons_list_frame.pack(fill="both", expand=True, padx=16, pady=(8, 4))
-        tk.Label(parent, text="Log:", anchor="w").pack(anchor="w", padx=16)
-        self._addons_log_text = tk.Text(parent, height=8, wrap="word")
-        self._addons_log_text.pack(fill="both", expand=False, padx=16, pady=(0, 12))
         self._addons_refresh_status()
         self._addons_discover()
 
@@ -2301,30 +2350,39 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
     # Second-level (group) Add-ons tab
     # ──────────────────────────────────────────────────────────────────────────
     def _build_group_addons_tab(self, parent):
-        """Build the second-level (group-level) Add-ons tab."""
+        """Build the second-level (group-level) Add-ons tab.
+
+        Same structure as the first-level tab: log pinned to the bottom, the
+        add-on list above it scrolls.
+        """
         self._gaddons_entries = []
         self._gaddons_setting_vars = {}
         for w in parent.winfo_children():
             w.destroy()
-        tk.Label(parent, text="Add-ons",
+
+        self._gaddons_log_text = tk.Text(parent, height=8, wrap="word")
+        self._gaddons_log_text.pack(side="bottom", fill="x", padx=16, pady=(0, 12))
+        tk.Label(parent, text="Log:", anchor="w").pack(
+            side="bottom", anchor="w", padx=16)
+
+        body, _ = self._make_scroll_body(parent)
+
+        tk.Label(body, text="Add-ons",
                  font=("TkDefaultFont", 13, "bold")).pack(pady=(12, 2))
-        tk.Label(parent,
+        tk.Label(body,
             text="Run optional group-level add-ons on your built group table.\n"
                  "Add-ons read the group file (group_level_LME_ready.csv) that\n"
                  "Group Analysis (LME) builds, and write their own new files \u2014\n"
                  "they never change it. Put your own group add-ons in the\n"
                  "'group_level' subfolder of your Preferences \u2192 Add-ons folder.",
             justify="left", fg="grey").pack(anchor="w", padx=16, pady=(0, 8))
-        self._gaddons_status = tk.Label(parent, anchor="w", justify="left", fg="grey")
+        self._gaddons_status = tk.Label(body, anchor="w", justify="left", fg="grey")
         self._gaddons_status.pack(anchor="w", padx=16, pady=(0, 4))
-        _br = tk.Frame(parent); _br.pack(fill="x", padx=16, pady=(0, 4))
+        _br = tk.Frame(body); _br.pack(fill="x", padx=16, pady=(0, 4))
         tk.Button(_br, text="Rescan add-ons",
                   command=self._group_addons_discover).pack(side="left")
-        self._gaddons_list_frame = tk.Frame(parent)
+        self._gaddons_list_frame = tk.Frame(body)
         self._gaddons_list_frame.pack(fill="both", expand=True, padx=16, pady=(8, 4))
-        tk.Label(parent, text="Log:", anchor="w").pack(anchor="w", padx=16)
-        self._gaddons_log_text = tk.Text(parent, height=8, wrap="word")
-        self._gaddons_log_text.pack(fill="both", expand=False, padx=16, pady=(0, 12))
         self._group_addons_refresh_status()
         self._group_addons_discover()
 

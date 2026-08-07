@@ -82,7 +82,11 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    # UPX is DISABLED on macOS deliberately. It rewrites Mach-O headers, which
+    # corrupts the binary on some systems and invalidates any code signature
+    # applied afterwards — including the ad-hoc signature the release workflow
+    # adds. Do not re-enable it here.
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     target_arch=None,
@@ -96,7 +100,7 @@ coll = COLLECT(
     a.zipfiles,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,                # see the note on the EXE block above
     upx_exclude=[],
     name='MEP-CMAP Analyser',
 )
@@ -105,13 +109,16 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='MEP-CMAP Analyser.app',
-    icon='MEP.ico',           # macOS uses .icns format; remove line if you don't have one
+    # Intentionally .ico, not .icns. Convention says macOS wants .icns, but
+    # MEP.icns produces NO icon on macOS in practice while MEP.ico renders
+    # correctly (verified on a real Mac). Leave this alone.
+    icon='MEP.ico',
     bundle_identifier='com.northumbria.mep-cmap-analyser',
     info_plist={
         'CFBundleName':              'MEP-CMAP Analyser',
         'CFBundleDisplayName':       'MEP-CMAP Analyser',
-        'CFBundleVersion':           '1.2.9',
-        'CFBundleShortVersionString':'1.2.9',
+        'CFBundleVersion':           '1.3.0',
+        'CFBundleShortVersionString':'1.3.0',
         'NSHighResolutionCapable':   True,
         'NSRequiresAquaSystemAppearance': False,  # supports dark mode
     },

@@ -70,7 +70,13 @@ ADDON_SETTINGS = [
 ]
 
 OUT_COLUMNS = [
-    "File", "StimType", "Trial",
+    # File/StimType/Segment are the join keys used by Second Level ▸ Group
+    # Analysis to merge these features back onto the core per-trial table.
+    # `File` must be the SOURCE FILE NAME (as in _trials.csv), not the BIDS
+    # prefix, and `Segment` is 1-based (Trial + 1) because the core table
+    # numbers trials from 1. `Trial` is retained as the 0-based index into the
+    # waveform stack, for backward compatibility.
+    "File", "StimType", "Segment", "Trial",
     "Amplitude(uV)", "Latency(ms)", "AUC(uV*ms)", "Thickness(ms)",
     "nTurns", "nPhases", "Duration(ms)",
     "T1T(ms)", "T1A(uV)", "T2T(ms)", "T2A(uV)",
@@ -487,6 +493,15 @@ def run(context):
     plot = bool((context.config or {}).get("mepfeatx_plot", True))
     debug = bool((context.config or {}).get("mepfeatx_debug", False))
     noise_gate_ratio = float((context.config or {}).get("mepfeatx_noise_gate_ratio", 0.2))
+    # Source file name for the join key. context.trials is already filtered to
+    # this recording, so any row carries it; fall back to the prefix when the
+    # add-on is run without a per-trial table beside the bundle.
+    file_name = context.bids_prefix
+    _tr = getattr(context, "trials", None)
+    if _tr is not None and getattr(_tr, "empty", True) is False \
+            and "File" in _tr.columns and len(_tr["File"]):
+        file_name = _tr["File"].iloc[0]
+
     rows = []
     n_found = 0
     reject_counts = {}
@@ -512,9 +527,9 @@ def run(context):
                 feats, found, detail, reason = None, False, None, f"errored: {ex}"
             if found:
                 n_found += 1
-                rows.append([context.bids_prefix, stim_type, trial_idx] + feats + [True, ""])
+                rows.append([file_name, stim_type, trial_idx + 1, trial_idx] + feats + [True, ""])
             else:
-                rows.append([context.bids_prefix, stim_type, trial_idx] + [np.nan] * 13 + [False, reason])
+                rows.append([file_name, stim_type, trial_idx + 1, trial_idx] + [np.nan] * 13 + [False, reason])
                 cat = (reason or "unknown").split(":")[0]
                 reject_counts[cat] = reject_counts.get(cat, 0) + 1
                 if debug:

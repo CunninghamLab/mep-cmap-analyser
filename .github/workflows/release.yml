@@ -57,7 +57,18 @@ jobs:
           path: MEP-CMAP_Analyser_Linux.tar.gz
 
   build-macos:
-    runs-on: macos-latest
+    # Two runners, two architectures. macos-latest is Apple Silicon, so building
+    # only there shipped an arm64-only app that Intel Macs could not launch at
+    # all ("bad CPU type in executable"). macos-13 is the last Intel runner.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-13
+            arch: intel
+          - runner: macos-latest
+            arch: apple-silicon
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -69,18 +80,31 @@ jobs:
           pip install pyinstaller
       - name: Build
         run: pyinstaller MEP_CMAP_Mac.spec --clean
+      - name: Ad-hoc code signature
+        # Not Developer ID signing and NOT notarization — this does not get past
+        # Gatekeeper on its own (see the macOS note in the README). It makes the
+        # bundle internally consistent, which arm64 requires in order to execute
+        # at all, and replaces the per-binary signatures PyInstaller leaves in a
+        # mixed state. Users still need the documented first-run step.
+        run: |
+          codesign --force --deep --sign - "dist/MEP-CMAP Analyser.app"
+          codesign --verify --deep --strict --verbose=2 "dist/MEP-CMAP Analyser.app"
       - name: Zip
-        # Package the .app bundle (double-clickable) using ditto, the macOS
-        # tool for zipping app bundles — the spec produces both a raw onedir
-        # folder and the .app; users want the .app.
-        run: ditto -c -k --keepParent "dist/MEP-CMAP Analyser.app" MEP-CMAP_Analyser_Mac.zip
+        # ditto preserves bundle structure, symlinks and extended attributes;
+        # plain `zip` corrupts .app bundles.
+        run: ditto -c -k --keepParent "dist/MEP-CMAP Analyser.app" MEP-CMAP_Analyser_Mac_${{ matrix.arch }}.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: mac-build
-          path: MEP-CMAP_Analyser_Mac.zip
+          name: mac-build-${{ matrix.arch }}
+          path: MEP-CMAP_Analyser_Mac_${{ matrix.arch }}.zip
 
   release:
-    needs: [build-windows, build-linux, build-macos]
+    # Depends on `test` as well as the builds. A successful PyInstaller build
+    # only proves the code imports, not that it works, so without this a tagged
+    # release published binaries and release notes even when the suite failed —
+    # the same gap that was fixed for publish-pypi. Both gates now sit behind
+    # the same job, including the tag/TOOL_VERSION match.
+    needs: [build-windows, build-linux, build-macos, test]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -92,7 +116,8 @@ jobs:
           files: |
             windows-build/MEP-CMAP_Analyser_Windows.zip
             linux-build/MEP-CMAP_Analyser_Linux.tar.gz
-            mac-build/MEP-CMAP_Analyser_Mac.zip
+            mac-build-intel/MEP-CMAP_Analyser_Mac_intel.zip
+            mac-build-apple-silicon/MEP-CMAP_Analyser_Mac_apple-silicon.zip
           generate_release_notes: true
 
   test:

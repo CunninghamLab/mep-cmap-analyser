@@ -7,6 +7,7 @@ on:
 
 jobs:
   build-windows:
+    timeout-minutes: 60
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -35,6 +36,7 @@ jobs:
           path: MEP-CMAP_Analyser_Windows.zip
 
   build-linux:
+    timeout-minutes: 60
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -57,18 +59,28 @@ jobs:
           path: MEP-CMAP_Analyser_Linux.tar.gz
 
   build-macos:
-    # Two runners, two architectures. macos-latest is Apple Silicon, so building
-    # only there shipped an arm64-only app that Intel Macs could not launch at
-    # all ("bad CPU type in executable"). macos-13 is the last Intel runner.
+    # macos-latest is Apple Silicon (arm64); building only there shipped an
+    # arm64-only app that Intel Macs could not launch ("bad CPU type in
+    # executable"). macos-13 — the old free Intel runner — was retired in
+    # December 2025 and its label now hangs waiting for a runner that will never
+    # arrive, so the Intel leg uses macos-15-intel, the last x86_64 image
+    # Actions will offer (available until August 2027).
+    #
+    # The Intel leg is continue-on-error: Intel Macs are a shrinking minority,
+    # that runner is slow and may be metered, and an optional artifact must
+    # never block the release of the other three. If it fails or is withdrawn,
+    # the release still publishes without the Intel zip.
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-13
+          - runner: macos-15-intel
             arch: intel
           - runner: macos-latest
             arch: apple-silicon
     runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.arch == 'intel' }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -118,6 +130,9 @@ jobs:
             linux-build/MEP-CMAP_Analyser_Linux.tar.gz
             mac-build-intel/MEP-CMAP_Analyser_Mac_intel.zip
             mac-build-apple-silicon/MEP-CMAP_Analyser_Mac_apple-silicon.zip
+          # The Intel macOS leg is allowed to fail (see build-macos), so its zip
+          # may legitimately be absent. Publish what exists rather than aborting.
+          fail_on_unmatched_files: false
           generate_release_notes: true
 
   test:
@@ -166,3 +181,9 @@ jobs:
           python -m build
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # A tag sometimes has to be re-pushed to rebuild binaries after a
+          # runner-side failure. PyPI permanently reserves a filename, so a
+          # second upload of the same version would 400 and fail the job for no
+          # good reason. Skip it instead — the wheel is already published.
+          skip-existing: true

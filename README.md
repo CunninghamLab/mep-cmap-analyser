@@ -70,6 +70,13 @@ The tool is not limited to any single measure or paradigm. It handles motor evok
   trial CSV are now computed through these shared functions as well. Trial
   values are unchanged; only the standalone helper's default moved, and it moved
   onto the correct value. `compute_rms` is exported alongside the others.
+* **New format: pre-epoched MATLAB trial stacks.** Files whose trials are
+  already cut around the stimulus are read directly, rather than requiring a
+  continuous recording with a trigger channel. The analysis windows are clamped
+  to the extent the file actually contains, with the reduction reported in the
+  log, and a warning is raised when the available post-stimulus window is too
+  short for cortical silent period detection. The amplitude unit is confirmed
+  once and saved to a sidecar when the file does not declare one.
 * **Variability and reliability add-ons** — two new built-in add-ons quantifying how much a measure varies from trial to trial, and what that means for study design. **variability** (first level) reports the coefficient of variation four ways with confidence intervals, robust and log-scale z scores, the precision of a condition mean and how many trials would tighten it, autoregressive structure and within-session drift, single-trial limits of agreement, the typical error and RMSE family, contrasts between conditions, and correlations among trial-level measures. **variability_group** (second level) decomposes variance into between-participant, between-session, and trial-level components, then turns that into the reliability, SEM, and MDC95 of a measurement averaged over any number of trials and sessions.
 * **The dispersion family, not just the CV** — MAD and IQR are reported alongside the coefficient of variation, each scaled so all three estimate the same quantity under normality and can be read against one another. Skewed amplitudes with occasional very large trials do not honour the assumptions the CV rests on, so the robust alternatives are there to be compared rather than assumed away.
 * **Raw or log scale, measured rather than assumed** — the group add-on regresses log(SD) on log(mean) across recordings. A slope near zero means additive noise and the SD is the meaningful summary; a slope near one means noise scales with amplitude, so the CV is appropriate and the log scale is the natural one to analyse on. The verdict is read off the confidence interval, and reports honestly when the dataset cannot distinguish the two.
@@ -77,6 +84,12 @@ The tool is not limited to any single measure or paradigm. It handles motor evok
 * **Do the metrics agree?** — the group add-on ranks recordings by each dispersion metric and reports whether the ranking survives the choice. If it does, the choice is a convention; if it does not, it is a finding that needs justifying.
 * **Reliability separated from change** — the group add-on reads your Second Level design and classifies each factor by whether it varies within a participant. Between-participant factors (group, arm) can be split on, so between-session reliability survives inside each stratum; within-participant factors (timepoint) label the session axis instead, because splitting on one would leave a single session per participant. A session pair straddling an intervention is reported as measuring **change**, not test-retest reliability, since its limits reflect measurement error plus whatever really changed.
 * **Figure captions** — figures now save a plain-language caption beside them, filled with that recording's own numbers, explaining what each panel shows and flagging traps only when the data triggers them (a drift that inflates the CV, or a typical error inflated by trial-to-trial alternation).
+* **An unusable MNE-Python install is now treated as absent.** MNE loads its
+  submodules lazily, so importing it can succeed while its readers cannot load
+  at all, most often a version mismatch against SciPy. Such an install was
+  previously reported as available and then failed at the moment a file was
+  opened. It is now detected up front, so the formats it would have handled are
+  simply not claimed and every native reader is unaffected.
 * **Dropdown settings for add-ons** — `ADDON_SETTINGS` gained `choices` and `choices_from`. A measure to analyse is chosen from a list read from the columns your dataset actually contains rather than typed by hand, and settings declared `"type": "bool"` render as a checkbox instead of a text box expecting the word `True`.
 
 ## What's New in 1.3
@@ -149,6 +162,18 @@ Native BIOPAC AcqKnowledge acquisition files, read via `bioread`. Channels and e
 
 AcqKnowledge's MATLAB export, detected by its signature variables and read without a BIOPAC installation.
 
+#### Pre-epoched MATLAB trial stack (`.mat`)
+
+Recognised by its per-trial structure rather than a continuous time series:
+trials are already cut around the stimulus, so no trigger channel is needed and
+the stimulus sits at a fixed sample index within every epoch. Because the file
+contains data only inside its own epochs, the pre- and post-stimulus analysis
+windows are clamped to what actually exists and the reduction is reported in the
+log; a window that cannot support cortical silent period detection is flagged
+rather than silently producing unreliable values. Where the export does not
+declare an amplitude unit, it is confirmed once on first open and saved to a
+sidecar.
+
 #### Brainsight neuronavigation export (`.txt`)
 
 Brainsight TMS neuronavigation session exports are recognised by their header signature, with stimulation events taken from the navigation record.
@@ -176,6 +201,7 @@ For any other tabular text file (tab, space, or comma delimited). A one-time, fo
 |`.adibin`|ADInstruments CFWB binary|TTL channel (auto-detected)|Yes|
 |`.acq`|BIOPAC AcqKnowledge|Event markers|No|
 |`.mat`|BIOPAC AcqKnowledge (MATLAB)|Event markers|No|
+|`.mat`|Pre-epoched MATLAB trial stack|Fixed index within each epoch|No|
 |`.txt`|Brainsight neuronavigation|Navigation events|No|
 |`.vhdr`|BrainVision|`.vmrk` markers|No|
 |`.csv` / `.txt`|KinEMG / NI-DAQ CSV|Trigger channel (optional)|No|
@@ -331,6 +357,7 @@ The tool handles any paradigm where a time-locked EMG response is expected withi
 * **Corticospinal excitability assays** — resting and active MEP series, pre/post intervention, crossover and parallel designs
 * **TMS-EMG silent period studies** — cSP duration, cSP/MEP ratio, and derived inhibitory indices
 * **MEP waveform morphology** — via the MEPFeatX add-on (turns, phases, thickness, T1/T2)
+* **Re-analysis of pre-epoched datasets** — trial stacks exported from another pipeline or downloaded from a public repository, where no continuous recording is available
 * **Voluntary EMG bursts** — files with no stimulation events can be loaded for waveform inspection, RMS quantification, and trial-level output
 
 ---

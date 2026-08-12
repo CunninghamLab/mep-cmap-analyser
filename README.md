@@ -1,6 +1,6 @@
 # MEP-CMAP Analyser
 
-**Version 1.3.0 | August 2026**  
+**Version 1.3.1 | August 2026**  
 *Author:* [*Justin Andrushko PhD, Northumbria University*](https://researchportal.northumbria.ac.uk/en/persons/justin-w-andrushko/)
 
 *Collaborators:* [*David Cunningham PhD*](https://fescenter.org/team/investigators/cunningham-david-phd/) *(*[*TMS Analysis ToolBox*](https://github.com/CunninghamLab/TMSAnalysisToolBox)*) ·* [*Nicholas Holmes PhD*](https://www.birmingham.ac.uk/staff/profiles/sportex/holmes-nick) *·* [*TMSMultiLab*](https://github.com/TMSMultiLab/TMSMultiLab/wiki)
@@ -30,6 +30,13 @@ Every setting, decision, and manual edit is saved in a sidecar JSON so analyses 
 The tool is not limited to any single measure or paradigm. It handles motor evoked potentials (MEPs), compound muscle action potentials (CMAPs), cortical silent periods (cSPs), M-wave recruitment curves, paired-pulse protocols such as SICI and ICF, and any other time-locked EMG response measurable by peak-to-peak amplitude, onset latency, or area under the curve. It operates on continuous recordings, pre-epoched trial stacks, and EMG bursts recorded without stimulation.
 
 ---
+
+## What's New in 1.3.1
+
+* **Variability and reliability add-ons** — two new built-in add-ons quantifying how much a measure varies from trial to trial, and what that means for study design. **variability** (first level) reports the coefficient of variation four ways with confidence intervals, robust and log-scale z scores, the precision of a condition mean and how many trials would tighten it, autoregressive structure and within-session drift, single-trial limits of agreement, the typical error and RMSE family, contrasts between conditions, and correlations among trial-level measures. **variability_group** (second level) decomposes variance into between-participant, between-session, and trial-level components, then turns that into the reliability, SEM, and MDC95 of a measurement averaged over any number of trials and sessions.
+* **Reliability separated from change** — the group add-on reads your Second Level design and classifies each factor by whether it varies within a participant. Between-participant factors (group, arm) can be split on, so between-session reliability survives inside each stratum; within-participant factors (timepoint) label the session axis instead, because splitting on one would leave a single session per participant. A session pair straddling an intervention is reported as measuring **change**, not test-retest reliability, since its limits reflect measurement error plus whatever really changed.
+* **Figure captions** — figures now save a plain-language caption beside them, filled with that recording's own numbers, explaining what each panel shows and flagging traps only when the data triggers them (a drift that inflates the CV, or a typical error inflated by trial-to-trial alternation).
+* **Dropdown settings for add-ons** — `ADDON_SETTINGS` gained `choices` and `choices_from`. A measure to analyse is chosen from a list read from the columns your dataset actually contains rather than typed by hand, and settings declared `"type": "bool"` render as a checkbox instead of a text box expecting the word `True`.
 
 ## What's New in 1.3
 
@@ -169,6 +176,8 @@ New formats are easy to add: a single `formats/<name>.py` module with three publ
 |**Overall trial number**|Chronological trial index across all stimulus types, by stimulus timestamp order|
 |**Stimulus time (s)**|Absolute timestamp of each stimulus (seconds from recording start)|
 |**Inter-stimulus interval (s)**|Time since the immediately preceding stimulus (any type) — a useful covariate for variable ISIs|
+|**Trial-to-trial variability**|Coefficient of variation, typical error, limits of agreement, drift and serial dependence per condition — via the `variability` add-on|
+|**Reliability (ICC, SEM, MDC95)**|Variance components and the reliability of an averaged measurement across participants and sessions — via the `variability_group` add-on|
 
 ### MEP Onset Detection
 
@@ -242,9 +251,12 @@ Built-in add-ons:
 |-|-|-|
 |**mepfeatx**|single-file|A faithful port of MEPFeatX (Nguyen et al. 2025 [10]): morphological MEP features — amplitude, latency, AUC, waveform thickness, number of turns and phases, duration, and the two dominant peaks (T1/T2) — with per-trial and per-condition diagnostic figures and a transparent rejection reason for every trial it can't quantify|
 |**rectified_area**|single-file|Rectified area under each MEP over the analysis window (a minimal example)|
+|**temporal_decomposition**|single-file|Splits each MEP into successive time bins from onset and aggregates them into early and late phases, with baseline EMG correction and per-condition diagnostic figures|
+|**variability**|single-file|Trial-to-trial variability per stimulus type: coefficient of variation with confidence intervals, robust and log-scale z scores, precision of the condition mean, autoregressive structure and drift, single-trial limits of agreement, typical error and the RMSE family, how many trials an average needs, contrasts between conditions, and correlations among trial-level measures. Emits a per-trial sidecar that joins into the group table|
+|**variability_group**|group-level|Dataset-level reliability: variance components (between participant, between session, trial to trial), the reliability / SEM / MDC95 of a measurement averaged over k trials and m sessions, ICC(1,1), ICC(2,1), ICC(3,1) and their k-forms, and session-to-session agreement labelled as reliability or as change. Optionally split by between-participant design factors|
 |**group_summary**|group-level|Per-condition mean, SD, and N of every metric across the group (a minimal example)|
 
-Add-ons can declare their own settings, which render as controls in the add-on's box (for example, MEPFeatX exposes a tunable noise-gate ratio for handling MEPs recorded during voluntary contraction). Point the tool at your own add-ons folder in **Settings → Preferences → Add-ons**; place first-level add-ons in a `single_file/` subfolder and group-level add-ons in a `group_level/` subfolder. See [Writing Add-ons](#writing-add-ons).
+Add-ons can declare their own settings, which render as controls in the add-on's box — a checkbox, a numeric field, or a dropdown, according to what the add-on declares (for example, MEPFeatX exposes a tunable noise-gate ratio for handling MEPs recorded during voluntary contraction, and the variability add-ons offer a measure picked from the columns your dataset actually contains). Point the tool at your own add-ons folder in **Settings → Preferences → Add-ons**; place first-level add-ons in a `single_file/` subfolder and group-level add-ons in a `group_level/` subfolder. See [Writing Add-ons](#writing-add-ons).
 
 ### BIDS-ify
 
@@ -391,14 +403,16 @@ study/
     ├── dataset_session.json               ← file queue and processing status
     ├── study_design.json                  ← Second-Level design configuration
     ├── group_level_LME_ready.csv          ← merged group output (Second Level)
+    ├── group_level_LME_ready_*.csv        ← group-level add-on outputs
     └── sub-001/
         └── ses-01/
             ├── sub-001_ses-01_session.json           ← full session state
             ├── results/
             │   ├── sub-001_ses-01_<StimType>_trials.csv   ← one per stim type
             │   ├── sub-001_ses-01_..._segments.npz        ← waveform bundle (add-on input)
+            │   ├── sub-001_ses-01_..._variability.csv     ← per-trial add-on output (joins into the group table)
             │   └── ...                                    ← add-on outputs, e.g. *_mepfeatx.csv
-            └── figures/                                   ← add-on figures, e.g. MEPFeatX plots
+            └── figures/                                   ← add-on figures, each saved with a *_caption.txt
 ```
 
 ### Trial-level CSV columns
@@ -427,7 +441,7 @@ excitability-compensation block when that option is run.
 
 ### Group-level LME-ready CSV
 
-Every trial-level column from every included session, prefixed with design columns — `participant_id`, `session`, `task`, `timepoint`, `Stim_Role`, and any custom between/within-subject factors defined at the second level. Output is at the trial level (outliers retained with their Z-scores as covariates rather than pre-excluded), so the analyst keeps full control of trial-level modelling. This file is also the input for group-level add-ons.
+Every trial-level column from every included session, prefixed with design columns — `participant_id`, `session`, `task`, `timepoint`, `Stim_Role`, and any custom between/within-subject factors defined at the second level. Output is at the trial level (outliers retained with their Z-scores as covariates rather than pre-excluded), so the analyst keeps full control of trial-level modelling. Per-trial add-on outputs are joined on automatically (see [Writing Add-ons](#writing-add-ons)), so columns such as the variability add-on's robust z scores arrive alongside the core measurements and can be used as covariates. This file is also the input for group-level add-ons.
 
 ---
 
@@ -489,7 +503,52 @@ def run(context):
     return [out]
 ```
 
-Put your modules in the matching subfolder (`single_file/` or `group_level/`) of the add-ons folder set in **Settings → Preferences → Add-ons**. The built-in add-ons (`mepfeatx`, `rectified_area`, `group_summary`) are good starting templates.
+### Add-on settings
+
+An add-on may declare `ADDON_SETTINGS`, a list of dictionaries that render as controls in the add-on's box. Each value is passed into `context.config` under its `key` when the add-on runs.
+
+|Field|Purpose|
+|-|-|
+|`key`|Config key the value arrives under. Prefix it with the add-on name to avoid collisions|
+|`label`|Text shown beside the control|
+|`help`|Longer explanation shown under the control|
+|`type`|`str`, `int`, `float`, or `bool`. A `bool` renders as a checkbox|
+|`default`|Value used when the user has not touched the control|
+|`min`, `max`|Advisory bounds for numeric settings|
+|`choices`|Fixed list of valid options, rendered as a read-only dropdown|
+|`choices_from`|`"trial_columns"` or `"group_columns"` — populate the dropdown from the columns your dataset actually contains. Stays editable, so an unlisted column can still be typed, and falls back to `choices` when no dataset is open|
+
+```python
+ADDON_SETTINGS = [
+    {
+        "key": "my_addon_metric",
+        "label": "Measure to analyse",
+        "help": "Trial-level column to quantify.",
+        "type": "str",
+        "default": "PTP(mV)",
+        "choices": ["PTP(mV)", "AUC(mV*s)"],   # fallback list
+        "choices_from": "trial_columns",        # real columns when a dataset is open
+    },
+    {
+        "key": "my_addon_plot",
+        "label": "Write figures",
+        "type": "bool",
+        "default": False,
+    },
+]
+```
+
+An unrecognised `type` falls back to a plain text box, so an add-on written for a newer version still loads on an older build.
+
+### Getting per-trial results into the group table
+
+Second Level ▸ Group Analysis left-joins any CSV sitting beside `<prefix>_trials.csv` that carries the join keys `StimType` and `Segment` (plus `File` when present). `Segment` is 1-based, matching the core trial table, and `File` must be the source file name as it appears there rather than the BIDS prefix.
+
+The join is additive and safe: a column whose name already exists in the core table arrives namespaced after its add-on rather than overwriting it, and the merge is validated one-to-one, so a sidecar must hold exactly one row per `(File, StimType, Segment)`. A sidecar whose keys match no trials is skipped with a note instead of appending empty columns.
+
+Output that is not per trial — a per-condition summary, a contrast table — simply omits `Segment` and is left alone by the join. Avoid ending such a file's name with `_summary.csv`, which is reserved for core outputs.
+
+Put your modules in the matching subfolder (`single_file/` or `group_level/`) of the add-ons folder set in **Settings → Preferences → Add-ons**. The built-in add-ons are good starting templates: `rectified_area` and `group_summary` are deliberately minimal, `mepfeatx` and `temporal_decomposition` show per-trial output that joins into the group table, and `variability` shows settings, dropdowns, figures, and captions.
 
 ---
 
@@ -536,7 +595,7 @@ The optional Rust extension `mep_cmap_io` provides accelerated I/O for the Spike
 
 If you use MEP-CMAP Analyser in published research, please cite:
 
-> Justin W. Andrushko. (2026). jandrushko/mep-cmap-analyser: MEP-CMAP Analyser (Version v1.3.0) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.21810844
+> Justin W. Andrushko. (2026). jandrushko/mep-cmap-analyser: MEP-CMAP Analyser (Version v1.3.1) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.21810844
 > Northumbria University. https://github.com/jandrushko/mep-cmap-analyser
 
 ---
@@ -562,6 +621,16 @@ If you use MEP-CMAP Analyser in published research, please cite:
 [9] Carson, R.G. (2026). A method of compensating for the excitability of spinal motoneurones when estimating the magnitude of potentials evoked in skeletal muscles. *The Journal of Physiology*, 604, 5731–5757. https://doi.org/10.1113/JP290979
 
 [10] Nguyen, T.D., et al. (2025). MEPFeatX: feature extraction for motor evoked potentials. *Frontiers in Neuroscience*, 18, 1415257. https://doi.org/10.3389/fnins.2024.1415257
+
+[11] Hopkins, W.G. (2000). Measures of reliability in sports medicine and science. *Sports Medicine*, 30(1), 1–15. https://doi.org/10.2165/00007256-200030010-00001
+
+[12] Shrout, P.E., & Fleiss, J.L. (1979). Intraclass correlations: uses in assessing rater reliability. *Psychological Bulletin*, 86(2), 420–428. https://doi.org/10.1037/0033-2909.86.2.420
+
+[13] McGraw, K.O., & Wong, S.P. (1996). Forming inferences about some intraclass correlation coefficients. *Psychological Methods*, 1(1), 30–46. https://doi.org/10.1037/1082-989X.1.1.30
+
+[14] Bland, J.M., & Altman, D.G. (1999). Measuring agreement in method comparison studies. *Statistical Methods in Medical Research*, 8(2), 135–160. https://doi.org/10.1177/096228029900800204
+
+[15] Vangel, M.G. (1996). Confidence intervals for a normal coefficient of variation. *The American Statistician*, 50(1), 21–26. https://doi.org/10.1080/00031305.1996.10473537
 
 ---
 

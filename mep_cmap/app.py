@@ -82,6 +82,29 @@ from .preferences    import prefs, apply_scaling, accent_button_kw
 from .stage2         import Stage2Mixin
 from .filter_preview import FilterPreviewMixin
 
+def _under_sourcedata(file_path: str, scan_root: str) -> bool:
+    """True if *file_path* sits under a ``sourcedata`` folder BELOW *scan_root*.
+
+    A BIDS study keeps original recordings in sourcedata/ and the converted
+    copies in the main tree, so scanning a study root must not pick up both —
+    each recording would enter the queue twice.
+
+    The test is deliberately relative to the scan root rather than absolute.
+    When the analyst has navigated into sourcedata themselves (or into a
+    subject folder within it) the originals are the only files there, and an
+    absolute test would silently return nothing while reporting that the
+    folder contains no data — which is indistinguishable, from the analyst's
+    side, from the format being unsupported.
+    """
+    try:
+        rel = os.path.relpath(os.path.normpath(file_path),
+                              os.path.normpath(scan_root))
+    except ValueError:          # different drives on Windows
+        return False
+    parts = [p.lower() for p in rel.split(os.sep)]
+    return "sourcedata" in parts
+
+
 def _make_bids_prefix(meta_prefix: str, file_stem: str) -> str:
     """Build a unique, clean BIDS prefix from metadata and source file stem.
 
@@ -226,6 +249,77 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         """Enable/disable the harmonics entry in sync with the mains‑canceller."""
         state = 'normal' if self.apply_humbug.get() else 'disabled'
         self.harmonics_entry.config(state=state)
+
+    def _ask_epoched_unit(self, fpath):
+        """Confirm the amplitude unit for a pre-epoched file that declares none.
+
+        Returns the chosen unit string, or None if the analyst cancelled.
+
+        The dialog leads with the evidence rather than an empty question: the
+        ADC quantisation grid and the resulting amplitudes usually identify the
+        unit outright, and an analyst asked to guess blind will guess wrong far
+        more often than one shown why a particular answer is proposed.
+        """
+        from .formats.epoched_mat import suggest_unit as _suggest
+        try:
+            _default, _evidence = _suggest(fpath)
+        except Exception as _e:
+            _default, _evidence = 'unknown', ["Could not inspect the data: %s" % _e]
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Confirm amplitude unit")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        tk.Label(dlg, text=os.path.basename(fpath),
+                 font=("TkDefaultFont", 10, "bold")).pack(
+            anchor="w", padx=14, pady=(12, 2))
+        tk.Label(dlg, justify="left", wraplength=460,
+                 text=("This format does not record what unit its amplitudes "
+                       "are in, so it has to be confirmed before any value is "
+                       "written to a column headed \u201c(mV)\u201d.")).pack(
+            anchor="w", padx=14, pady=(0, 8))
+
+        ev = tk.LabelFrame(dlg, text="Evidence from the file")
+        ev.pack(fill="x", padx=14, pady=(0, 10))
+        for line in _evidence:
+            tk.Label(ev, text="\u2022 " + line, justify="left",
+                     wraplength=440).pack(anchor="w", padx=8, pady=1)
+
+        choice = tk.StringVar(value=_default)
+        box = tk.LabelFrame(dlg, text="Amplitudes in this file are in")
+        box.pack(fill="x", padx=14, pady=(0, 10))
+        for val, txt in (
+                ('mV', "Millivolts (mV)"),
+                ('V',  "Volts (V) \u2014 will be scaled by 1000"),
+                ('uV', "Microvolts (\u00b5V) \u2014 will be scaled by 0.001"),
+                ('unknown', "I don't know \u2014 do not scale, and record "
+                            "that the unit is unverified")):
+            tk.Radiobutton(box,
+                           text=(txt + "   [suggested]" if val == _default else txt),
+                           variable=choice, value=val,
+                           justify="left").pack(anchor="w", padx=8, pady=1)
+
+        result = {}
+
+        def _ok():
+            result['unit'] = choice.get()
+            dlg.destroy()
+
+        btn = tk.Frame(dlg)
+        btn.pack(pady=(4, 12))
+        tk.Button(btn, text="Save & continue", width=16,
+                  command=_ok).pack(side="left", padx=6)
+        tk.Button(btn, text="Cancel", width=10,
+                  command=dlg.destroy).pack(side="left", padx=6)
+
+        dlg.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - dlg.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry("+%d+%d" % (x, y))
+        self.root.wait_window(dlg)
+        return result.get('unit')
 
     def _review_outliers_gui(self, flagged_outliers, fs, pre_ms, post_ms, emg_unit=None):
         """
@@ -658,6 +752,32 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             wide_window_s          = self.wide_window_s.get(),
             derivatives_root  = self.derivatives_path.get().strip() or None,
         )
+
+        # ---- CLAMP WINDOWS TO A PRE-EPOCHED FILE'S REAL EXTENT ----
+        # Pre-epoched formats contain data only within their own epochs.  The
+        # reader pads between epochs so that no window can reach into a
+        # neighbouring trial, but padding is not signal: an unclamped window
+        # measures the padding and reports it as data.  Clamp before the worker
+        # starts, and tell the analyst exactly what was reduced.
+        try:
+            from .io import get_epoch_bounds as _io_bounds
+            _bounds = _io_bounds(params["input_path"])
+        except Exception:
+            _bounds = None
+        if _bounds:
+            from .pipeline import clamp_config_to_epoch_bounds as _clamp
+            params, _changes = _clamp(params, _bounds)
+            self._log_gui(
+                f"📐 Pre-epoched file: {_bounds[0]:g} ms before and "
+                f"{_bounds[1]:g} ms after each stimulus are available.")
+            for _f, _old, _new in _changes:
+                self._log_gui(f"   ↳ {_f} reduced {_old} → {_new} ms "
+                              f"(no data exists beyond this)")
+            if _bounds[1] < 300:
+                self._log_gui(
+                    "   ⚠️  Cortical silent period needs roughly 300 ms after "
+                    "the stimulus; this file ends sooner, so cSP metrics will "
+                    "be unreliable or blank.")
 
         # Close any stale pyplot figures on the main thread via after(),
         # so we never destroy Tk-embedded canvases mid-event which causes
@@ -2217,6 +2337,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
 
     def _addons_discover(self):
         """Scan built-in + user folders and rebuild the add-on list."""
+        self._addon_col_cache = {}
         from . import addons as _addons
         try:
             self._addons_entries = _addons.discover_all("single_file", prefs.addons_path,
@@ -2247,22 +2368,141 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             # are merged into the run config. Values persist across rescans.
             if entry.get("settings"):
                 svars = self._addons_setting_vars.setdefault(entry["name"], {})
-                sframe = tk.Frame(txt); sframe.pack(anchor="w", fill="x", pady=(4, 0))
-                for sp in entry["settings"]:
-                    key = sp.get("key")
-                    if not key:
-                        continue
-                    if key not in svars:
-                        svars[key] = tk.StringVar(value=str(sp.get("default", "")))
-                    _rr = tk.Frame(sframe); _rr.pack(anchor="w", fill="x")
-                    tk.Label(_rr, text=f"{sp.get('label', key)}:").pack(side="left")
-                    tk.Entry(_rr, textvariable=svars[key], width=8).pack(side="left", padx=(4, 0))
-                    if sp.get("help"):
-                        tk.Label(sframe, text=sp["help"], fg="grey", justify="left",
-                                 wraplength=600, font="TkSmallCaptionFont").pack(anchor="w")
+                self._addons_render_settings(txt, entry, svars)
             tk.Button(row, text="Run",
                       command=lambda e=entry: self._addons_run(e)).pack(
                           side="right", padx=8, pady=4)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Add-on settings widgets (shared by the first- and second-level tabs)
+    # ──────────────────────────────────────────────────────────────────────────
+    # Numeric columns that identify a trial rather than measure anything, so they
+    # are never offered as a measure to analyse.
+    _ADDON_NON_METRIC_COLS = {
+        "Segment", "Segment_Overall", "Trial", "Stim_Time(s)",
+        "Time_Since_Last_Stim(s)", "Reference_N", "EMGComp_N",
+        "k_trials_averaged",
+    }
+
+    def _addon_data_columns(self, source):
+        """Numeric columns actually present in the dataset, for a dropdown.
+
+        `source` is 'trial_columns' (first level, scanning every *_trials.csv
+        under the derivatives folder) or 'group_columns' (second level, reading
+        the merged group table). The union across sessions is returned, so a
+        column produced by only some sessions is still offered; the add-ons
+        validate the choice at run time and log a fallback if it turns out to be
+        empty for a particular recording.
+
+        Results are cached per derivatives folder and cleared when the add-on
+        list is rescanned, so switching dataset picks up the new columns.
+        """
+        cache = getattr(self, "_addon_col_cache", None)
+        if cache is None:
+            cache = self._addon_col_cache = {}
+
+        folder = ""
+        if hasattr(self, "derivatives_path"):
+            folder = (self.derivatives_path.get() or "").strip()
+        ckey = (source, folder)
+        if ckey in cache:
+            return cache[ckey]
+
+        cols = []
+        if folder and os.path.isdir(folder):
+            try:
+                import glob as _glob
+                import pandas as _pd
+                if source == "group_columns":
+                    pattern = os.path.join(folder, "**", "group_level_LME_ready.csv")
+                else:
+                    pattern = os.path.join(folder, "**", "*_trials.csv")
+                paths = sorted(_glob.glob(pattern, recursive=True))
+                for path in paths[:25]:          # cap: the tab must stay responsive
+                    try:
+                        head = _pd.read_csv(path, nrows=200)
+                    except Exception:
+                        continue
+                    for c in head.columns:
+                        if c in cols or c in self._ADDON_NON_METRIC_COLS:
+                            continue
+                        vals = _pd.to_numeric(head[c], errors="coerce")
+                        if vals.notna().mean() >= 0.5:
+                            cols.append(str(c))
+            except Exception:
+                cols = []
+
+        cache[ckey] = cols
+        return cols
+
+    def _addon_setting_choices(self, sp):
+        """Options for one setting: (values, is_dynamic).
+
+        A setting may declare a fixed list via 'choices', or ask for the list to
+        be read from the dataset via 'choices_from'. A dynamic list falls back to
+        any fixed list when no dataset is open yet, so the control is never empty.
+        """
+        static = [str(c) for c in (sp.get("choices") or [])]
+        source = sp.get("choices_from")
+        if not source:
+            return static, False
+        found = self._addon_data_columns(str(source))
+        if found:
+            extras = [c for c in static if c not in found]
+            return found + extras, True
+        return static, True
+
+    def _addons_render_settings(self, parent, entry, svars):
+        """Render one add-on's ADDON_SETTINGS as controls.
+
+        Widget by declared type: a checkbox for 'bool' (previously a text box the
+        user had to type True into), a combobox where the add-on declares
+        choices, and a text entry otherwise. A fixed 'choices' list is read-only
+        because those options really are the only valid ones; a dataset-derived
+        list stays editable so an unusual column can still be typed in.
+
+        Both the first- and second-level tabs call this, so the two cannot drift
+        apart.
+        """
+        if not entry.get("settings"):
+            return
+        sframe = tk.Frame(parent)
+        sframe.pack(anchor="w", fill="x", pady=(4, 0))
+
+        for sp in entry["settings"]:
+            key = sp.get("key")
+            if not key:
+                continue
+            typ = str(sp.get("type", "str")).strip().lower()
+            rowf = tk.Frame(sframe)
+            rowf.pack(anchor="w", fill="x")
+
+            if typ == "bool":
+                # BooleanVar.get() returns a real bool; str(True).lower() is
+                # 'true', which the existing config coercion already accepts.
+                if not isinstance(svars.get(key), tk.BooleanVar):
+                    svars[key] = tk.BooleanVar(value=bool(sp.get("default", False)))
+                tk.Checkbutton(rowf, text=sp.get("label", key),
+                               variable=svars[key]).pack(side="left")
+            else:
+                if not isinstance(svars.get(key), tk.StringVar):
+                    svars[key] = tk.StringVar(value=str(sp.get("default", "")))
+                tk.Label(rowf, text=f"{sp.get('label', key)}:").pack(side="left")
+                values, dynamic = self._addon_setting_choices(sp)
+                if values:
+                    width = max(18, min(40, max(len(v) for v in values) + 2))
+                    ttk.Combobox(
+                        rowf, textvariable=svars[key], values=values,
+                        state=("normal" if dynamic else "readonly"),
+                        width=width).pack(side="left", padx=(4, 0))
+                else:
+                    tk.Entry(rowf, textvariable=svars[key],
+                             width=(8 if typ in ("int", "float") else 30)
+                             ).pack(side="left", padx=(4, 0))
+
+            if sp.get("help"):
+                tk.Label(sframe, text=sp["help"], fg="grey", justify="left",
+                         wraplength=600, font="TkSmallCaptionFont").pack(anchor="w")
 
     def _addons_build_config(self):
         """Analysis settings handed to add-ons as context.config."""
@@ -2409,6 +2649,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
 
     def _group_addons_discover(self):
         """Scan built-in + user 'group_level' folders and rebuild the list."""
+        self._addon_col_cache = {}
         from . import addons as _addons
         try:
             self._gaddons_entries = _addons.discover_all("group_level", prefs.addons_path,
@@ -2437,19 +2678,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                      justify="left").pack(anchor="w")
             if entry.get("settings"):
                 svars = self._gaddons_setting_vars.setdefault(entry["name"], {})
-                sframe = tk.Frame(txt); sframe.pack(anchor="w", fill="x", pady=(4, 0))
-                for sp in entry["settings"]:
-                    key = sp.get("key")
-                    if not key:
-                        continue
-                    if key not in svars:
-                        svars[key] = tk.StringVar(value=str(sp.get("default", "")))
-                    _rr = tk.Frame(sframe); _rr.pack(anchor="w", fill="x")
-                    tk.Label(_rr, text=f"{sp.get('label', key)}:").pack(side="left")
-                    tk.Entry(_rr, textvariable=svars[key], width=8).pack(side="left", padx=(4, 0))
-                    if sp.get("help"):
-                        tk.Label(sframe, text=sp["help"], fg="grey", justify="left",
-                                 wraplength=600, font="TkSmallCaptionFont").pack(anchor="w")
+                self._addons_render_settings(txt, entry, svars)
             tk.Button(row, text="Run",
                       command=lambda e=entry: self._group_addons_run(e)).pack(
                           side="right", padx=8, pady=4)
@@ -3185,7 +3414,10 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                 _date  = "—"
 
             _ext = os.path.splitext(fe.path)[1].lower()
-            _ftype = {".txt": "TXT", ".smr": "SMR", ".adibin": "ADIBIN", ".edf": "EDF", ".bdf": "BDF"}.get(_ext, _ext.lstrip(".").upper() or "—")
+            _ftype = {".txt": "TXT", ".smr": "SMR", ".adibin": "ADIBIN",
+                      ".edf": "EDF", ".bdf": "BDF", ".vhdr": "BrainVision",
+                      ".acq": "ACQ", ".mat": "MAT", ".csv": "CSV"}.get(
+                          _ext, _ext.lstrip(".").upper() or "—")
 
             # Tags: (status_tag, raw_bytes_str) — raw bytes used for numeric size sort
             tree.insert("", "end", iid=fe.id,
@@ -3461,11 +3693,12 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         r'(?:_(?P<task>task-[A-Za-z0-9]+))?'
         r'(?:_(?P<run>run-[0-9]+))?'
         r'(?:_(?P<suffix>[^.]+))?'
-        r'\.(txt|smr|adibin)$',
+        r'\.(txt|smr|adibin|edf|bdf|vhdr|acq|mat|csv)$',
         re.IGNORECASE,
     )
 
-    _SUPPORTED_EXTENSIONS = {".txt", ".smr", ".adibin", ".edf", ".bdf"}
+    _SUPPORTED_EXTENSIONS = {".txt", ".smr", ".adibin", ".edf", ".bdf",
+                             ".vhdr", ".acq", ".mat", ".csv"}
 
     def _audit_filename(self, basename: str) -> list:
         """Return a list of human-readable issue strings for *basename*.
@@ -3475,7 +3708,9 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         name, ext = os.path.splitext(basename)
 
         if ext.lower() not in self._SUPPORTED_EXTENSIONS:
-            issues.append(f"Extension '{ext}' — expected .txt, .smr, .adibin, .edf, or .bdf")
+            issues.append(
+                f"Extension '{ext}' — expected one of "
+                + ", ".join(sorted(self._SUPPORTED_EXTENSIONS)))
 
         parts = name.split("_")
 
@@ -3901,18 +4136,19 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         # Only the BrainVision .vhdr header is globbed — never .eeg/.vmrk —
         # so each recording enters the queue once, not three times.
         _EXTS = ("*.txt", "*.smr", "*.adibin", "*.edf", "*.bdf",
-                 "*.vhdr", "*.acq")
+                 "*.vhdr", "*.acq", "*.mat", "*.csv")
         all_files = []
         for _pat in _EXTS:
             all_files.extend(_glob.glob(os.path.join(raw, "**", _pat), recursive=True))
         files = sorted(
             f for f in all_files
             if not any(p in os.path.basename(f).lower() for p in EXCLUDE)
-            and "sourcedata" not in os.path.normpath(f).lower().split(os.sep)
+            and not _under_sourcedata(f, raw)
         )
         if not files:
             messagebox.showinfo("No files found",
-                "No data files (.txt, .smr, .adibin, .edf, .bdf) found in the raw data folder.",
+                "No data files (.txt, .smr, .adibin, .edf, .bdf, .vhdr, .acq, "
+                ".mat, .csv) found in the raw data folder.",
                 parent=self.root)
             return
         ds = self._get_or_create_dataset()
@@ -3953,19 +4189,20 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         # Only the BrainVision .vhdr header is globbed — never .eeg/.vmrk —
         # so each recording enters the queue once, not three times.
         _EXTS = ("*.txt", "*.smr", "*.adibin", "*.edf", "*.bdf",
-                 "*.vhdr", "*.acq")
+                 "*.vhdr", "*.acq", "*.mat", "*.csv")
         all_files = []
         for _pat in _EXTS:
             all_files.extend(_glob.glob(os.path.join(folder, "**", _pat), recursive=True))
         files = sorted(
             f for f in all_files
             if not any(p in os.path.basename(f).lower() for p in EXCLUDE_PATTERNS)
-            and "sourcedata" not in os.path.normpath(f).lower().split(os.sep)
+            and not _under_sourcedata(f, folder)
         )
 
         if not files:
             messagebox.showinfo("No files found",
-                "No data files (.txt, .smr, .adibin, .edf, .bdf) found in that folder or its subfolders.\n\n"
+                "No data files (.txt, .smr, .adibin, .edf, .bdf, .vhdr, .acq, "
+                ".mat, .csv) found in that folder or its subfolders.\n\n"
                 "If your files are in a different format, use '+ Add file(s)' instead.",
                 parent=self.root)
             return
@@ -4118,6 +4355,62 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                     f"{k} ({len(v)})" for k, v in sorted(stim_events.items())))
             else:
                 self.log("   ⚠️  No event markers found in this recording")
+
+        elif _fmt == 'epoched_mat':
+            # Pre-epoched MATLAB export: trials are already cut around the
+            # stimulus.  The format declares no amplitude unit, so confirm one
+            # before any value reaches a column headed "(mV)".
+            self.log("📋 Pre-epoched MATLAB export detected — trials already "
+                     "cut around the stimulus")
+            try:
+                from .formats.epoched_mat import (
+                    has_config      as _ep_has_cfg,
+                    save_config     as _ep_save_cfg,
+                    load_config     as _ep_load_cfg,
+                    suggest_unit    as _ep_suggest,
+                    get_epoch_bounds as _ep_bounds,
+                    get_clipped_trials as _ep_clipped,
+                    get_trial_count as _ep_ntrial,
+                )
+                if not _ep_has_cfg(fpath):
+                    _unit = self._ask_epoched_unit(fpath)
+                    if _unit is None:
+                        self.log("⚠️  Unit confirmation cancelled — file not loaded.")
+                        return
+                    _ep_save_cfg(fpath, _unit)
+                    self.log(f"   Amplitude unit set to '{_unit}' — saved to sidecar")
+                else:
+                    _unit = _ep_load_cfg(fpath).get('unit')
+                    self.log(f"   Amplitude unit '{_unit}' — loaded from sidecar")
+                if _unit == 'unknown':
+                    self.log("   ⚠️  Unit unconfirmed: amplitudes are NOT scaled "
+                             "and columns headed '(mV)' are unverified.")
+
+                _pre, _post = _ep_bounds(fpath)
+                self.log(f"   {_ep_ntrial(fpath)} trials | window "
+                         f"-{_pre:g} to +{_post:g} ms about the stimulus")
+                _clip = _ep_clipped(fpath, 0)
+                if _clip:
+                    self.log(f"   ⚠️  {len(_clip)} trial(s) contain "
+                             f"ADC-saturated samples (peak-to-peak "
+                             f"underestimated): {', '.join(str(i + 1) for i in _clip)}")
+            except Exception as _e:
+                self.log(f"❌ Error reading epoched .mat file: {_e}")
+                return
+
+            self.marker_choice.set('A')
+            try:
+                stim_events = extract_stim_times(fpath, '')
+            except Exception as _e:
+                self.log(f"   ⚠️  Could not read stimulus times: {_e}")
+                stim_events = {}
+            if stim_events:
+                self.available_markers = sorted(stim_events)
+                self.marker_choice.set(sorted(stim_events)[0])
+                self.log("   Stim types found: " + ", ".join(
+                    f"{k} ({len(v)})" for k, v in sorted(stim_events.items())))
+            else:
+                self.log("   ⚠️  No stimulus events found in this file")
 
         elif _fmt in ('acqknowledge_acq', 'acqknowledge_mat', 'brainsight'):
             # Trigger/marker-channel formats: one stim type, labelled by
@@ -4588,7 +4881,8 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             if stim_types_found:
                 self.log(f"   Marker codes in range: {', '.join(sorted(stim_types_found))}")
 
-        elif _fmt in ('edf', 'brainvision', 'labchart_mat', 'mne'):
+        elif _fmt in ('edf', 'brainvision', 'labchart_mat', 'mne',
+                      'epoched_mat'):
             # Marker-based formats (BIDS EDF/BDF sidecar _events.tsv or EDF+
             # annotations; BrainVision .vmrk; LabChart .mat comments; MNE
             # annotations) — read the actual labels present so the labels tab

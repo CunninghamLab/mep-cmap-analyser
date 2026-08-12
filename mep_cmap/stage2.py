@@ -9,6 +9,7 @@ the group-level analysis tab.  Mixed into TMSAnalysisApp via Stage2Mixin.
 
 import os
 import json
+import re
 import pathlib
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
@@ -310,10 +311,21 @@ class Stage2Mixin:
                         _parts = pathlib.Path(dirpath).parts
                         _sub = next((p for p in _parts if p.startswith("sub-")), "")
                         _ses = next((p for p in _parts if p.startswith("ses-")), "")
+                        # Several files can belong to one session (e.g. a
+                        # 600-pulse protocol saved as six runs of 100 trials).
+                        # Without a run discriminator they all collapse onto a
+                        # single (participant_id, session) key and every row but
+                        # one is silently dropped on rescan, so fall back to the
+                        # filename's run- entity, then to the file stem.
+                        _run = meta.get("run") or ""
+                        if not _run:
+                            _m = re.search(r"run-([A-Za-z0-9]+)", fn)
+                            _run = _m.group(1) if _m else ""
                         found.append({
                             "include":        True,
                             "participant_id": meta.get("participant_id") or _sub,
                             "session":        meta.get("session")        or _ses,
+                            "run":            _run,
                             "task":           meta.get("task",           ""),
                             "timepoint":      meta.get("timepoint",      ""),
                             "_json_path":     jpath,
@@ -330,11 +342,11 @@ class Stage2Mixin:
             return
 
         # Merge with existing rows: preserve group assignments for known sessions
-        existing = {(r["participant_id"], r["session"]): r
+        existing = {(r["participant_id"], r["session"], r.get("run", "")): r
                     for r in self._s2_rows}
         merged = []
         for row in found:
-            key = (row["participant_id"], row["session"])
+            key = (row["participant_id"], row["session"], row.get("run", ""))
             if key in existing:
                 # Keep existing group assignments, update metadata
                 old = existing[key].copy()
@@ -348,7 +360,8 @@ class Stage2Mixin:
                 merged.append(row)
 
         # Sort by participant then session
-        merged.sort(key=lambda r: (r["participant_id"], r["session"]))
+        merged.sort(key=lambda r: (r["participant_id"], r["session"],
+                                   r.get("run", "")))
         self._s2_rows = merged
         self._s2_refresh_tree()
         self._s2_update_status()
@@ -357,7 +370,8 @@ class Stage2Mixin:
 
     def _s2_rebuild_tree_columns(self):
         """Rebuild Treeview columns from current state."""
-        fixed = ["include", "participant_id", "session", "task", "timepoint", "configure"]
+        fixed = ["include", "participant_id", "session", "run", "task",
+                 "timepoint", "configure"]
         group_names = [gc["name"] for gc in self._s2_group_cols]
         all_cols = fixed + group_names
 
@@ -366,6 +380,7 @@ class Stage2Mixin:
             "include":        55,
             "participant_id": 110,
             "session":        80,
+            "run":            55,
             "task":           90,
             "timepoint":      80,
             "configure":      80,
@@ -374,6 +389,7 @@ class Stage2Mixin:
             "include":        "Include",
             "participant_id": "Participant",
             "session":        "Session",
+            "run":            "Run",
             "task":           "Task",
             "timepoint":      "Timepoint",
             "configure":      "Setup",
@@ -411,7 +427,7 @@ class Stage2Mixin:
         """Clear and repopulate the Treeview from self._s2_rows."""
         for item in self._s2_tree.get_children():
             self._s2_tree.delete(item)
-        fixed = ["participant_id", "session", "task", "timepoint"]
+        fixed = ["participant_id", "session", "run", "task", "timepoint"]
         for i, row in enumerate(self._s2_rows):
             vals = []
             vals.append("☑" if row.get("include", True) else "☐")

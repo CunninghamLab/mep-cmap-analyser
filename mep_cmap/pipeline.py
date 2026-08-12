@@ -49,6 +49,77 @@ from .detection     import (detect_mep_onset_peak_fraction,
 from .normalisation import (compute_mmax, apply_normalisation,
                             apply_emg_compensation, EXCLUDED_DECISIONS)
 
+def clamp_config_to_epoch_bounds(cfg, bounds):
+    """Shrink a config's time windows to what a pre-epoched file contains.
+
+    ``bounds`` is the (pre_ms, post_ms) returned by io.get_epoch_bounds(), or
+    None for continuous formats — in which case nothing is changed.
+
+    Why this is mandatory rather than advisory
+    ------------------------------------------
+    Both failure modes here are silent, which is what makes the clamp
+    non-optional.
+
+    On the pre-stimulus side, ``pre_start`` is clamped with max(0, ...), which
+    only protects the very first trial.  For every other trial an over-long
+    ``prestim_ms`` walks backwards out of its own epoch.  With the 100 ms
+    default against a 25 ms epoch lead-in, three quarters of that window falls
+    outside the trial — and it is the baseline that sets the bootstrap onset
+    threshold and the RMS outlier gate.
+
+    On the post-stimulus side one might expect the completeness guard in
+    pipeline_extract_segments to reject an over-long window.  It does not: a
+    pre-epoched reader supplies guard-band padding between epochs, so the
+    window is filled and every trial passes.  Measured directly, post_ms=400
+    against a 100 ms epoch keeps 100/100 trials rather than rejecting them.
+    The guard prevents contamination by *neighbouring trials*, but it cannot
+    stop an unclamped window from measuring padding and reporting it as
+    signal.  Only the clamp does that.
+
+    Returns
+    -------
+    (cfg, changes) : the config (mutated in place) and a list of
+                     (field, old, new) tuples describing what was reduced, for
+                     the caller to report to the analyst.
+    """
+    if not bounds:
+        return cfg, []
+    pre_avail, post_avail = float(bounds[0]), float(bounds[1])
+    changes = []
+
+    # Accept either a PipelineConfig-style object or the plain params dict the
+    # GUI snapshots before starting the worker thread.
+    is_map = isinstance(cfg, dict)
+    _get = (lambda k, d=None: cfg.get(k, d)) if is_map else (
+        lambda k, d=None: getattr(cfg, k, d))
+
+    def _set(k, v):
+        if is_map:
+            cfg[k] = v
+        else:
+            setattr(cfg, k, v)
+
+    # The pre-stimulus baseline may additionally be pushed earlier by a
+    # per-stim-type gap, so the gap has to come out of the available lead-in.
+    try:
+        max_gap = max([float(v) for v in (_get('gap_ms_map') or {}).values()]
+                      or [0.0])
+    except Exception:
+        max_gap = 0.0
+
+    for field, limit in (('pre_ms', pre_avail),
+                         ('post_ms', post_avail),
+                         ('prestim_ms', max(pre_avail - max_gap, 0.0))):
+        old = _get(field)
+        if old is None:
+            continue
+        new = int(min(float(old), limit))
+        if new != old:
+            _set(field, new)
+            changes.append((field, old, new))
+    return cfg, changes
+
+
 @dataclass
 class PipelineConfig:
     """Bundles all analysis settings so subfunctions share one parameter object."""
@@ -929,7 +1000,29 @@ LAT_COLS = [
     "EMGComp_Rho_Post",               # Spearman rho(adjusted, RMS) — ≈ 0 when adequate
     # Annotations — always last
     "Manual_Note",
+    # Acquisition-quality flags.  Appended after Manual_Note so that row
+    # builders emitting the older, shorter row remain valid; rows are padded
+    # to full width in pipeline_write_outputs.
+    "Clipped",          # trial contains ADC-saturated samples -> PTP underestimated
+    "Units_Assumed",    # amplitude unit was not declared by the file
 ]
+
+
+def _trials_frame(rows):
+    """Build the trial-level DataFrame, padding rows to the LAT_COLS width.
+
+    Row builders emit positional lists.  Appending a column to the end of
+    LAT_COLS therefore desynchronises every builder that has not been updated,
+    and pandas raises "N columns passed, passed data had M columns" at write
+    time — after the whole analysis has run.  Padding here keeps a schema
+    addition from breaking the run, and keeps every construction site
+    consistent: build frames through this function, never pd.DataFrame(...,
+    columns=LAT_COLS) directly.
+    """
+    w = len(LAT_COLS)
+    padded = [list(r) + [""] * (w - len(r)) if len(r) < w else list(r)[:w]
+              for r in rows]
+    return pd.DataFrame(padded, columns=LAT_COLS)
 
 
 def pipeline_write_outputs(latency_manual, results_out, bids_prefix):
@@ -988,7 +1081,7 @@ def pipeline_write_outputs(latency_manual, results_out, bids_prefix):
     # ── Trial-level files ─────────────────────────────────────────────────────
     if latency_manual:
         df_all = _alpha_sort(
-            pd.DataFrame(latency_manual, columns=LAT_COLS),
+            _trials_frame(latency_manual),
             "StimType").sort_values(["StimType", "File", "Segment"])
         # trials.csv deliberately carries EVERY trial; Outlier_Decision is the
         # filter column so the analyst keeps control of trial-level modelling.
@@ -1071,7 +1164,7 @@ def pipeline_write_outputs(latency_manual, results_out, bids_prefix):
                 ])
             return pd.DataFrame(rows, columns=SUM_HDR)
 
-        df_all = pd.DataFrame(latency_manual, columns=LAT_COLS)
+        df_all = _trials_frame(latency_manual)
         df_clean_only = df_all[~df_all["Outlier_Decision"].isin(EXCLUDED_DECISIONS)]
 
         _build_summary(df_clean_only) \

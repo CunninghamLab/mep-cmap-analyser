@@ -669,6 +669,31 @@ class DataInspectorWindow:
         onset    = stim_idx if onset_ms is None else stim_idx + int(round(onset_ms / dt_ms))
         onset    = max(onset, stim_idx)
 
+        # ---------- discard stale landmark indices --------------------------
+        # Metadata persists across runs and is honoured by the setdefault calls
+        # below, so an index stored when the analysis window was longer would be
+        # reused against a shorter segment.  scatter() then raises IndexError
+        # mid-draw and the inspector never opens at all.
+        #
+        # An index that cannot exist in this segment is stale, not a user edit
+        # worth preserving, so drop it and let detection re-seed.  Clamping to
+        # the segment edge instead would be worse: it silently plants a landmark
+        # at a boundary the analyst never chose and reports it as a measurement.
+        _seg_len = len(emg)
+        _stale = [f for f in ('ptp_min_idx', 'ptp_max_idx', 'onset_idx',
+                              'silent_start_idx', 'silent_end_idx')
+                  if m.get(f) is not None
+                  and not (0 <= int(m[f]) < _seg_len)]
+        if _stale:
+            for f in _stale:
+                m.pop(f, None)
+            if not getattr(self, '_stale_meta_warned', False):
+                self._stale_meta_warned = True
+                print(f"[inspector] Discarded landmark(s) {', '.join(_stale)} "
+                      f"stored outside the current {_seg_len}-sample segment "
+                      f"(analysis window changed since they were saved); "
+                      f"re-detecting.")
+
         # ---------- seed metadata defaults ----------------------------------
         m.setdefault('ptp_min_idx', p_min)
         m.setdefault('ptp_max_idx', p_max)
@@ -819,6 +844,15 @@ class DataInspectorWindow:
         self._dpts = []
 
         def _add(idx0, c, field, label=None):
+            # A marker outside the segment is skipped rather than clamped: the
+            # draw must not fail, but nor should a landmark appear at a sample
+            # the detector never chose.  Stale values are normally cleared
+            # above; this guards any path that reaches here with one anyway.
+            if idx0 is None or not (0 <= int(idx0) < len(emg)):
+                print(f"[inspector] Skipped marker '{field}' at index {idx0} "
+                      f"(outside the {len(emg)}-sample segment).")
+                return
+            idx0 = int(idx0)
             mk   = 'x' if field.startswith('ptp_') else 'o'
             alp  = 0.6 if field == "onset_idx" else 1.0
             scat = self.ax_raw.scatter(self.t[idx0], emg[idx0],

@@ -9,6 +9,8 @@ Supported formats (auto-detected from file header)
   LabChart text export — header line 0 starts with "Interval="
   Generic TSV          — headerless / all-numeric tab/space/comma delimited text
                          (requires a one-time Format Wizard dialog on first open)
+  Epoched MATLAB       — pre-cut TMS-EMG trials (Chans/Markers/Conds/Events)
+                         (requires a one-time unit-confirmation dialog)
 
 Adding a new format
 -------------------
@@ -25,6 +27,17 @@ Public API
   list_event_channels(file_path)               -> list[str]
   extract_emg_waveform_and_fs(file_path, ch)   -> (np.ndarray, int, str|None)
   extract_stim_times(file_path, marker_name)   -> dict[str, list[float]]
+  get_epoch_bounds(file_path)                  -> (pre_ms, post_ms) | None
+  units_assumed(file_path)                     -> bool
+  get_clipped_trials(file_path, channel_idx)   -> list[int]
+
+Pre-epoched formats
+-------------------
+Most readers return a continuous recording.  A pre-epoched reader instead
+returns its trials stitched into a pseudo-continuous trace separated by
+guard-band padding, plus synthetic stim times.  Such a format reports a
+non-None get_epoch_bounds(); callers must clamp their analysis windows to it
+(see that function for why silence here is dangerous).
 
 Generic TSV — wizard integration
 ---------------------------------
@@ -51,6 +64,7 @@ from .formats import labchart_mat as _labchart_mat
 from .formats import brainsight  as _brainsight
 from .formats import acqknowledge_mat as _acqknowledge_mat
 from .formats import acqknowledge_acq as _acqknowledge_acq
+from .formats import epoched_mat  as _epoched_mat
 from .formats import brainvision  as _brainvision
 from .formats import edf          as _edf
 from .formats import cfwb        as _cfwb
@@ -146,6 +160,11 @@ def detect_format(file_path: str) -> str:
         return 'labchart_mat'
     if ext == '.mat' and _acqknowledge_mat.is_acqknowledge_mat(file_path):
         return 'acqknowledge_mat'
+    # Pre-epoched TMS-EMG MATLAB export (.mat) — trials already cut around the
+    # stimulus.  Checked after the two continuous .mat readers; the three
+    # signatures are disjoint, so order is for consistency, not correctness.
+    if ext == '.mat' and _epoched_mat.is_epoched_mat(file_path):
+        return 'epoched_mat'
 
     # Brainsight neuronavigation export (.txt) — header-signature sniff
     if _brainsight.is_brainsight(file_path):
@@ -213,6 +232,8 @@ def needs_wizard(file_path: str) -> bool:
         return not _generic_has_config(file_path)
     if fmt == 'spike2_smr':
         return not _spike2_smr.has_config(file_path)
+    if fmt == 'epoched_mat':
+        return not _epoched_mat.has_config(file_path)
     return False
 
 
@@ -230,6 +251,8 @@ def list_waveform_channels(file_path: str) -> list:
         return _acqknowledge_acq.list_waveform_channels(file_path)
     if fmt == 'acqknowledge_mat':
         return _acqknowledge_mat.list_waveform_channels(file_path)
+    if fmt == 'epoched_mat':
+        return _epoched_mat.list_waveform_channels(file_path)
     if fmt == 'brainvision':
         return _brainvision.list_waveform_channels(file_path)
     if fmt == 'edf':
@@ -357,6 +380,8 @@ def _extract_emg_native(file_path: str, channel_idx: int = 0):
         return _acqknowledge_acq.extract_emg_waveform_and_fs(file_path, channel_idx)
     if fmt == 'acqknowledge_mat':
         return _acqknowledge_mat.extract_emg_waveform_and_fs(file_path, channel_idx)
+    if fmt == 'epoched_mat':
+        return _epoched_mat.extract_emg_waveform_and_fs(file_path, channel_idx)
     if fmt == 'brainvision':
         return _brainvision.extract_emg_waveform_and_fs(file_path, channel_idx)
     if fmt == 'edf':
@@ -374,6 +399,59 @@ def _extract_emg_native(file_path: str, channel_idx: int = 0):
     if fmt == 'generic_tsv':
         return _generic_tsv.extract_emg_waveform_and_fs(file_path, channel_idx)
     return _spike2.extract_emg_waveform_and_fs(file_path, channel_idx)
+
+
+def get_epoch_bounds(file_path: str):
+    """
+    Return (pre_ms, post_ms) available around the stimulus, or None.
+
+    Continuous formats return None: the recording runs either side of every
+    stimulus, so no window is structurally unavailable.  Pre-epoched formats
+    return the real extent of their epochs.
+
+    Callers MUST clamp pre_ms / post_ms / prestim_ms to a non-None result.
+    Without that clamp an over-long window silently reaches past the end of
+    one epoch — with a default prestim_ms of 100 ms against a 25 ms epoch
+    lead-in, the "baseline" used for bootstrap onset thresholds and RMS
+    outlier gating would be drawn largely from the neighbouring trial's MEP.
+
+    Returns
+    -------
+    (pre_ms, post_ms) : tuple[float, float] for pre-epoched formats
+    None              : for continuous formats
+    """
+    file_path = _resolve_path(file_path)
+    if detect_format(file_path) == 'epoched_mat':
+        return _epoched_mat.get_epoch_bounds(file_path)
+    return None
+
+
+def units_assumed(file_path: str) -> bool:
+    """
+    True when the amplitude unit is an assumption rather than a file fact.
+
+    Formats that declare their own units always return False.  Formats where
+    the analyst had to supply the unit return True when the answer was left
+    unknown, so that output can record whether a column labelled "(mV)" is a
+    measurement or an unverified assumption.
+    """
+    file_path = _resolve_path(file_path)
+    if detect_format(file_path) == 'epoched_mat':
+        return _epoched_mat.units_assumed(file_path)
+    return False
+
+
+def get_clipped_trials(file_path: str, channel_idx: int = 0) -> list:
+    """
+    Return indices of trials containing ADC-saturated samples, if knowable.
+
+    Empty for formats that cannot determine it.  A saturated trial's
+    peak-to-peak amplitude is an underestimate of unknown size.
+    """
+    file_path = _resolve_path(file_path)
+    if detect_format(file_path) == 'epoched_mat':
+        return _epoched_mat.get_clipped_trials(file_path, channel_idx)
+    return []
 
 
 def extract_stim_times(file_path: str, marker_name: str, stim_channel: str = None) -> dict:
@@ -400,6 +478,8 @@ def extract_stim_times(file_path: str, marker_name: str, stim_channel: str = Non
         return _acqknowledge_acq.extract_stim_times(file_path, marker_name)
     if fmt == 'acqknowledge_mat':
         return _acqknowledge_mat.extract_stim_times(file_path, marker_name)
+    if fmt == 'epoched_mat':
+        return _epoched_mat.extract_stim_times(file_path, marker_name)
     if fmt == 'brainvision':
         return _brainvision.extract_stim_times(file_path, marker_name)
     if fmt == 'edf':

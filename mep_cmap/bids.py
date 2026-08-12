@@ -12,7 +12,7 @@ import re
 import datetime
 from dataclasses import dataclass, field, asdict
 
-TOOL_VERSION = "1.3.0"
+TOOL_VERSION = "1.3.1"
 
 
 @dataclass
@@ -25,12 +25,19 @@ class StudyMetadata:
     limb:           str = ""       # e.g. "left" / "right"  (optional)
     measure:        str = ""       # e.g. "CSE" / "SICI" / "ICF"  (optional)
     acq:            str = ""       # e.g. "cse-cond30" — acquisition/condition label
+    run:            str = ""       # e.g. "01" — index within a multi-file session
 
     def bids_prefix(self) -> str:
         """
         Build the filename prefix from active fields.
-        e.g.  sub-JD001_ses-01_task-fatigue_tp-pre
+        e.g.  sub-JD001_ses-01_task-fatigue_tp-pre_run-01
         Fields that are blank are omitted.
+
+        ``run`` is the BIDS entity for several acquisitions that belong to one
+        session — e.g. a 600-pulse protocol saved as six files of 100 trials.
+        It is what keeps their derivatives distinct on disk and their rows
+        distinct in the Stage 2 table; without it they collapse onto a single
+        (participant_id, session) key and all but one are lost.
         """
         parts = [self.participant_id]
         if self.session:
@@ -45,6 +52,8 @@ class StudyMetadata:
             parts.append(f"measure-{self.measure}")
         if self.acq:
             parts.append(f"acq-{self.acq}")
+        if self.run:
+            parts.append(f"run-{self.run}")
         return "_".join(p for p in parts if p)
 
     def sub_ses_path(self) -> str:

@@ -16,6 +16,7 @@ folder.
 from __future__ import annotations
 import json
 import os
+import pathlib
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -117,6 +118,7 @@ class FileEntry:
     include_in_group: bool  = True
     review_flags:     dict  = field(default_factory=dict)  # {letter: status}
     is_external_ref:  bool  = False       # True if added as external normalisation ref
+    run:              str   = ""          # BIDS run index within a multi-file session
 
     def to_dict(self, study_root: str = "") -> dict:
         path_out  = _to_relative(self.path,             study_root) if study_root else self.path
@@ -134,6 +136,7 @@ class FileEntry:
             "include_in_group": self.include_in_group,
             "review_flags":     self.review_flags,
             "is_external_ref":  self.is_external_ref,
+            "run":              self.run,
         }
 
     @classmethod
@@ -155,6 +158,7 @@ class FileEntry:
             include_in_group = d.get("include_in_group", True),
             review_flags     = d.get("review_flags", {}),
             is_external_ref  = d.get("is_external_ref", False),
+            run              = d.get("run", ""),
         )
 
     @property
@@ -378,6 +382,80 @@ class DatasetSession:
                             STATUS_NEEDS_REVIEW, STATUS_STALE):
                 return f
         return None
+
+    # ── Run indexing for multi-file sessions ──────────────────────────────────
+
+    @staticmethod
+    def session_key(path: str) -> tuple:
+        """Return a key identifying which session a source file belongs to.
+
+        Prefers the BIDS sub-/ses- entities, looked for in the filename first
+        and then in the directory components (sourcedata trees commonly carry
+        the subject on the folder rather than the file, as in
+        ``sourcedata/emg/sub-283/283_000.mat``).  Falls back to the containing
+        directory, which is the practical unit for non-BIDS exports added
+        together in one go.
+        """
+        import re
+        norm  = os.path.normpath(path)
+        parts = list(pathlib.PurePath(norm).parts)
+        stem  = os.path.splitext(os.path.basename(norm))[0]
+
+        def _entity(tag):
+            m = re.search(rf'{tag}-([A-Za-z0-9]+)', stem)
+            if m:
+                return m.group(1)
+            for p in reversed(parts[:-1]):
+                m = re.fullmatch(rf'{tag}-([A-Za-z0-9]+)', p)
+                if m:
+                    return m.group(1)
+            return ""
+
+        sub_id, ses_id = _entity('sub'), _entity('ses')
+        if sub_id:
+            return ('bids', sub_id, ses_id)
+        return ('dir', os.path.dirname(norm))
+
+    def assign_runs(self, force: bool = False) -> list:
+        """Give each file in a multi-file session a BIDS run index.
+
+        Several source files can belong to one session — e.g. a 600-pulse
+        protocol saved as six files of 100 trials.  Without a distinguishing
+        entity their derivatives collide on disk and their Stage 2 rows
+        collapse onto a single (participant_id, session) key, so all but one
+        is lost.  The run index is what keeps them separate.
+
+        Indices are 1-based and assigned in queue order, so reordering the
+        queue before processing changes them and reordering afterwards does
+        not: existing values are left alone unless ``force`` is set.  Sessions
+        holding a single file are left blank rather than labelled run-01,
+        since an index that never varies only adds noise to filenames.
+
+        External reference files are skipped — they are not part of the
+        session's own trial sequence.
+
+        Returns
+        -------
+        list of (FileEntry, old_run, new_run) for entries that changed.
+        """
+        groups: dict = {}
+        for fe in self.files:
+            if fe.is_external_ref:
+                continue
+            groups.setdefault(self.session_key(fe.path), []).append(fe)
+
+        changed = []
+        for _key, entries in groups.items():
+            if len(entries) < 2:
+                continue
+            for i, fe in enumerate(entries, start=1):
+                if fe.run and not force:
+                    continue
+                new = f"{i:02d}"
+                if fe.run != new:
+                    changed.append((fe, fe.run, new))
+                    fe.run = new
+        return changed
 
     def label_from_bids(self, path: str) -> str:
         """

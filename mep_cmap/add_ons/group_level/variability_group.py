@@ -210,7 +210,12 @@ def _resolve_metric(df, requested, log):
 
 
 def _build_records(df, metric, target_col, session_col, file_col):
-    """One record per recording: its target, its session, and its trial values."""
+    """One record per recording: one participant, one session, one limb.
+
+    Participant and limb are carried separately from `target`, because the
+    target may be either of them depending on the reliability-target setting,
+    and a reader needs to see which recording a row refers to regardless.
+    """
     records = []
     keys = [c for c in (target_col, session_col, file_col) if c in df.columns]
     for key, sub in df.groupby(keys, sort=True):
@@ -224,8 +229,31 @@ def _build_records(df, metric, target_col, session_col, file_col):
                "session": str(key[1]) if len(key) > 1 else "ses-1",
                "x": vals}
         rec["file"] = str(key[2]) if len(key) > 2 else rec["target"]
+
+        def _first(col):
+            if col in sub.columns:
+                vv = sub[col].dropna()
+                if len(vv):
+                    return str(vv.iloc[0])
+            return ""
+        rec["subject"] = _first("participant_id")
+        rec["limb"] = _first("Limb")
         records.append(rec)
     return records
+
+
+def _recording_label(rec):
+    """Compact identifier for one recording: subject, session, limb.
+
+    Kept short because it becomes a y-axis tick. Empty parts are dropped rather
+    than printed blank, so a dataset without a Limb column reads cleanly.
+    """
+    parts = [rec.get("subject") or rec.get("target", ""),
+             rec.get("session", "")]
+    limb = str(rec.get("limb") or "")
+    if limb:
+        parts.append(limb.replace("limb-", ""))
+    return "  ".join(p for p in parts if p)
 
 
 def _recording_table(records):
@@ -236,7 +264,10 @@ def _recording_table(records):
         m = float(np.mean(x))
         sd = float(np.std(x, ddof=1)) if x.size > 1 else np.nan
         rows.append({
-            "Target": r["target"], "Session": r["session"], "File": r.get("file"),
+            "Label": _recording_label(r),
+            "Subject": r.get("subject", ""), "Session": r["session"],
+            "Limb": r.get("limb", ""), "Target": r["target"],
+            "File": r.get("file"),
             "N_Trials": int(x.size), "Mean": m, "SD": sd,
             "CV(%)": 100.0 * sd / m if m else np.nan,
         })
@@ -351,9 +382,21 @@ def _plot_stratum(res, metric, stim_type, out_png):
         ax.errorbar(s["Mean"], y, xerr=err, fmt="o", color="#2C3E50",
                     ecolor="#5DADE2", ms=4, elinewidth=1.5)
         ax.axvline(s["Mean"].mean(), color="#C0392B", ls="--", lw=1)
-        ax.set_yticks([])
+        # Name the rows while they are still legible. Past roughly 30 recordings
+        # the ticks collide and an unlabelled axis is the honest choice; the
+        # recordings CSV carries the same labels for looking one up.
+        labels = list(s["Label"]) if "Label" in s.columns else []
+        if labels and len(labels) <= 30:
+            ax.set_yticks(y)
+            ax.set_yticklabels(labels,
+                               fontsize=(8 if len(labels) <= 14 else 6))
+            ax.set_ylabel("")
+        else:
+            ax.set_yticks([])
+            ax.set_ylabel(f"Each row is one recording, sorted by mean "
+                          f"({len(s)} recordings)")
+        ax.set_ylim(-0.7, len(s) - 0.3)
         ax.set_xlabel(f"Mean {metric} for one recording, with 95% CI")
-        ax.set_ylabel("Each row is one recording (sorted by mean)")
     ax.set_title("Recording means", fontsize=10)
 
     ax = axes[0, 1]
@@ -476,15 +519,18 @@ def _caption_stratum(res, metric, stim_type, prefix):
                 f"{_fmt(res.get('ceiling_1_session'), 3)}.")
     add("")
     add("Bottom right - Session against session.")
-    add("  Each point is one target measured twice. The horizontal axis is the")
-    add("  average of its two sessions, the vertical axis the difference between")
-    add("  them. The solid line is the mean difference and the dashed lines the")
-    add("  95 % limits of agreement.")
     if ba and "error" not in ba:
+        add("  Each point is one target measured twice. The horizontal axis is the")
+        add("  average of its two sessions, the vertical axis the difference")
+        add("  between them. The solid line is the mean difference and the dashed")
+        add("  lines the 95 % limits of agreement.")
         sp = res.get("session_pair", ("", ""))
         add(f"  {sp[0]} against {sp[1]}: bias {_fmt(ba.get('bias'))}, limits "
             f"{_fmt(ba.get('loa_lo'))} to {_fmt(ba.get('loa_hi'))}")
         add(f"  ({_fmt(ba.get('loa_width_pct_of_mean'), 0)} % of the mean).")
+    else:
+        add("  Empty for this dataset: comparing a target against itself on a")
+        add("  second occasion needs at least two sessions per target.")
     add("")
     add("KEY NUMBERS")
     add("")

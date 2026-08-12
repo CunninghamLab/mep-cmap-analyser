@@ -90,24 +90,68 @@ _BOUNDARY_DESCRIPTIONS = (
 _RAW_CACHE = {}          # {cache_key: Raw}   bounded to _CACHE_LIMIT entries
 _CACHE_LIMIT = 2
 
+# Probe result for MNE: None until first checked, then (module | None, reason).
+# Cached because detect_format() consults is_mne_readable() for every file and
+# the probe imports an MNE submodule, which is not free.
+_MNE_STATE = None
+
 
 # ── Lazy MNE import ───────────────────────────────────────────────────────────
 
 def _mne():
-    """Import and return the mne module, or None if unavailable."""
+    """Import and return the mne module, or None if it is unusable.
+
+    Importing MNE successfully is not enough. MNE loads its submodules lazily,
+    so ``import mne`` can succeed while the reader machinery cannot load at
+    all — most often an MNE built against a SciPy that has since removed a
+    symbol it imports (``scipy.special.sph_harm``, removed in SciPy 1.17).
+    Without probing, such an install is reported as available and then fails
+    later with a confusing "MNE could not read <file>" message, at the moment
+    the user is trying to open a recording.
+
+    Probing the submodule this module actually uses means a broken install
+    degrades exactly as an absent one does: the format is simply not claimed,
+    and every native reader is unaffected.
+    """
+    global _MNE_STATE
+    if _MNE_STATE is not None:
+        return _MNE_STATE[0]
+
     try:
         import mne as _m
-    except Exception:
+    except Exception as exc:
+        _MNE_STATE = (None, f"MNE-Python is not installed ({exc})")
         return None
+
+    try:
+        _m.io.read_raw                      # forces the lazy submodule import
+    except Exception as exc:
+        _MNE_STATE = (None,
+                      f"MNE-Python is installed but its readers cannot load "
+                      f"({exc}); this is usually a version mismatch between "
+                      f"MNE and SciPy")
+        return None
+
     try:
         _m.set_log_level('ERROR')
     except Exception:
         pass
+    _MNE_STATE = (_m, None)
     return _m
 
 
+def unavailable_reason():
+    """Why MNE cannot be used, or None when it is usable.
+
+    Exposed so a caller can log something actionable rather than silently
+    treating a broken install as an absent one.
+    """
+    _mne()
+    return _MNE_STATE[1] if _MNE_STATE else None
+
+
 def is_available() -> bool:
-    """True if MNE-Python is installed and importable."""
+    """True if MNE-Python is installed AND its readers can actually load."""
     return _mne() is not None
 
 
@@ -155,8 +199,9 @@ def _raw(file_path: str):
     m = _mne()
     if m is None:
         raise RuntimeError(
-            "MNE-Python is required to read this file "
-            "(pip install mne).")
+            f"MNE-Python is required to read this file: "
+            f"{unavailable_reason() or 'MNE is unavailable'} "
+            f"(pip install --upgrade mne).")
 
     key = _cache_key(file_path)
     if key in _RAW_CACHE:

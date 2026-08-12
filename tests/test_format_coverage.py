@@ -146,6 +146,7 @@ def test_detect_format_returns_known_set():
         "spike2", "spike2_smr", "labchart", "labchart_mat", "cfwb",
         "generic_tsv", "edf", "brainvision", "brainsight",
         "acqknowledge_acq", "acqknowledge_mat", "mne",
+        "epoched_mat",
     }
 
 
@@ -292,7 +293,17 @@ def test_brainvision_matches_mne(brainvision_triplet):
     mne.set_log_level("ERROR")
     from mep_cmap import io
 
-    raw = mne.io.read_raw_brainvision(str(brainvision_triplet), preload=True)
+    # importorskip only catches MNE being absent. MNE loads its submodules
+    # lazily, so `import mne` can succeed while the reader machinery cannot
+    # load at all — most often an MNE built against a SciPy that has since
+    # removed a symbol it imports (scipy.special.sph_harm, gone in SciPy 1.17).
+    # That is an environment mismatch, not a regression in this package, so it
+    # skips rather than fails.
+    try:
+        raw = mne.io.read_raw_brainvision(str(brainvision_triplet), preload=True)
+    except ImportError as exc:
+        pytest.skip(f"MNE is installed but its readers cannot load ({exc}); "
+                    f"usually SciPy 1.17+ against an older MNE")
 
     assert raw.ch_names == io.list_waveform_channels(str(brainvision_triplet))
     assert int(raw.info["sfreq"]) == BV_FS

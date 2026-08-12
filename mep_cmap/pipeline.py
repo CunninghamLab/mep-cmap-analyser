@@ -41,7 +41,9 @@ from .bids import StudyMetadata
 from .utils import _add_time_and_digmark
 from .io import extract_emg_waveform_and_fs, extract_stim_times
 from .filters import adaptive_mains_cancel, design_notch_sos
-from .detection     import (detect_mep_onset_peak_fraction,
+from .detection     import (compute_ptp, compute_rms, compute_auc,
+                            compute_prestim_rms,
+                            detect_mep_onset_peak_fraction,
                              detect_mep_onset_bootstrap,
                              detect_mep_onset_bigoni,
                              detect_mep_onset_bigoni_walkback,
@@ -315,13 +317,12 @@ def pipeline_prestim_rms(prestim, cfg: PipelineConfig = None, axis=None):
     ``axis=None`` for a single 1-D window; ``axis=1`` for a (trials, samples)
     stack, returning one value per trial.
     """
-    x = np.asarray(prestim, dtype=float)
-    if x.size == 0:
-        return 0.0 if axis is None else np.zeros(0)
-    if cfg is None or getattr(cfg, "prestim_rms_demean", True):
-        x = x - np.mean(x, axis=axis, keepdims=(axis is not None))
-    return (float(np.sqrt(np.mean(x ** 2))) if axis is None
-            else np.sqrt(np.mean(x ** 2, axis=axis)))
+    # Thin wrapper: this function's job is to read the preference, and
+    # detection.quantification.compute_prestim_rms owns the arithmetic. Two
+    # implementations of one measurement will always drift apart eventually,
+    # and this pair already had, by about ten percent.
+    demean = True if cfg is None else bool(getattr(cfg, "prestim_rms_demean", True))
+    return compute_prestim_rms(prestim, demean=demean, axis=axis)
 
 
 def pipeline_extract_segments(time, emg, stim_times, stim_types, fs,
@@ -575,6 +576,9 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
     """
     rms_all    = pipeline_prestim_rms(prestim_all, cfg, axis=1)
     preptp_all = _np_ptp(prestim_all, axis=1)
+    # RMS over the same window PTP uses, filled per trial in the loop below via
+    # the shared compute_rms so there is only one definition of it.
+    mep_rms_vals = []
     rms_z_full = (zscore(rms_all) if len(rms_all) > 1
                   else np.zeros_like(rms_all))
     ptps = np.empty(len(segs_all))
@@ -594,7 +598,7 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
 
     for idx, seg in enumerate(segs_all):
         # ── automatic metrics ────────────────────────────────────────────
-        auto_ptp = _np_ptp(seg[ptp_start_idx:ptp_end_idx])
+        auto_ptp = compute_ptp(seg, ptp_start_idx, ptp_end_idx)
         auto_lat = auto_onsets.get(idx)
 
         # ── manual overrides from inspector ──────────────────────────────
@@ -662,8 +666,9 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
             # User-set or inspector-auto AUC window
             a0 = _ci(segments_metadata[mk]["auc_start_idx"])
             a1 = _ci(segments_metadata[mk]["auc_end_idx"])
-            auc_val = float(_np_trapz(np.abs(seg[a0:a1]), dx=1 / fs))
-            auc_vals_all.append(auc_val)
+            auc_val = compute_auc(seg, a0, a1, fs)
+            if auc_val is not None:
+                auc_vals_all.append(auc_val)
         elif mk in segments_metadata and \
                 "silent_start_idx" in segments_metadata[mk] and \
                 "onset_idx" in segments_metadata[mk]:
@@ -737,7 +742,7 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
             name, stim_type, custom_labels.get(stim_type, ""), idx + 1,  # [0-3]
             None, None, None,                                              # [4-6] timing
             cfg.limb, cfg.measure,                                        # [7-8]
-            None, None,                                                   # [9-10] PTP/Lat
+            None, None, None,                                  # PTP / MEP_RMS / Latency
             silent_dur, sp_mep_offset_ms, sp_emg_return_ms, _csp_mep,   # [11-14] SP
             auc_val,                                                      # [15]
             round(rms_all[idx], 4), round(preptp_all[idx], 4),           # [16-17] PreStimRMS/PTP
@@ -753,10 +758,18 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
 
         auto_row   = common.copy()
         manual_row = common.copy()
-        auto_row  [9] = round(auto_ptp, 2)
-        auto_row  [10] = round(auto_lat, 2) if auto_lat is not None else "Not Detected"
-        manual_row[9] = round(man_ptp, 2)
-        manual_row[10] = round(man_lat, 2) if man_lat is not None else "Not Detected"
+        auto_row  [_C_PTP] = round(auto_ptp, 2)
+        auto_row  [_C_LAT] = round(auto_lat, 2) if auto_lat is not None else "Not Detected"
+        manual_row[_C_PTP] = round(man_ptp, 2)
+        manual_row[_C_LAT] = round(man_lat, 2) if man_lat is not None else "Not Detected"
+
+        # RMS over the PTP window. Identical for the auto and manual rows by
+        # design: the manual override moves two peak markers, which is not a
+        # window, so there is no manual counterpart to a window statistic.
+        _mep_rms = compute_rms(seg, ptp_start_idx, ptp_end_idx)
+        mep_rms_vals.append(_mep_rms)
+        auto_row  [_C_MEP_RMS] = round(_mep_rms, 4)
+        manual_row[_C_MEP_RMS] = round(_mep_rms, 4)
 
         # PTP / PreStimRMS per trial (indices 30-31 in LAT_COLS)
         _rms_val = rms_all[idx]
@@ -775,8 +788,15 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
             latencies.append(man_lat)
 
     ptp_z_full = (zscore(ptps) if len(ptps) > 1 else np.zeros_like(ptps))
+    # Addressed by name, not by literal index. The literal 19 used here wrote the
+    # within-condition PTP z-score into Z_PreStimRMS, clobbering the baseline
+    # z that `common` had already filled, and leaving Z_PTP_Within empty for the
+    # later pooled pass to shift into.
+    _col_z_within = LAT_COLS.index("Z_PTP_Within")
     for i, (ar, mr) in enumerate(zip(auto_rows, manual_rows)):
-        ar[19] = mr[19] = round(float(ptp_z_full[i]), 3)  # Z_PTP_Within
+        ar[_col_z_within] = mr[_col_z_within] = round(float(ptp_z_full[i]), 3)
+
+    mep_rms_all = np.asarray(mep_rms_vals, dtype=float)
 
     # ── summary rows ─────────────────────────────────────────────────────────
     lat_pos     = [v for v in latencies if v is not None and v >= 0]
@@ -801,6 +821,8 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
     header_vals = [name, stim_type, lbl, sum(clean_mask),
                    float(clean_ptps.mean()) if len(clean_ptps) else np.nan,
                    float(clean_ptps.std(ddof=1)) if len(clean_ptps) > 1 else np.nan,
+                   float(mep_rms_all[clean_mask].mean()) if clean_mask.count(True) else np.nan,
+                   float(mep_rms_all[clean_mask].std(ddof=1)) if clean_mask.count(True) > 1 else np.nan,
                    float(rms_all[clean_mask].mean()) if clean_mask.count(True) else np.nan,
                    float(rms_all[clean_mask].std(ddof=1)) if clean_mask.count(True) > 1 else np.nan,
                    float(preptp_all[clean_mask].mean()) if clean_mask.count(True) else np.nan,
@@ -810,6 +832,8 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
     with_out_row = [name, stim_type, lbl, n_all,
                     float(np.mean(_np_ptp(segs_all[:, ptp_start_idx:ptp_end_idx], axis=1))),
                     float(np.std( _np_ptp(segs_all[:, ptp_start_idx:ptp_end_idx], axis=1))),
+                    float(mep_rms_all.mean()),
+                    float(mep_rms_all.std(ddof=1)) if len(mep_rms_all) > 1 else np.nan,
                     float(rms_all.mean()),    float(rms_all.std(ddof=1)),
                     float(preptp_all.mean()), float(preptp_all.std(ddof=1)),
                     mean_lat, std_lat, mean_sil, std_sil, mean_auc_a, std_auc_a]
@@ -915,14 +939,14 @@ def pipeline_compute_pooled_stats(ptps_per_stim, stim_times_per_stim,
             sdz = round(float(sess_det_z_by_type[st][ti]),    3)
             seg_ov, stim_t, tsl = overall_rank.get((st, ti), (None, None, None))
             for rows in (latency_rows_auto, latency_rows_manual):
-                rows[-abs_i][4]  = seg_ov  # Segment_Overall
-                rows[-abs_i][5]  = stim_t  # Stim_Time(s)
-                rows[-abs_i][6]  = tsl     # Time_Since_Last_Stim(s)
-                rows[-abs_i][20] = pz      # Z_PTP_Pooled
-                rows[-abs_i][21] = wdv     # PTP_Detrended_WithinCond(mV)
-                rows[-abs_i][22] = wdz     # PTP_Detrended_WithinCond_Z
-                rows[-abs_i][23] = sdv     # PTP_Detrended_Session(mV)
-                rows[-abs_i][24] = sdz     # PTP_Detrended_Session_Z
+                rows[-abs_i][_C_SEG_OV] = seg_ov
+                rows[-abs_i][_C_STIM_T] = stim_t
+                rows[-abs_i][_C_TSL]    = tsl
+                rows[-abs_i][_C_Z_POOL] = pz
+                rows[-abs_i][_C_DET_WC] = wdv
+                rows[-abs_i][_C_DET_WZ] = wdz
+                rows[-abs_i][_C_DET_SV] = sdv
+                rows[-abs_i][_C_DET_SZ] = sdz
         cum_off += n
 
 
@@ -955,6 +979,13 @@ def pipeline_bootstrap_comparisons(ptp_data, rms_data, preptp_data,
 
 
 # Trial-level CSV column definitions — module-level so all pipeline stages can reference it
+#
+# Rows are built as positional lists, so any code that writes a single field has
+# to know that field's index. Writing literal integers was the source of an
+# off-by-one that shifted Z_PTP_Pooled and all four detrended columns one place
+# left and left PTP_Detrended_Session_Z permanently empty. Every such write now
+# resolves its index from LAT_COLS by name (see the _C_* constants below), so
+# inserting or reordering a column can no longer silently corrupt the output.
 LAT_COLS = [
     # Identification
     "File", "StimType", "Stim_Label", "Segment",
@@ -963,7 +994,10 @@ LAT_COLS = [
     "Time_Since_Last_Stim(s)",   # ISI from previous stim (any type); blank for first stim
     "Limb", "Measure",
     # Core MEP metrics
-    "PTP(mV)", "Latency(ms)",
+    "PTP(mV)",
+    "MEP_RMS(mV)",          # RMS over the same window as PTP; integrates the
+                            # whole response rather than two extreme samples
+    "Latency(ms)",
     "cSP_Duration(ms)",     # duration MEP offset → EMG return
     "cSP_MEP_Offset(ms)",    # time of MEP offset (cSP onset) re: stim
     "cSP_EMG_Return(ms)",    # time of EMG return (cSP offset) re: stim
@@ -1007,6 +1041,21 @@ LAT_COLS = [
     "Units_Assumed",    # amplitude unit was not declared by the file
 ]
 
+# Column indices resolved by name. Any code writing a single field into a row
+# must use these rather than a literal, so the row layout and the writers can
+# never disagree again.
+_C_SEG_OV  = LAT_COLS.index("Segment_Overall")
+_C_STIM_T  = LAT_COLS.index("Stim_Time(s)")
+_C_TSL     = LAT_COLS.index("Time_Since_Last_Stim(s)")
+_C_PTP     = LAT_COLS.index("PTP(mV)")
+_C_MEP_RMS = LAT_COLS.index("MEP_RMS(mV)")
+_C_LAT     = LAT_COLS.index("Latency(ms)")
+_C_Z_POOL  = LAT_COLS.index("Z_PTP_Pooled")
+_C_DET_WC  = LAT_COLS.index("PTP_Detrended_WithinCond(mV)")
+_C_DET_WZ  = LAT_COLS.index("PTP_Detrended_WithinCond_Z")
+_C_DET_SV  = LAT_COLS.index("PTP_Detrended_Session(mV)")
+_C_DET_SZ  = LAT_COLS.index("PTP_Detrended_Session_Z")
+
 
 def _trials_frame(rows):
     """Build the trial-level DataFrame, padding rows to the LAT_COLS width.
@@ -1042,6 +1091,7 @@ def pipeline_write_outputs(latency_manual, results_out, bids_prefix):
         "N_Total", "N_Included", "N_Outliers",
         # Core MEP
         "Mean_PTP(mV)", "SD_PTP(mV)",
+        "Mean_MEP_RMS(mV)", "SD_MEP_RMS(mV)",
         "Mean_Latency(ms)", "SD_Latency(ms)",
         # cSP
         "Mean_cSP_Duration(ms)", "SD_cSP_Duration(ms)",
@@ -1128,6 +1178,7 @@ def pipeline_write_outputs(latency_manual, results_out, bids_prefix):
                     fname, st, lbl,
                     n_tot, n_inc, n_out,
                     _mn(_col(clean,"PTP(mV)")),         _sd(_col(clean,"PTP(mV)")),
+                    _mn(_col(clean,"MEP_RMS(mV)")),      _sd(_col(clean,"MEP_RMS(mV)")),
                     _mn(_col(clean,"Latency(ms)")),      _sd(_col(clean,"Latency(ms)")),
                     _mn(_col(clean,"cSP_Duration(ms)")), _sd(_col(clean,"cSP_Duration(ms)")),
                     _mn(_col(clean,"cSP_MEP_Offset(ms)")),_sd(_col(clean,"cSP_MEP_Offset(ms)")),
@@ -1242,7 +1293,7 @@ def pipeline_generate_plots(trace_stats, time_axis, segments_metadata,
 AVERAGED_COLS = [
     "File", "StimType", "Stim_Label", "Limb", "Measure",
     "N_Trials_Averaged",
-    "PTP(mV)", "Latency(ms)",
+    "PTP(mV)", "MEP_RMS(mV)", "Latency(ms)",
     "cSP_Duration(ms)", "cSP_MEP_Offset(ms)", "cSP_EMG_Return(ms)",
     "cSP_MEP_Ratio(ms/mV)",
     "AUC(mV*s)",
@@ -1329,7 +1380,13 @@ def pipeline_quantify_averaged(means, segments_metadata, fs, cfg,
                         - seg[_clamp(meta["ptp_min_idx"])])
         else:
             _e = min(ptp_e, L); _s = min(ptp_s, max(_e - 1, 0))
-            ptp = float(_np_ptp(seg[_s:_e])) if _e > _s else float("nan")
+            ptp = compute_ptp(seg, _s, _e) if _e > _s else float("nan")
+
+        # ── MEP RMS over the analysis window ─────────────────────────────
+        # Always the window, never the peak markers: RMS is a window statistic
+        # and a manual two-marker PTP override has no window equivalent.
+        _re = min(ptp_e, L); _rs = min(ptp_s, max(_re - 1, 0))
+        mep_rms = compute_rms(seg, _rs, _re) if _re > _rs else float("nan")
 
         # ── Latency / onset ──────────────────────────────────────────────
         onset_idx = None
@@ -1409,6 +1466,7 @@ def pipeline_quantify_averaged(means, segments_metadata, fs, cfg,
             "Limb": cfg.limb, "Measure": cfg.measure,
             "N_Trials_Averaged": n_clean,
             "PTP(mV)": round(ptp, 6) if not np.isnan(ptp) else None,
+            "MEP_RMS(mV)": round(mep_rms, 6) if not np.isnan(mep_rms) else None,
             "Latency(ms)": round(lat, 2) if lat is not None else "Not Detected",
             "cSP_Duration(ms)": csp_dur if csp_dur is not None else "Not Marked",
             "cSP_MEP_Offset(ms)": csp_off,

@@ -164,6 +164,11 @@ CONDITION_COLUMNS = [
     "File", "StimType", "Metric", "N_Trials_Total", "N_Trials_Used",
     "Mean", "SD", "Median", "Geometric_Mean",
     "CV(%)", "CV_Corrected(%)", "CV_Log(%)", "CV_Robust(%)",
+    "MAD_Raw", "MAD_Scaled", "IQR", "IQR_SD_Equivalent",
+    "IQR(%_of_median)", "IQR_CV(%)",
+    "Outliers_Removed_N", "CV_Outliers_Removed(%)", "CV_Change_When_Trimmed(%)",
+    "Jackknife_Max_Influence_On_CV(%)", "Jackknife_Most_Influential_Trial",
+    "Jackknife_Single_Trial_Dominates",
     "CV_CI_Lo(%)", "CV_CI_Hi(%)",
     "Mean_CI_Lo", "Mean_CI_Hi", "Mean_CI_Halfwidth(%)", "N_Trials_For_10pct_CI",
     "N_Extreme_Robust_Z", "Max_Abs_Robust_Z",
@@ -557,6 +562,8 @@ def run(context):
     trial_rows = []
     cond_rows = []
     tta_rows = []
+    sens_rows = []
+    jk_rows = []
     fig_jobs = []
     by_condition_values = {}
     corr_rows = []
@@ -593,6 +600,44 @@ def run(context):
                 cum[used] = res["cumulative_mean"]
             # RMSE family: typical error, and how much the AR model helps
             res.update(V.rmse_family(x, res.get("_ar")))
+
+            # The full dispersion family, so the conventional CV can be read
+            # against the robust alternatives rather than on its own.
+            res.update(V.dispersion_metrics(x))
+
+            # Does the answer depend on the outliers?
+            sens, sinfo = V.dispersion_sensitivity(x, robust_z_thresh=robust_z)
+            if len(sens):
+                st = sens.copy()
+                st.insert(0, "File", file_name)
+                st.insert(1, "StimType", stim_type)
+                st.insert(2, "Metric", metric)
+                st["N_Trials"] = sinfo.get("n_trials")
+                st["N_Removed"] = sinfo.get("n_removed")
+                sens_rows.append(st)
+                res["sens_n_removed"] = sinfo.get("n_removed")
+                cvrow = sens[sens["Dispersion_Metric"] == "CV(%)"]
+                if len(cvrow):
+                    res["sens_cv_trimmed"] = float(cvrow["Outliers_Removed"].iloc[0])
+                    res["sens_cv_change"] = float(cvrow["Change(%)"].iloc[0])
+
+            # Is the dispersion a property of the series, or of one trial?
+            jk, jinfo = V.jackknife_dispersion(x, robust_z_thresh=robust_z)
+            if len(jk):
+                jt = jk.copy()
+                jt.insert(0, "File", file_name)
+                jt.insert(1, "StimType", stim_type)
+                jt.insert(2, "Metric", metric)
+                jk_rows.append(jt)
+                res["jk_max_influence"] = jinfo.get("max_abs_influence")
+                res["jk_trial"] = jinfo.get("most_influential_trial")
+                res["jk_dominates"] = jinfo.get("single_trial_dominates")
+                if jinfo.get("single_trial_dominates"):
+                    log(f"{ADDON_NAME}: {stim_type} — trial "
+                        f"{jinfo['most_influential_trial']} alone moves the CV from "
+                        f"{jinfo['cv_percent']:.1f}% to "
+                        f"{jinfo['cv_without_most_influential']:.1f}%; the summary is "
+                        f"describing that trial as much as the series.")
 
             # Trials-to-average: computed on every run, and now actually written
             tta = V.trials_to_average_table(x, n_rep=1000)
@@ -636,6 +681,18 @@ def run(context):
                 "CV_Corrected(%)": res.get("cv_corrected_percent"),
                 "CV_Log(%)": res.get("cv_log_percent"),
                 "CV_Robust(%)": res.get("cv_robust_percent"),
+                "MAD_Raw": res.get("mad_raw"),
+                "MAD_Scaled": res.get("mad_scaled"),
+                "IQR": res.get("iqr"),
+                "IQR_SD_Equivalent": res.get("iqr_sd_equivalent"),
+                "IQR(%_of_median)": res.get("iqr_percent_of_median"),
+                "IQR_CV(%)": res.get("iqr_cv_percent"),
+                "Outliers_Removed_N": res.get("sens_n_removed"),
+                "CV_Outliers_Removed(%)": res.get("sens_cv_trimmed"),
+                "CV_Change_When_Trimmed(%)": res.get("sens_cv_change"),
+                "Jackknife_Max_Influence_On_CV(%)": res.get("jk_max_influence"),
+                "Jackknife_Most_Influential_Trial": res.get("jk_trial"),
+                "Jackknife_Single_Trial_Dominates": res.get("jk_dominates"),
                 "CV_CI_Lo(%)": res.get("cv_boot_lo_percent"),
                 "CV_CI_Hi(%)": res.get("cv_boot_hi_percent"),
                 "Mean_CI_Lo": res.get("ci_lo"),
@@ -735,6 +792,18 @@ def run(context):
                 verdict = ("differ" if omni["fligner_p"] < 0.05 else "do not differ")
                 log(f"{ADDON_NAME}: conditions {verdict} in spread "
                     f"(Fligner-Killeen p = {omni['fligner_p']:.4f}).")
+
+    if sens_rows:
+        sp = os.path.join(context.results_dir,
+                          f"{context.bids_prefix}_{ADDON_NAME}_sensitivity.csv")
+        pd.concat(sens_rows, ignore_index=True).to_csv(sp, index=False)
+        written.append(sp)
+
+    if jk_rows:
+        jp = os.path.join(context.results_dir,
+                          f"{context.bids_prefix}_{ADDON_NAME}_jackknife.csv")
+        pd.concat(jk_rows, ignore_index=True).to_csv(jp, index=False)
+        written.append(jp)
 
     if corr_rows:
         cor_path = os.path.join(context.results_dir,

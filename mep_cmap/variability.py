@@ -1592,3 +1592,325 @@ def pooled_trials_to_average(tables):
     out = out.join(g.quantile(0.75).add_suffix("_q75"))
     out["n_recordings"] = g.size()
     return out.reset_index()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The dispersion family, and how the choice between them matters
+# ─────────────────────────────────────────────────────────────────────────────
+def dispersion_metrics(x):
+    """Every common dispersion metric for one condition, side by side.
+
+    The coefficient of variation dominates the MEP literature, but it assumes
+    the mean is a sensible centre and the SD a sensible spread, which skewed
+    amplitudes with occasional very large trials do not honour. The robust
+    alternatives are reported alongside so the choice can be inspected rather
+    than assumed:
+
+      * SD and CV — the conventional pair
+      * MAD — median absolute deviation. Reported raw and scaled by 1.4826, the
+        factor that makes it estimate the same quantity as the SD under
+        normality, so the two are directly comparable
+      * IQR — reported raw, as a percentage of the median, and divided by 1.349,
+        which likewise puts it on an SD-equivalent scale
+      * log CV — from the SD of log amplitudes, correct when noise is
+        multiplicative
+
+    All the percentage forms share a denominator role (centre), so they can be
+    compared with each other directly; the absolute forms cannot, across
+    recordings of different amplitude.
+    """
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    out = {"n": int(x.size)}
+    if x.size < 3:
+        return out
+
+    m = float(np.mean(x))
+    med = float(np.median(x))
+    sd = float(np.std(x, ddof=1))
+    q75, q25 = np.percentile(x, [75, 25])
+    iqr = float(q75 - q25)
+    mad_raw = float(np.median(np.abs(x - med)))
+    mad_sc = 1.4826 * mad_raw
+
+    out.update({
+        "mean": m, "median": med,
+        "sd": sd,
+        "cv_percent": 100.0 * sd / m if m else np.nan,
+        "mad_raw": mad_raw,
+        "mad_scaled": mad_sc,
+        "mad_cv_percent": 100.0 * mad_sc / med if med else np.nan,
+        "iqr": iqr,
+        # 1.349 is the IQR of a standard normal, so IQR/1.349 is an SD-equivalent
+        "iqr_sd_equivalent": iqr / 1.349,
+        "iqr_percent_of_median": 100.0 * iqr / med if med else np.nan,
+        "iqr_cv_percent": 100.0 * (iqr / 1.349) / med if med else np.nan,
+    })
+    if np.all(x > 0):
+        s_ln = float(np.std(np.log(x), ddof=1))
+        out["log_cv_percent"] = 100.0 * np.sqrt(np.exp(s_ln ** 2) - 1.0)
+    return out
+
+
+def dispersion_sensitivity(x, robust_z_thresh=3.5):
+    """Each dispersion metric with all trials, and with outliers removed.
+
+    Answers "does my conclusion depend on the outliers" without running the
+    analysis twice and diffing it by hand. Trials are flagged by robust
+    (median/MAD) z, so an outlier cannot inflate the denominator that would
+    otherwise hide it.
+
+    A metric that barely moves is robust to the trimming by construction (the
+    MAD- and IQR-based ones usually are). A large shift in the CV while the
+    robust metrics hold still is the signature of a genuine outlier driving the
+    conventional estimate.
+    """
+    if pd is None:
+        raise RuntimeError("dispersion_sensitivity requires pandas.")
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    if x.size < 4:
+        return pd.DataFrame(), {}
+
+    med = float(np.median(x))
+    mad = mad_normal(x)
+    if mad and np.isfinite(mad) and mad > 0:
+        keep = np.abs((x - med) / mad) <= robust_z_thresh
+    else:
+        keep = np.ones(x.size, dtype=bool)
+    n_removed = int((~keep).sum())
+
+    full = dispersion_metrics(x)
+    trimmed = dispersion_metrics(x[keep]) if keep.sum() >= 3 else {}
+
+    rows = []
+    for key, label in (("sd", "SD"), ("cv_percent", "CV(%)"),
+                       ("mad_scaled", "MAD (scaled)"),
+                       ("mad_cv_percent", "Robust CV(%)"),
+                       ("iqr", "IQR"),
+                       ("iqr_cv_percent", "IQR CV(%)"),
+                       ("log_cv_percent", "Log CV(%)")):
+        a, b = full.get(key), trimmed.get(key)
+        if a is None:
+            continue
+        rows.append({
+            # Named Dispersion_Metric, not Metric: the add-ons add a column
+            # naming the measure being analysed, and two different meanings of
+            # "metric" in one table is a collision waiting to happen.
+            "Dispersion_Metric": label,
+            "All_Trials": a,
+            "Outliers_Removed": b,
+            "Change(%)": (100.0 * (b - a) / a
+                          if (b is not None and a not in (0, None)
+                              and np.isfinite(a) and np.isfinite(b) and a != 0)
+                          else np.nan),
+        })
+    info = {"n_trials": int(x.size), "n_removed": n_removed,
+            "robust_z_threshold": robust_z_thresh}
+    return pd.DataFrame(rows), info
+
+
+def jackknife_dispersion(x, robust_z_thresh=3.5):
+    """Leave-one-out influence of every trial on the dispersion estimate.
+
+    Recomputes the CV with each trial removed in turn. A recording whose
+    variability is a property of the whole series barely moves; one where a
+    single trial is doing the work shows a large jump when that trial goes.
+
+    The distinction matters before quoting a CV: 'this condition is variable'
+    and 'this condition contains one aberrant trial' call for different
+    responses, and the summary statistic cannot tell them apart on its own.
+    """
+    if pd is None:
+        raise RuntimeError("jackknife_dispersion requires pandas.")
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    n = x.size
+    if n < 5:
+        return pd.DataFrame(), {}
+
+    full_m = float(np.mean(x))
+    full_sd = float(np.std(x, ddof=1))
+    full_cv = 100.0 * full_sd / full_m if full_m else np.nan
+
+    total = x.sum()
+    loo_mean = (total - x) / (n - 1.0)
+    loo_cv = np.empty(n)
+    for i in range(n):
+        rest = np.delete(x, i)
+        sd = float(np.std(rest, ddof=1))
+        loo_cv[i] = 100.0 * sd / loo_mean[i] if loo_mean[i] else np.nan
+
+    influence = loo_cv - full_cv
+    med = float(np.median(x))
+    mad = mad_normal(x)
+    rz = (x - med) / mad if (mad and np.isfinite(mad) and mad > 0) else np.full(n, np.nan)
+
+    tbl = pd.DataFrame({
+        "Trial": np.arange(1, n + 1),
+        "Value": x,
+        "Robust_Z": rz,
+        "CV_Without_This_Trial(%)": loo_cv,
+        "Influence_On_CV(%)": influence,
+    })
+    finite = np.isfinite(influence)
+    info = {"cv_percent": full_cv, "n_trials": n}
+    if finite.any():
+        k = int(np.nanargmax(np.abs(influence)))
+        info.update({
+            "max_abs_influence": float(abs(influence[k])),
+            "most_influential_trial": int(k + 1),
+            "most_influential_value": float(x[k]),
+            "cv_without_most_influential": float(loo_cv[k]),
+            # A single trial moving the CV by more than a fifth of its own value
+            # means the summary is describing that trial as much as the series.
+            "single_trial_dominates": bool(
+                np.isfinite(full_cv) and full_cv > 0
+                and abs(influence[k]) / full_cv > 0.20),
+        })
+    return tbl, info
+
+
+def mean_variance_scaling(records):
+    """Does noise scale with amplitude, and therefore should analysis be logged?
+
+    Regresses log(SD) on log(mean) across recordings. The slope says how the
+    spread grows with the size of the response:
+
+      * slope near 0 — additive noise. The SD is constant across amplitudes, so
+        the SD is the right summary and the CV will look artificially large for
+        low-amplitude recordings.
+      * slope near 1 — multiplicative noise. The SD is proportional to the mean,
+        so the CV is constant and is the right summary; the log scale is the
+        natural one to analyse on.
+      * slope near 0.5 — variance proportional to the mean, the Poisson-like
+        case, where a square-root transform stabilises the variance.
+
+    This turns "raw or transformed?" from a matter of preference into a
+    measurement. It needs several recordings spanning a range of amplitudes;
+    with few recordings, or all of similar amplitude, the slope is not
+    identifiable and the confidence interval will say so.
+    """
+    _require_scipy("scipy.stats")
+    means, sds = [], []
+    for r in records:
+        x = np.asarray(r["x"], float)
+        x = x[np.isfinite(x)]
+        if x.size < 3:
+            continue
+        m = float(np.mean(x))
+        sd = float(np.std(x, ddof=1))
+        if m > 0 and sd > 0:
+            means.append(m)
+            sds.append(sd)
+    means = np.asarray(means, float)
+    sds = np.asarray(sds, float)
+    out = {"n_recordings": int(means.size), "means": means, "sds": sds}
+    if means.size < 4:
+        out["error"] = ("at least 4 recordings with positive mean and spread "
+                        "are needed to estimate the scaling")
+        return out
+
+    lm, ls = np.log(means), np.log(sds)
+    lr = _safe_linregress(lm, ls)
+    slope = lr["slope"]
+    out.update({
+        "slope": slope, "slope_se": lr["stderr"],
+        "intercept": lr["intercept"],
+        "r_squared": lr["rvalue"] ** 2 if np.isfinite(lr["rvalue"]) else np.nan,
+        "p_value": lr["pvalue"],
+    })
+    if np.isfinite(slope) and np.isfinite(lr["stderr"]):
+        tcrit = float(_st.t.ppf(0.975, max(means.size - 2, 1)))
+        out["slope_ci_lo"] = slope - tcrit * lr["stderr"]
+        out["slope_ci_hi"] = slope + tcrit * lr["stderr"]
+        lo, hi = out["slope_ci_lo"], out["slope_ci_hi"]
+        # Read from the interval, not the point estimate: a slope of 0.7 with an
+        # interval spanning 0 to 1.4 distinguishes nothing.
+        if lo <= 0 <= hi and lo <= 1 <= hi:
+            verdict = ("indeterminate: the interval covers both additive and "
+                       "multiplicative noise, so this dataset cannot tell them "
+                       "apart")
+        elif hi < 0.5:
+            verdict = ("closer to additive: spread is roughly constant across "
+                       "amplitudes, so the SD is the more meaningful summary "
+                       "and the CV will overstate variability in low-amplitude "
+                       "recordings")
+        elif lo > 0.75:
+            verdict = ("multiplicative: spread grows in proportion to amplitude, "
+                       "so the CV is the appropriate summary and the log scale "
+                       "is the natural one to analyse on")
+        else:
+            verdict = ("intermediate, near the variance-proportional-to-mean "
+                       "case; a square-root transform is the variance-stabilising "
+                       "one here")
+        out["interpretation"] = verdict
+        # Is the CV actually constant, which is what quoting one assumes?
+        cvs = 100.0 * sds / means
+        cv_lr = _safe_linregress(lm, cvs)
+        out["cv_vs_mean_slope"] = cv_lr["slope"]
+        out["cv_vs_mean_p"] = cv_lr["pvalue"]
+    return out
+
+
+def compare_dispersion_metrics(records, labels=None):
+    """Do the dispersion metrics rank recordings the same way?
+
+    Computes every metric for every recording, then asks whether the choice of
+    metric changes the conclusion or merely rescales it. Spearman correlation
+    is the relevant comparison: if two metrics rank recordings identically,
+    choosing between them is a matter of convention, and if they do not, the
+    choice is a finding that needs justifying.
+
+    The comparison is made among the percentage forms, which share a centre in
+    their denominator and are therefore on a common scale; absolute forms are
+    not comparable across recordings of differing amplitude.
+    """
+    if pd is None:
+        raise RuntimeError("compare_dispersion_metrics requires pandas.")
+    _require_scipy("scipy.stats")
+
+    rows = []
+    for i, r in enumerate(records):
+        d = dispersion_metrics(r["x"])
+        if d.get("n", 0) < 3:
+            continue
+        row = {"Recording": (labels[i] if labels and i < len(labels)
+                             else r.get("file") or r.get("target") or f"rec{i + 1}")}
+        row.update({k: v for k, v in d.items() if k != "n"})
+        rows.append(row)
+    per_rec = pd.DataFrame(rows)
+    if len(per_rec) < 4:
+        return per_rec, pd.DataFrame()
+
+    compare = [("cv_percent", "CV(%)"),
+               ("mad_cv_percent", "Robust CV(%)"),
+               ("iqr_cv_percent", "IQR CV(%)"),
+               ("log_cv_percent", "Log CV(%)")]
+    compare = [(k, lab) for k, lab in compare if k in per_rec.columns]
+
+    pairs = []
+    for i in range(len(compare)):
+        for j in range(i + 1, len(compare)):
+            ka, la = compare[i]
+            kb, lb = compare[j]
+            a = per_rec[ka].to_numpy(float)
+            b = per_rec[kb].to_numpy(float)
+            ok = np.isfinite(a) & np.isfinite(b)
+            if ok.sum() < 4 or np.ptp(a[ok]) == 0 or np.ptp(b[ok]) == 0:
+                continue
+            rho, rho_p = _safe_test(_st.spearmanr, a[ok], b[ok])
+            d = a[ok] - b[ok]
+            pairs.append({
+                "Metric_A": la, "Metric_B": lb, "N_Recordings": int(ok.sum()),
+                "Median_A": float(np.median(a[ok])),
+                "Median_B": float(np.median(b[ok])),
+                "Spearman_rho": rho, "Spearman_p": rho_p,
+                "Mean_Difference": float(np.mean(d)),
+                "LoA_Lower": float(np.mean(d) - 1.96 * np.std(d, ddof=1)),
+                "LoA_Upper": float(np.mean(d) + 1.96 * np.std(d, ddof=1)),
+                # Ranking preserved means the choice is cosmetic; not preserved
+                # means it changes which recordings look most variable.
+                "Ranking_Preserved": bool(np.isfinite(rho) and rho >= 0.9),
+            })
+    return per_rec, pd.DataFrame(pairs)

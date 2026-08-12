@@ -193,6 +193,53 @@ def _read_design_factors(results_dir, log):
         return []
 
 
+# Identifier and bookkeeping columns, and the prefixes of measurement blocks the
+# pipeline and add-ons write. None of these is a study-design factor.
+_NOT_A_FACTOR = {
+    "File", "participant_id", "session", "task", "StimType", "Stim_Label",
+    "Stim_Role", "Segment", "Segment_Overall", "Trial", "Outlier_Decision",
+    "Limb", "Measure", "Manual_Note", "_target", "Clipped", "Units_Assumed",
+}
+_METRIC_PREFIXES = ("EMGComp_", "Var_", "Reference_", "Normalised_", "Z_",
+                    "PTP_", "cSP_", "Adjusted_", "MEP_", "PreStim_")
+
+
+def _infer_design_factors(df, candidates):
+    """Guess which columns are study-design factors, when no design file exists.
+
+    The group loader labels every non-numeric column a design column, which
+    sweeps up measurements that merely contain a sentinel string: `Latency(ms)`
+    holds 'Not Detected', `cSP_Duration(ms)` holds 'Not Marked'. Treating those
+    as factors produced nonsense such as latency being reported as a
+    repeated-measures axis.
+
+    A real factor is categorical, has a handful of levels, and is not a
+    measurement. Columns that are mostly numeric once coerced, carry a unit in
+    their name, or belong to a known measurement block are rejected.
+
+    This is a fallback. When study_design.json exists its factor list is used
+    verbatim and none of this guessing happens.
+    """
+    out = []
+    for c in candidates:
+        if c in _NOT_A_FACTOR or c.startswith(_METRIC_PREFIXES):
+            continue
+        if "(" in c and ")" in c:          # a unit in the name means a measurement
+            continue
+        if c not in df.columns:
+            continue
+        col = df[c]
+        # Mostly coercible to numbers means it is a measurement carrying
+        # sentinel strings, not a categorical factor.
+        if pd.to_numeric(col, errors="coerce").notna().mean() > 0.5:
+            continue
+        n_levels = col.dropna().nunique()
+        if not (2 <= n_levels <= 20):      # constants split nothing; IDs are not factors
+            continue
+        out.append(c)
+    return out
+
+
 def _resolve_metric(df, requested, log):
     if requested in df.columns:
         return requested
@@ -331,6 +378,16 @@ def _analyse_stratum(records, df_stratum, within_factor, session_col):
         out["typical_error_pct_q25"] = float(np.percentile(tes, 25))
         out["typical_error_pct_q75"] = float(np.percentile(tes, 75))
     out["pooled_trials"] = V.pooled_trials_to_average(ttas)
+
+    # Does noise scale with amplitude, and therefore should the analysis be
+    # done on the log scale? Measured rather than assumed.
+    out["scaling"] = V.mean_variance_scaling(records)
+
+    # Does the choice of dispersion metric change which recordings look most
+    # variable, or only rescale them?
+    labels = [_recording_label(r) for r in records]
+    out["metric_table"], out["metric_pairs"] = V.compare_dispersion_metrics(
+        records, labels=labels)
 
     if out["n_targets"] < MIN_TARGETS:
         out["skipped"] = (f"only {out['n_targets']} target(s); at least "
@@ -700,6 +757,39 @@ def _report_stratum(L, res, metric, label):
                     f"(ceiling {_fmt(res.get('ceiling_1_session'), 3)}); more")
                 add("      sessions are needed, not more stimuli")
 
+    sc = res.get("scaling") or {}
+    if "error" in sc:
+        add("")
+        add(f"  Noise scaling with amplitude: {sc['error']}")
+    elif sc.get("slope") is not None:
+        add("")
+        add("  Does noise scale with amplitude (raw or log scale?)")
+        add(f"    log(SD) on log(mean) slope  {_fmt(sc.get('slope'), 3)} "
+            f"[{_fmt(sc.get('slope_ci_lo'), 3)}, {_fmt(sc.get('slope_ci_hi'), 3)}]"
+            f", R2 = {_fmt(sc.get('r_squared'), 3)}")
+        add("    0 = additive (SD constant), 1 = multiplicative (CV constant),")
+        add("    0.5 = variance proportional to the mean")
+        for line in _wrap(str(sc.get("interpretation", "")), 68):
+            add("    " + line)
+        if sc.get("cv_vs_mean_p") is not None:
+            add(f"    CV against amplitude: slope "
+                f"{_fmt(sc.get('cv_vs_mean_slope'), 2)} per log unit, "
+                f"p = {_fmt(sc.get('cv_vs_mean_p'), 4)}")
+
+    mp = res.get("metric_pairs")
+    if mp is not None and len(mp):
+        add("")
+        add("  Do the dispersion metrics agree with each other?")
+        add("    metric A       vs metric B        rho   medians        ranking")
+        for _, r in mp.iterrows():
+            add("    %-14s vs %-14s %5s  %5s / %-5s  %s" % (
+                r["Metric_A"], r["Metric_B"], _fmt(r["Spearman_rho"], 2),
+                _fmt(r["Median_A"], 1), _fmt(r["Median_B"], 1),
+                "preserved" if r["Ranking_Preserved"] else "CHANGED"))
+        if not bool(mp["Ranking_Preserved"].all()):
+            add("    At least one pair ranks recordings differently, so the choice")
+            add("    of metric is a finding to justify rather than a convention.")
+
     pt = res.get("pooled_trials")
     if pt is not None and len(pt) and "loa_width_pct_of_mean_median" in pt.columns:
         add("")
@@ -779,6 +869,11 @@ def _flatten_row(stim_type, metric, factor, level, res):
         "Spread_Fligner_p": (res.get("spread") or {}).get("fligner_p"),
         "N_Atypical_CV_Recordings": (res.get("spread") or {}).get("n_atypical_cv"),
         "Typical_Error_Median(%)": res.get("typical_error_pct_median"),
+        "Noise_Scaling_Slope": (res.get("scaling") or {}).get("slope"),
+        "Noise_Scaling_Slope_Lo": (res.get("scaling") or {}).get("slope_ci_lo"),
+        "Noise_Scaling_Slope_Hi": (res.get("scaling") or {}).get("slope_ci_hi"),
+        "Noise_Scaling_R2": (res.get("scaling") or {}).get("r_squared"),
+        "Noise_Scaling_Verdict": (res.get("scaling") or {}).get("interpretation"),
         "R1_Median": (res.get("serial") or {}).get("r1_median"),
         "R1_Mean_Fisher": (res.get("serial") or {}).get("r1_mean_fisher"),
         "R1_p": (res.get("serial") or {}).get("r1_p"),
@@ -865,23 +960,55 @@ def run(context):
         return []
 
     # Target: two limbs of one participant are two corticospinal pathways.
+    #
+    # Built defensively because a blank Limb is common — BIDS-ified data often
+    # leaves it empty. Concatenating a missing value produces NaN for the whole
+    # target, and groupby silently drops NaN keys, so every recording would
+    # disappear and the add-on would report nothing at all rather than failing.
+    _subject = work[part_col].astype(str).str.strip().fillna("")
+    _subject = _subject.replace({"nan": "", "None": "", "<NA>": "", "NaN": ""})
+    target_desc = "participant"
     if icc_target == "subject_limb" and "Limb" in work.columns:
-        work["_target"] = (work[part_col].astype(str) + "_"
-                           + work["Limb"].astype(str))
-        target_desc = "participant and limb"
+        # fillna first: .str.strip() leaves pandas NA as NA rather than a
+        # string, so a dict replace never sees it and the blank goes undetected.
+        _limb = (work["Limb"].astype(str).str.strip().fillna("")
+                 .replace({"nan": "", "None": "", "<NA>": "", "NaN": ""}))
+        n_blank = int((_limb == "").sum())
+        if n_blank == len(_limb):
+            work["_target"] = _subject
+            log(f"{ADDON_NAME}: no Limb recorded, so each participant is one "
+                f"target (the 'subject_limb' setting has nothing to separate).")
+        else:
+            work["_target"] = np.where(_limb.eq(""), _subject,
+                                       _subject + "_" + _limb)
+            target_desc = "participant and limb"
+            if n_blank:
+                log(f"{ADDON_NAME}: {n_blank} row(s) have no Limb; those "
+                    f"participants are treated as a single target.")
     else:
-        work["_target"] = work[part_col].astype(str)
-        target_desc = "participant"
+        work["_target"] = _subject
     target_col = "_target"
+
+    if work["_target"].isna().any() or (work["_target"] == "").any():
+        log(f"{ADDON_NAME}: some rows have no participant identifier and were "
+            f"dropped.")
+        work = work[work["_target"].notna() & (work["_target"] != "")]
+        if work.empty:
+            log(f"{ADDON_NAME}: no rows left after dropping unidentified "
+                f"recordings.")
+            return []
 
     # Which design factors exist, and how each may be used
     factors = _read_design_factors(context.results_dir, log)
     if not factors:
-        known = {"File", "participant_id", "session", "task", "StimType", "Stim_Label",
-                 "Stim_Role", "Segment", "Segment_Overall", "Trial",
-                 "Outlier_Decision", "Limb", "_target"}
-        factors = [c for c in getattr(context, "design_columns", []) or []
-                   if c not in known]
+        factors = _infer_design_factors(work,
+                                        getattr(context, "design_columns", []) or [])
+        if factors:
+            log(f"{ADDON_NAME}: inferred design factor(s): {', '.join(factors)}.")
+        else:
+            log(f"{ADDON_NAME}: no usable design factors found, so results are "
+                f"not split. Assign factors in Second Level > Group Analysis and "
+                f"save the design to enable splitting.")
     roles = V.classify_design_factors(work, factors, target_col=target_col,
                                       session_col=session_col)
     between = [f for f, i in roles.items() if i.get("role") == "between_target"]
@@ -919,6 +1046,7 @@ def run(context):
 
     # ── analyse ─────────────────────────────────────────────────────────────
     summary_rows, rel_rows, rec_rows, fig_jobs, pooled_rows = [], [], [], [], []
+    metric_rows, metric_pair_rows = [], []
     L = []
     L.append("=" * 78)
     L.append(f"GROUP VARIABILITY AND RELIABILITY   metric: {metric}")
@@ -962,6 +1090,21 @@ def run(context):
                 r.insert(2, "Stratum_Level", level)
                 rel_rows.append(r)
 
+            mt = res.get("metric_table")
+            if mt is not None and len(mt):
+                mt = mt.copy()
+                mt.insert(0, "StimType", stim_type)
+                mt.insert(1, "Stratum_Factor", factor)
+                mt.insert(2, "Stratum_Level", level)
+                metric_rows.append(mt)
+            mpr = res.get("metric_pairs")
+            if mpr is not None and len(mpr):
+                mpr = mpr.copy()
+                mpr.insert(0, "StimType", stim_type)
+                mpr.insert(1, "Stratum_Factor", factor)
+                mpr.insert(2, "Stratum_Level", level)
+                metric_pair_rows.append(mpr)
+
             pt = res.get("pooled_trials")
             if pt is not None and len(pt):
                 pt = pt.copy()
@@ -995,6 +1138,16 @@ def run(context):
             base + "_reliability.csv", index=False)
         written.append(base + "_reliability.csv")
 
+    if metric_rows:
+        pd.concat(metric_rows, ignore_index=True).to_csv(
+            base + "_dispersion_by_recording.csv", index=False)
+        written.append(base + "_dispersion_by_recording.csv")
+
+    if metric_pair_rows:
+        pd.concat(metric_pair_rows, ignore_index=True).to_csv(
+            base + "_dispersion_metric_agreement.csv", index=False)
+        written.append(base + "_dispersion_metric_agreement.csv")
+
     if pooled_rows:
         pd.concat(pooled_rows, ignore_index=True).to_csv(
             base + "_trials_to_average.csv", index=False)
@@ -1019,26 +1172,57 @@ def run(context):
     log(f"{ADDON_NAME}: {len(summary_rows)} stratum row(s) -> "
         f"{os.path.basename(base)}.csv and report")
 
+    if want_figs and not fig_jobs:
+        log(f"{ADDON_NAME}: no figure written — every stratum was too small to "
+            f"decompose (at least {MIN_TARGETS} targets are needed, and this "
+            f"dataset has "
+            f"{work[target_col].nunique()}). Process more recordings, or set "
+            f"'Reliability target' to 'subject' if limbs were split.")
+
     if want_figs and fig_jobs:
+        # Each figure and each caption is guarded separately. Wrapping the whole
+        # loop in one try meant a single failure silently cost every later
+        # figure as well, and left a stray PNG with no caption beside it.
+        fig_dir = None
         try:
             import matplotlib
             matplotlib.use("Agg")
-            fig_root = context.figures_dir or os.path.join(context.results_dir, "figures")
-            fig_dir = os.path.join(fig_root, f"{context.bids_prefix}_{ADDON_NAME}_figures")
+            fig_root = context.figures_dir or os.path.join(context.results_dir,
+                                                           "figures")
+            fig_dir = os.path.join(fig_root,
+                                   f"{context.bids_prefix}_{ADDON_NAME}_figures")
             os.makedirs(fig_dir, exist_ok=True)
+        except Exception as ex:
+            log(f"{ADDON_NAME}: could not prepare the figures folder ({ex}); "
+                f"figures and captions skipped.")
+            fig_dir = None
+
+        n_png = n_cap = 0
+        if fig_dir:
             for res, stim_type in fig_jobs:
                 png = os.path.join(fig_dir, f"{context.bids_prefix}_stim-{stim_type}"
                                             f"_{ADDON_NAME}.png")
-                _plot_stratum(res, metric, stim_type, png)
-                written.append(png)
+                try:
+                    _plot_stratum(res, metric, stim_type, png)
+                    written.append(png)
+                    n_png += 1
+                except Exception as ex:
+                    log(f"{ADDON_NAME}: figure for {stim_type} skipped "
+                        f"({type(ex).__name__}: {ex})")
+
                 cap_path = png[:-4] + "_caption.txt"
-                with open(cap_path, "w", encoding="utf-8") as fh:
-                    fh.write(_caption_stratum(res, metric, stim_type,
-                                              context.bids_prefix))
-                written.append(cap_path)
-            log(f"{ADDON_NAME}: {len(fig_jobs)} figure(s) with captions -> "
+                try:
+                    text = _caption_stratum(res, metric, stim_type,
+                                            context.bids_prefix)
+                    with open(cap_path, "w", encoding="utf-8") as fh:
+                        fh.write(text)
+                    written.append(cap_path)
+                    n_cap += 1
+                except Exception as ex:
+                    log(f"{ADDON_NAME}: caption for {stim_type} skipped "
+                        f"({type(ex).__name__}: {ex})")
+
+            log(f"{ADDON_NAME}: {n_png} figure(s) and {n_cap} caption(s) -> "
                 f"{os.path.basename(fig_dir)}/")
-        except Exception as ex:
-            log(f"{ADDON_NAME}: figure generation skipped ({ex})")
 
     return written

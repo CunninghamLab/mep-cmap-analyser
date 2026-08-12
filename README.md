@@ -31,9 +31,50 @@ The tool is not limited to any single measure or paradigm. It handles motor evok
 
 ---
 
-## What's New in 1.3.1
+## What's New in 1.3.2
 
+> **Important: reprocess existing derivatives.** This release fixes a
+> column-alignment fault that affected every trial-level CSV written by earlier
+> versions. Six columns held the wrong measurement and one was always empty. Any
+> analysis that used the detrended amplitudes or the pooled z-score should be
+> re-run after reprocessing. Peak-to-peak amplitude, latency, AUC, cSP measures
+> and the raw waveforms were never affected.
+
+* **Fixed: trial-level columns were shifted by one place.** The per-trial rows
+  are built as positional lists, and the code that filled the z-score and
+  detrended fields addressed them by literal index. Those literals were one
+  lower than the column they named, so `Z_PTP_Pooled` received the detrended
+  amplitude in millivolts, `PTP_Detrended_WithinCond(mV)` received a z-score,
+  `PTP_Detrended_WithinCond_Z` received the session-detrended amplitude,
+  `PTP_Detrended_Session(mV)` received a z-score, `PTP_Detrended_Session_Z` was
+  never written at all, and `Z_PreStimRMS` was overwritten with the
+  within-condition PTP z-score. The shift is easy to spot in an affected file:
+  columns labelled `(mV)` hold values on a z-score scale and vice versa. Every
+  such write now resolves its position from the column list by name, so the
+  layout and the writers cannot disagree again.
+* **New measure: MEP RMS.** Root-mean-square amplitude over the same window as
+  peak-to-peak, written as `MEP_RMS(mV)` with matching summary columns.
+  Peak-to-peak is determined by two extreme samples and is therefore sensitive
+  to a single spike, while RMS integrates the whole response, so a broad
+  low-amplitude MEP and a narrow spiky one of equal peak-to-peak amplitude are
+  no longer indistinguishable.
+* **Fixed: two definitions of pre-stimulus RMS.** `detection.quantification`
+  is documented as the single source of truth for scalar trial metrics, but
+  nothing in the codebase actually called it, and its `compute_prestim_rms` did
+  not remove the DC offset while the pipeline's own version did. The two
+  disagreed by around ten percent on a segment carrying a modest offset, so an
+  add-on that followed the documentation got a value that silently contradicted
+  the `PreStimRMS` column. `compute_prestim_rms` now takes `demean=True`,
+  matching the pipeline and therefore the CSV, and the pipeline delegates to it
+  so there is one implementation. The per-trial PTP, RMS and AUC that reach the
+  trial CSV are now computed through these shared functions as well. Trial
+  values are unchanged; only the standalone helper's default moved, and it moved
+  onto the correct value. `compute_rms` is exported alongside the others.
 * **Variability and reliability add-ons** — two new built-in add-ons quantifying how much a measure varies from trial to trial, and what that means for study design. **variability** (first level) reports the coefficient of variation four ways with confidence intervals, robust and log-scale z scores, the precision of a condition mean and how many trials would tighten it, autoregressive structure and within-session drift, single-trial limits of agreement, the typical error and RMSE family, contrasts between conditions, and correlations among trial-level measures. **variability_group** (second level) decomposes variance into between-participant, between-session, and trial-level components, then turns that into the reliability, SEM, and MDC95 of a measurement averaged over any number of trials and sessions.
+* **The dispersion family, not just the CV** — MAD and IQR are reported alongside the coefficient of variation, each scaled so all three estimate the same quantity under normality and can be read against one another. Skewed amplitudes with occasional very large trials do not honour the assumptions the CV rests on, so the robust alternatives are there to be compared rather than assumed away.
+* **Raw or log scale, measured rather than assumed** — the group add-on regresses log(SD) on log(mean) across recordings. A slope near zero means additive noise and the SD is the meaningful summary; a slope near one means noise scales with amplitude, so the CV is appropriate and the log scale is the natural one to analyse on. The verdict is read off the confidence interval, and reports honestly when the dataset cannot distinguish the two.
+* **Does the answer depend on the outliers, or on one trial?** — every dispersion metric is reported with and without robust-z outliers, side by side with the percentage change, and a leave-one-out jackknife shows how far each single trial moves the estimate. A CV that collapses when one trial is dropped is describing that trial as much as the series, which a summary statistic cannot reveal on its own.
+* **Do the metrics agree?** — the group add-on ranks recordings by each dispersion metric and reports whether the ranking survives the choice. If it does, the choice is a convention; if it does not, it is a finding that needs justifying.
 * **Reliability separated from change** — the group add-on reads your Second Level design and classifies each factor by whether it varies within a participant. Between-participant factors (group, arm) can be split on, so between-session reliability survives inside each stratum; within-participant factors (timepoint) label the session axis instead, because splitting on one would leave a single session per participant. A session pair straddling an intervention is reported as measuring **change**, not test-retest reliability, since its limits reflect measurement error plus whatever really changed.
 * **Figure captions** — figures now save a plain-language caption beside them, filled with that recording's own numbers, explaining what each panel shows and flagging traps only when the data triggers them (a drift that inflates the CV, or a typical error inflated by trial-to-trial alternation).
 * **Dropdown settings for add-ons** — `ADDON_SETTINGS` gained `choices` and `choices_from`. A measure to analyse is chosen from a list read from the columns your dataset actually contains rather than typed by hand, and settings declared `"type": "bool"` render as a checkbox instead of a text box expecting the word `True`.
@@ -162,6 +203,7 @@ New formats are easy to add: a single `formats/<name>.py` module with three publ
 |Measure|Description|
 |-|-|
 |**PTP amplitude (mV)**|Peak-to-peak amplitude within the user-specified MEP/CMAP window|
+|**MEP RMS (mV)**|Root-mean-square amplitude over the same window as PTP — integrates the whole response rather than two extreme samples|
 |**Onset latency (ms)**|MEP onset relative to stimulus (see onset detection methods)|
 |**AUC (mV·s)**|Area under the rectified EMG from onset to cSP start (or a user-defined window via drag selector)|
 |**cSP duration (ms)**|Cortical silent period, from EMG suppression onset to EMG return|
@@ -428,7 +470,7 @@ excitability-compensation block when that option is run.
 |`Segment`, `Segment_Overall`|Trial index within the condition, and chronological index across all conditions|
 |`Stim_Time(s)`, `Time_Since_Last_Stim(s)`|Absolute stimulus time and inter-stimulus interval|
 |`Limb`|Limb identifier (from filename or entered)|
-|`PTP(mV)`, `Latency(ms)`, `AUC(mV*s)`|Core response: peak-to-peak amplitude, onset latency (`Not Marked` when unresolved), and area under the rectified EMG|
+|`PTP(mV)`, `MEP_RMS(mV)`, `Latency(ms)`, `AUC(mV*s)`|Core response: peak-to-peak amplitude, RMS over the same window, onset latency (`Not Marked` when unresolved), and area under the rectified EMG. `MEP_RMS(mV)` is a window statistic, so a manual peak-marker adjustment in the Inspector changes `PTP(mV)` but not the RMS|
 |`Measure`|Optional auxiliary / manual measurement (blank unless used)|
 |`cSP_Duration(ms)`, `cSP_MEP_Offset(ms)`, `cSP_EMG_Return(ms)`, `cSP_MEP_Ratio(ms/mV)`|Silent-period duration (`Not Marked` when absent), stimulus→cSP-start, stimulus→EMG-return, and cSP ÷ PTP ratio (Orth & Rothwell, 2004 [5])|
 |`PreStimRMS`, `PreStimPTP`, `PTP_per_PreStimRMS`, `Z_PreStimRMS`|Pre-stimulus baseline EMG: RMS, peak-to-peak, PTP-per-RMS, and standardised RMS|
@@ -539,6 +581,27 @@ ADDON_SETTINGS = [
 ```
 
 An unrecognised `type` falls back to a plain text box, so an add-on written for a newer version still loads on an older build.
+
+### Computing the same measurements the pipeline does
+
+Add-ons and external scripts should quantify amplitudes through the shared
+helpers rather than reimplementing them, so their numbers agree with the trial
+CSVs:
+
+```python
+from mep_cmap.detection import (compute_ptp, compute_rms, compute_auc,
+                                compute_prestim_rms, compute_prestim_ptp)
+
+ptp = compute_ptp(segment, start_idx, end_idx)      # peak-to-peak in a window
+rms = compute_rms(segment, start_idx, end_idx)      # RMS over the same window
+auc = compute_auc(segment, onset_idx, end_idx, fs)  # area under rectified EMG
+base = compute_prestim_rms(prestim_segment)          # DC offset removed
+```
+
+`compute_prestim_rms` removes the DC offset by default, which is what the
+`PreStimRMS` column contains and what the Carson (2026) compensation expects.
+Pass `demean=False` only if the raw, offset-inclusive r.m.s. is specifically
+what you want.
 
 ### Getting per-trial results into the group table
 

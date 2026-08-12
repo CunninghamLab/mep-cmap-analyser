@@ -14,7 +14,7 @@ onset_peak_fraction  : peak-fraction + slope backtracking onset detector
 onset_bootstrap      : bootstrap peak-anchored backward scan onset detector
 onset_bigoni         : derivative-based onset detector (Bigoni et al. 2022)
 csp_detection        : cortical silent period bootstrap detector
-quantification       : PTP, AUC, pre-stim RMS/PTP scalar metrics
+quantification       : PTP, RMS, AUC, pre-stim RMS/PTP scalar metrics
 
 Dispatcher
 ----------
@@ -40,6 +40,7 @@ from .csp_detection import detect_csp_bootstrap                      # noqa: F40
 
 from .quantification import (                                         # noqa: F401
     compute_ptp,
+    compute_rms,
     compute_auc,
     compute_prestim_rms,
     compute_prestim_ptp,

@@ -1,6 +1,6 @@
 # MEP-CMAP Analyser
 
-**Version 1.3.2 | August 2026**  
+**Version 1.3.3 | August 2026**  
 *Author:* [*Justin Andrushko PhD, Northumbria University*](https://researchportal.northumbria.ac.uk/en/persons/justin-w-andrushko/)
 
 *Collaborators:* [*David Cunningham PhD*](https://fescenter.org/team/investigators/cunningham-david-phd/) *(*[*TMS Analysis ToolBox*](https://github.com/CunninghamLab/TMSAnalysisToolBox)*) ·* [*Nicholas Holmes PhD*](https://www.birmingham.ac.uk/staff/profiles/sportex/holmes-nick) *·* [*TMSMultiLab*](https://github.com/TMSMultiLab/TMSMultiLab/wiki)
@@ -28,6 +28,75 @@ MEP-CMAP Analyser is a GUI pipeline for EMG data collected with transcranial mag
 Every setting, decision, and manual edit is saved in a sidecar JSON so analyses are fully reproducible and can be re-run or audited at any time.
 
 The tool is not limited to any single measure or paradigm. It handles motor evoked potentials (MEPs), compound muscle action potentials (CMAPs), cortical silent periods (cSPs), M-wave recruitment curves, paired-pulse protocols such as SICI and ICF, and any other time-locked EMG response measurable by peak-to-peak amplitude, onset latency, or area under the curve. It operates on continuous recordings, pre-epoched trial stacks, and EMG bursts recorded without stimulation.
+
+---
+
+## What's New in 1.3.3
+
+> **Important: reprocess if you use onset latency or AUC.** This release fixes
+> two faults that silently produced plausible-looking wrong numbers rather than
+> failing. Onset latencies were clipped by the amplitude-measurement window, and
+> MEP offset (and therefore AUC at rest) frequently failed to detect at all.
+> Amplitude, cSP and normalisation measures are unaffected.
+
+**Onset detection no longer depends on the amplitude window.** The onset search
+window was taken from the PTP window, which is a single per-file setting, while
+the latency profile is per stimulus type. A stimulus type whose profile began
+before the PTP window start had its onsets pinned to the window edge — measured
+on a deltoid-like case with a true onset of 8.9 ms, a profile of 8–16 ms and the
+default 10–50 ms window, every trial returned exactly 10.00 ms with a
+between-trial SD of zero. Implausibly consistent latencies are the signature,
+which makes this considerably more dangerous than a detector that returns
+nothing. The search window is now derived from the latency profile, widened by
+the PTP window, and the log warns whenever onsets collapse onto a search bound.
+
+**Four new onset detection methods**, bringing the total to seven: an RMS
+envelope detector with SD-scaled threshold, a CUSUM change-point detector,
+optional Teager–Kaiser preconditioning, and a consensus method that takes the
+median across several detectors. See [MEP Onset Detection](#mep-onset-detection).
+
+**MEP offset and duration** are now detected and reported, giving `MEP_Offset(ms)`
+and `MEP_Duration(ms)`. Where a cortical silent period is detected its start *is*
+the end of the MEP and is reported as the offset; where there is none, the return
+to baseline is detected instead. `MEP_Offset_Source` records which rule applied.
+This also gives **AUC a principled endpoint in resting-state recordings**, where
+there is no silent period to close the integration window and the endpoint
+previously had to be dragged by hand.
+
+**PTP window anchoring per stimulus type** *(opt-in)*. The amplitude window is one
+setting for the whole file, so a recording containing both M-waves and MEPs
+cannot be measured correctly by a single window. On a real mixed recording the
+M-wave conditions had the first 6 ms of every response excluded from the
+amplitude measurement, understating it by around 20%. Enable **PTP Window
+Anchoring** in Preferences → Detection to give each stimulus type a window placed
+on its own median onset; the 1c window end still applies as a ceiling.
+
+**Onset method agreement and comparison outputs.** With *Compare methods on every
+trial* enabled, every consensus member runs on every trial and the spread between
+them is reported as `Onset_Disagreement(ms)` — a direct triage signal for which
+trials need manual review. The individual latencies are also written to two CSVs
+and five figure types, including Bland–Altman against a leave-one-out consensus.
+See [Onset Method Comparison](#onset-method-comparison).
+
+**Analysis and review now use identical detection.** The Data Inspector carried
+its own copy of the onset dispatch. It knew only four methods, so selecting a
+newer one silently fell through to peak-fraction, and it forwarded no amplitude
+gate, peak fraction or slope threshold — meaning a re-detection during review
+could use a different algorithm, and different settings, than the analysis it was
+reviewing. Both paths now share one implementation.
+
+**Preferences carry forward raised defaults.** The Preferences dialog writes every
+field on the tab, so a value you never deliberately chose was stored and then
+shadowed any later change to that default. Detection settings are now
+version-stamped and migrated on load, but only where the stored value is still
+the default it superseded — anything you actually changed is left alone. A
+**Restore detection defaults** button covers the rest.
+
+**Smaller fixes.** The amplitude window fields in 1c are relabelled and now state
+plainly that they do not constrain onset detection. `min_peak_amplitude`,
+`peak_fraction` and `slope_threshold` are honoured consistently across the
+pipeline and the Inspector. Detection defaults are defined in exactly one place,
+with a test that fails if any consumer drifts from it.
 
 ---
 
@@ -231,7 +300,10 @@ New formats are easy to add: a single `formats/<name>.py` module with three publ
 |**PTP amplitude (mV)**|Peak-to-peak amplitude within the user-specified MEP/CMAP window|
 |**MEP RMS (mV)**|Root-mean-square amplitude over the same window as PTP — integrates the whole response rather than two extreme samples|
 |**Onset latency (ms)**|MEP onset relative to stimulus (see onset detection methods)|
-|**AUC (mV·s)**|Area under the rectified EMG from onset to cSP start (or a user-defined window via drag selector)|
+|**AUC (mV·s)**|Area under the rectified EMG from onset to the end of the response — the cSP start where one is detected, otherwise the detected offset, or a user-defined window via drag selector|
+|**MEP offset (ms)**|End of the evoked response relative to stimulus (see [MEP Offset and Duration](#mep-offset-and-duration))|
+|**MEP duration (ms)**|Offset minus onset|
+|**Onset disagreement (ms)**|Spread between onset detection methods on that trial — a triage signal for manual review|
 |**cSP duration (ms)**|Cortical silent period, from EMG suppression onset to EMG return|
 |**cSP MEP offset (ms)**|Time from stimulus to start of cSP|
 |**cSP EMG return (ms)**|Time from stimulus to EMG recovery after cSP|
@@ -249,13 +321,152 @@ New formats are easy to add: a single `formats/<name>.py` module with three publ
 
 ### MEP Onset Detection
 
-Three detection methods are available. The global default is set in **Settings → Preferences → Detection** and can be overridden per file in 1a without affecting the preference. All methods share the same physiological latency bounds (see [Physiological Latency Profiles](#physiological-latency-profiles)) and return `None` rather than a floor value when no confident onset is found, so ambiguous trials are flagged rather than silently mislabelled.
+Seven detection methods are available. The global default is set in **Settings →
+Preferences → Detection** and can be overridden per file in 1a without affecting
+the preference. All methods share the same physiological latency bounds (see
+[Physiological Latency Profiles](#physiological-latency-profiles)) and return
+`None` rather than a floor value when no confident onset is found, so ambiguous
+trials are flagged rather than silently mislabelled.
 
-**Derivative-based method — Bigoni et al. 2022 (default)** — identifies onset as the start of the longest sustained positive-derivative run on the MEP rising edge, with optional Savitzky-Golay pre-smoothing. It makes no assumptions about background EMG level, so it is robust for both resting and active-contraction paradigms and for biphasic waveforms of either polarity. Follows Bigoni et al. [6] with adaptations for variable sampling rates and muscle-group windows. Tuneable: smoothing window (default 2 ms) and minimum positive-run length (default 1 ms).
+The **latency profile governs onset detection**, not the amplitude window. The
+search window is derived from each stimulus type's profile, widened by the
+amplitude window, and floored at the artefact blanking period. When most onsets
+in a condition land on a search bound the log says so — that pattern means the
+profile is wrong for the muscle, and the resulting latencies are a window edge
+rather than a measurement.
 
-**Peak-fraction method** — finds the largest positive and negative peaks, then scans backward from the dominant peak to the point where the signal first crosses a fraction of that peak (default 15%), with a minimum-amplitude guard. Best on clean, high-amplitude MEPs with a near-silent baseline.
+**Derivative-based — Bigoni et al. 2022 (default)** — onset is the start of the
+longest sustained positive-derivative run on the rising edge, with optional
+Savitzky–Golay pre-smoothing. It assumes nothing about background EMG level, so
+it suits both resting and active-contraction paradigms and biphasic waveforms of
+either polarity. Follows Bigoni et al. [6], adapted for variable sampling rates
+and muscle-group windows.
 
-**Bootstrap threshold method** — estimates a noise threshold from the pre-stimulus baseline via a bootstrap distribution, then scans backward within a physiologically plausible latency window. More sensitive on low-amplitude signals. Latency windows are per stimulus type with published normative defaults.
+**Derivative-based + walkback** — as above, then walks the onset back to the
+point of departure from baseline. Use when the plain method lands mid-rise.
+
+**RMS envelope + SD threshold** — a moving-window RMS envelope against a
+threshold of *baseline mean + k × SD*, with the minimum duration calibrated
+against the chance distribution of above-threshold run lengths rather than fixed
+by hand. The envelope crossing is treated as a coarse anchor and the onset is
+re-detected on a much shorter window, so the result is largely insensitive to the
+smoothing width — the usual criticism of this method class. Most precise on a
+quiet baseline; like every threshold method it degrades when background EMG is
+high.
+
+**CUSUM change-point** — accumulates the running excess over the baseline mean
+and reports the point at which the mean *changed*, rather than the point at which
+the signal crossed a level. The change point is estimated by backtracking to
+where the accumulator was last zero, so it does not inherit the delay between the
+true change and the moment enough evidence had accrued. Tolerant of raised
+background EMG.
+
+**Teager–Kaiser preconditioning** *(option on the envelope and CUSUM methods)* —
+applies the Teager–Kaiser energy operator before detection, amplifying components
+that are both large and fast-changing. Sharpens the contrast of the transition
+rather than the amplitude, which helps most at low signal-to-noise ratio.
+
+**Consensus** — runs several detectors and reports the median of those that find
+an onset. Slower, but the spread between members is reported as
+`Onset_Disagreement(ms)`, which flags the trials worth reviewing by hand. Members
+are chosen in Preferences.
+
+**Peak-fraction** — finds the largest positive and negative peaks, then scans
+back from the dominant peak to where the signal first crosses a fraction of it
+(default 15%), with a minimum-amplitude guard. Best on clean, high-amplitude
+responses with a near-silent baseline.
+
+**Bootstrap threshold** *(legacy)* — retained so analyses run on v1.3.x and
+earlier reproduce exactly. Its threshold is clipped to a multiple of the baseline
+mean, which overrides the SD scaling and places onsets systematically early;
+prefer the RMS envelope method for new work.
+
+#### Amplitude and duration guards
+
+The envelope and CUSUM detectors apply a width guard: a candidate onset is
+rejected unless the response stays elevated for a minimum duration. Smoothing
+widens a single-sample artefact — a cable transient, an electrical spike — into
+an excursion as wide as the smoothing window, which then satisfies any shorter
+run-length criterion. Amplitude- and energy-based detectors need this guard;
+derivative-based ones largely do not.
+
+### MEP Offset and Duration
+
+`MEP_Offset(ms)` marks the end of the evoked response and `MEP_Duration(ms)` is
+the interval from onset to offset. One precedence rule is applied, and
+`MEP_Offset_Source` records which branch fired, so no value's provenance has to
+be inferred:
+
+|Condition|`MEP_Offset(ms)`|`MEP_Offset_Source`|
+|-|-|-|
+|Manual marker set in the Inspector|the manual value|`manual`|
+|cSP enabled for this stimulus type and detected|cSP start|`csp_start`|
+|Otherwise|envelope return to baseline|`envelope`|
+|No onset, or no confident return found|blank|`none`|
+
+During voluntary contraction the end of the MEP and the start of the silent
+period are the same physical event, so they are reported as the same number
+rather than as two near-duplicate estimates. `cSP_MEP_Offset(ms)` is retained
+unchanged for backward compatibility; prefer `MEP_Offset(ms)` in new analyses,
+since it is also populated at rest.
+
+The return threshold is the larger of a baseline-derived level and a fraction of
+the response's own peak envelope (default 12%). A purely baseline-derived
+threshold is an absolute level, and on a quiet resting recording it is a very low
+one: real EMG does not settle back to resting-quiet within tens of milliseconds
+after a large response, so such a threshold fails *worse* the cleaner the trial.
+Scaling the criterion to the response removes that.
+
+Detecting the offset also gives **AUC an endpoint in resting-state recordings**.
+Where there is no silent period to close the integration window, AUC now runs
+from onset to the detected offset instead of requiring the endpoint to be dragged
+by hand.
+
+### PTP Window Anchoring
+
+*Off by default.* The amplitude window in 1c is one setting for the whole file,
+but each stimulus type has its own latency profile. A recording containing both
+M-waves and MEPs cannot be measured correctly by a single window: with a 10 ms
+start, an M-wave beginning at 4 ms has most of its response excluded from the
+amplitude measurement, and an M-wave's entire biphasic deflection lasts only
+5–15 ms.
+
+With anchoring enabled, each stimulus type gets an amplitude window placed on its
+own **median detected onset** — not per trial, which would make amplitude a
+function of onset-detection error and leave trials without an onset with no
+amplitude at all. The condition median keeps the window identical for every trial
+in the condition, so within-condition amplitudes stay comparable. The 1c window
+end still applies as a ceiling, and stimulus types with too few detected onsets
+fall back to the file-wide window. The window chosen for each condition is
+printed to the log rather than changing silently.
+
+### Onset Method Comparison
+
+With **Compare methods on every trial** enabled, every consensus member runs on
+every trial regardless of which method is selected — so a method choice can be
+justified while still running the one you trust. Beyond the per-trial agreement
+columns, this writes:
+
+- `<prefix>_onset_methods.csv` — long format, one row per trial × method,
+  including rows where a method failed, so detection rate stays recoverable
+- `<prefix>_onset_method_summary.csv` — per stimulus type × method: detection
+  rate, latency statistics, bias and 95% limits of agreement
+- `figures/<prefix>_onset_methods_figures/` — per condition, where each method's
+  onset lands on the actual waveform with per-trial onsets beneath; latency by
+  method across the file; Bland–Altman of each method against the others; and the
+  distribution of disagreement
+
+Bland–Altman uses a **leave-one-out consensus**: the method under test is
+excluded from the median it is compared against. Comparing a method with a
+composite that contains it is a part-whole comparison, which drags the bias
+toward zero and narrows the limits, flattering every method. On real data this
+understated the limits of agreement by around a quarter.
+
+> Agreement is not accuracy. Detectors that share an assumption can be wrong
+> together, and the two derivative variants are not independent — the walkback
+> starts from the plain method's answer. Read the spread as the practical
+> consequence of a method choice; establishing which method is *correct* requires
+> ground truth, not agreement.
 
 ### Cortical Silent Period (cSP) Detection
 
@@ -480,8 +691,11 @@ study/
             │   ├── sub-001_ses-01_<StimType>_trials.csv   ← one per stim type
             │   ├── sub-001_ses-01_..._segments.npz        ← waveform bundle (add-on input)
             │   ├── sub-001_ses-01_..._variability.csv     ← per-trial add-on output (joins into the group table)
+            │   ├── sub-001_ses-01_..._onset_methods.csv   ← per trial × method (agreement enabled)
+            │   ├── sub-001_ses-01_..._onset_method_summary.csv
             │   └── ...                                    ← add-on outputs, e.g. *_mepfeatx.csv
             └── figures/                                   ← add-on figures, each saved with a *_caption.txt
+                └── sub-001_ses-01_onset_methods_figures/  ← onset method comparison figures
 ```
 
 ### Trial-level CSV columns
@@ -500,6 +714,8 @@ excitability-compensation block when that option is run.
 |`PTP(mV)`, `MEP_RMS(mV)`, `Latency(ms)`, `AUC(mV*s)`|Core response: peak-to-peak amplitude, RMS over the same window, onset latency (`Not Marked` when unresolved), and area under the rectified EMG. `MEP_RMS(mV)` is a window statistic, so a manual peak-marker adjustment in the Inspector changes `PTP(mV)` but not the RMS|
 |`Measure`|Optional auxiliary / manual measurement (blank unless used)|
 |`cSP_Duration(ms)`, `cSP_MEP_Offset(ms)`, `cSP_EMG_Return(ms)`, `cSP_MEP_Ratio(ms/mV)`|Silent-period duration (`Not Marked` when absent), stimulus→cSP-start, stimulus→EMG-return, and cSP ÷ PTP ratio (Orth & Rothwell, 2004 [5])|
+|`MEP_Offset(ms)`, `MEP_Duration(ms)`, `MEP_Offset_Source`|End of the evoked response, its duration from onset, and which rule produced the offset (`manual` / `csp_start` / `envelope` / `none`). Where a silent period is detected, `MEP_Offset(ms)` and `cSP_MEP_Offset(ms)` carry the same value by design — they are the same physical event|
+|`Onset_Consensus(ms)`, `Onset_Disagreement(ms)`, `Onset_IQR(ms)`, `Onset_Methods_N`|Populated only when *Compare methods on every trial* is enabled: the median across onset detection methods, the max–min spread, the interquartile range (robust to one stray method), and how many methods found an onset. High disagreement flags a trial for review; it does not mean the reported onset is wrong|
 |`PreStimRMS`, `PreStimPTP`, `PTP_per_PreStimRMS`, `Z_PreStimRMS`|Pre-stimulus baseline EMG: RMS, peak-to-peak, PTP-per-RMS, and standardised RMS|
 |`Z_PTP_Within`, `Z_PTP_Pooled`|PTP z-scores within each condition and pooled across conditions|
 |`PTP_Detrended_WithinCond(mV)` + `_Z`, `PTP_Detrended_Session(mV)` + `_Z`|Amplitude detrended within condition and across the whole session (fatigue / potentiation), each with its z-score|
@@ -685,7 +901,7 @@ The optional Rust extension `mep_cmap_io` provides accelerated I/O for the Spike
 
 If you use MEP-CMAP Analyser in published research, please cite:
 
-> Justin W. Andrushko. (2026). jandrushko/mep-cmap-analyser: MEP-CMAP Analyser (Version v1.3.2) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.21810844
+> Justin W. Andrushko. (2026). jandrushko/mep-cmap-analyser: MEP-CMAP Analyser (Version v1.3.3) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.21810844
 > Northumbria University. https://github.com/jandrushko/mep-cmap-analyser
 
 ---

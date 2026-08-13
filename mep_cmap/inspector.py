@@ -16,11 +16,9 @@ import tkinter as tk
 from tkinter import ttk, scrolledtext
 
 from .compat import _np_trapz, _np_ptp
-from .detection import (detect_mep_onset_peak_fraction,
-                        detect_mep_onset_bootstrap,
-                        detect_mep_onset_bigoni,
-                        detect_mep_onset_bigoni_walkback,
+from .detection import (dispatch_onset,
                         detect_csp_bootstrap)
+from .detection.defaults import DETECTION_DEFAULTS
 
 class DraggablePoint:
     """
@@ -196,6 +194,7 @@ class DataInspectorWindow:
                  onset_bootstrap_crit=1.96, onset_bootstrap_n=500,
                  onset_bigoni_smooth_ms=0.5, onset_bigoni_min_run_ms=0.5,
                  onset_bigoni_walkback_sd=1.0,
+                 detection_params=None,
                  enable_auc=True,
                  csp_search_start_ms=40, csp_search_end_ms=400,
                  csp_min_silence_ms=25, csp_min_return_ms=40,
@@ -231,6 +230,31 @@ class DataInspectorWindow:
         self.onset_bigoni_smooth_ms    = onset_bigoni_smooth_ms
         self.onset_bigoni_min_run_ms   = onset_bigoni_min_run_ms
         self.onset_bigoni_walkback_sd  = onset_bigoni_walkback_sd
+
+        # Detection parameters as one dict, keyed by PipelineConfig field name,
+        # for detection.dispatch_onset. Built from the canonical defaults, then
+        # `detection_params` (everything the analysis ran with), then the
+        # individual keyword arguments above -- which are retained so existing
+        # call sites keep working, and which win because a caller that names a
+        # parameter explicitly means it.
+        #
+        # Passing the whole dict rather than adding a keyword per parameter is
+        # what lets the inspector honour settings it previously ignored:
+        # min_peak_amplitude, peak_fraction and slope_threshold were never
+        # forwarded here, so re-detection silently used detector defaults while
+        # the pipeline used the configured values.
+        self.detection_params = dict(DETECTION_DEFAULTS)
+        if detection_params:
+            self.detection_params.update(
+                {k: v for k, v in detection_params.items() if v is not None})
+        self.detection_params.update({
+            "onset_method":             onset_method,
+            "onset_bootstrap_crit":     onset_bootstrap_crit,
+            "onset_bootstrap_n":        onset_bootstrap_n,
+            "onset_bigoni_smooth_ms":   onset_bigoni_smooth_ms,
+            "onset_bigoni_min_run_ms":  onset_bigoni_min_run_ms,
+            "onset_bigoni_walkback_sd": onset_bigoni_walkback_sd,
+        })
         self._enable_auc_global        = enable_auc
         self.csp_search_start_ms  = csp_search_start_ms
         self.csp_search_end_ms    = csp_search_end_ms
@@ -628,43 +652,19 @@ class DataInspectorWindow:
         _lat = self.latency_map.get(self.cur_type, (10.0, 50.0))
         _min_lat, _max_lat = _lat if _lat else (10.0, 50.0)
 
-        if self.onset_method == "bootstrap":
-            onset_ms = detect_mep_onset_bootstrap(
-                           emg, fs,
-                           pre_ms=_pre_ms,
-                           peak_search_start_ms=self.ptp_start_ms or 10,
-                           peak_search_end_ms=self.ptp_end_ms or 50,
-                           min_latency_ms=_min_lat,
-                           max_latency_ms=_max_lat,
-                           criterion=self.onset_bootstrap_crit,
-                           n_boot=self.onset_bootstrap_n)
-        elif self.onset_method == "bigoni":
-            onset_ms = detect_mep_onset_bigoni(
-                           emg, fs,
-                           pre_ms=_pre_ms,
-                           search_start_ms=self.ptp_start_ms or 10,
-                           search_end_ms=self.ptp_end_ms or 50,
-                           min_latency_ms=_min_lat,
-                           max_latency_ms=_max_lat,
-                           smooth_window_ms=self.onset_bigoni_smooth_ms,
-                           min_run_ms=self.onset_bigoni_min_run_ms)
-        elif self.onset_method == "bigoni_walkback":
-            onset_ms = detect_mep_onset_bigoni_walkback(
-                           emg, fs,
-                           pre_ms=_pre_ms,
-                           search_start_ms=self.ptp_start_ms or 10,
-                           search_end_ms=self.ptp_end_ms or 50,
-                           min_latency_ms=_min_lat,
-                           max_latency_ms=_max_lat,
-                           smooth_window_ms=self.onset_bigoni_smooth_ms,
-                           min_run_ms=self.onset_bigoni_min_run_ms,
-                           walkback_sd_mult=self.onset_bigoni_walkback_sd)
-        else:
-            onset_ms = detect_mep_onset_peak_fraction(
-                           emg, fs,
-                           pre_ms=_pre_ms,
-                           poststim_start_ms=self.ptp_start_ms or 10,
-                           poststim_end_ms=self.ptp_end_ms or 50)
+        # One shared dispatch with the pipeline (detection/dispatch.py). This
+        # was previously a four-branch copy that did not know about methods
+        # added later and forwarded no amplitude/peak-fraction parameters, so
+        # a re-detection here could use a different algorithm, and different
+        # settings, than the analysis it was reviewing.
+        onset_ms = dispatch_onset(
+            emg, fs, self.detection_params,
+            pre_ms=_pre_ms,
+            search_start_ms=self.ptp_start_ms or 10,
+            search_end_ms=self.ptp_end_ms or 50,
+            min_latency_ms=_min_lat,
+            max_latency_ms=_max_lat,
+        )
         stim_idx = np.argmin(np.abs(self.t))
         onset    = stim_idx if onset_ms is None else stim_idx + int(round(onset_ms / dt_ms))
         onset    = max(onset, stim_idx)

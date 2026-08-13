@@ -41,6 +41,13 @@ STRIP_NOISE = re.compile(
     r"|[Pp]ython \d[\d.]*"           # "Python 3.9 or later"
     r"|setuptools[><=~!\d. ]*"
     r"|[><=~!]=?\s*\d[\d.]*"        # dependency pins: pyedflib>=0.1.30
+    # Historical changelog headings. "## What's New in 1.3.2" sitting under a
+    # 1.3.3 release is correct -- it describes what 1.3.2 changed and must not
+    # be rewritten. Without this the check fails on every release that keeps a
+    # previous section, and a check that cries wolf every time stops being read.
+    # The authoritative version strings (the header line and the citation) are
+    # still checked, so nothing real is masked.
+    r"|What's New in \d[\d.]*"
 )
 
 # Matches 1.2.7 and v1.2.7 alike — \b fails after 'v', since both are word

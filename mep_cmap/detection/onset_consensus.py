@@ -1,0 +1,290 @@
+"""
+mep_cmap.detection.onset_consensus
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Multi-detector consensus onset estimate, and per-trial agreement metrics.
+
+Two separate entry points, deliberately not merged:
+
+``detect_mep_onset_consensus``
+    Returns the median of the detectors that found an onset — a single float,
+    so it registers as an ordinary onset method alongside the others.
+
+``compute_onset_agreement``
+    Returns the full per-method breakdown plus dispersion statistics. This is
+    computed independently of which method is SELECTED, so disagreement
+    columns are available even when the analysis runs plain Bigoni.
+
+The agreement metrics are arguably the more useful product. The recurring
+practical question in MEP analysis is not "what is the single best estimator"
+— no estimator wins across resting and active paradigms, SNRs and muscles —
+but "which trials must a human actually look at". Trials where independent
+detectors built on different principles (derivative run length, envelope
+threshold, cumulative change point, relative peak fraction) converge to within
+a millisecond need no review; trials where they scatter over 10 ms do. Spread
+across methods is a direct, cheap proxy for that, and it is reportable.
+
+Interpretation caveats
+----------------------
+Low spread means the detectors agree, NOT that they are correct: methods
+sharing an assumption can be wrong together. The two Bigoni variants in
+particular are not independent — the walkback variant starts from the plain
+variant's answer — so their agreement is partly structural. Spread is a
+triage signal, not a validation.
+
+Cost
+----
+Consensus runs every member detector on every trial. The default member set
+excludes ``bootstrap``, which recomputes a 500-iteration bootstrap inside each
+call and dominates the runtime; it can be added explicitly where its behaviour
+is specifically wanted.
+
+  * detect_mep_onset_consensus
+  * compute_onset_agreement
+  * CONSENSUS_DEFAULT_METHODS
+"""
+
+from collections import namedtuple
+
+import numpy as np
+
+from .onset_bigoni import detect_mep_onset_bigoni
+from .onset_bigoni_walkback import detect_mep_onset_bigoni_walkback
+from .onset_bootstrap import detect_mep_onset_bootstrap
+from .onset_cusum import detect_mep_onset_cusum
+from .onset_peak_fraction import detect_mep_onset_peak_fraction
+from .onset_rms_envelope import detect_mep_onset_rms_envelope
+
+# Five fast, methodologically distinct detectors. Odd count so the median is a
+# member of the set rather than an average of two.
+CONSENSUS_DEFAULT_METHODS = (
+    "bigoni",
+    "bigoni_walkback",
+    "rms_envelope",
+    "cusum",
+    "peak_fraction",
+)
+
+OnsetAgreement = namedtuple(
+    "OnsetAgreement",
+    "per_method consensus_ms spread_ms iqr_ms n_detected n_attempted")
+
+
+# ── Adapter layer ─────────────────────────────────────────────────────────────
+# Each detector was written with its own keyword names (``poststim_start_ms``
+# vs ``search_start_ms`` vs ``peak_search_start_ms``). Rather than renaming
+# parameters in the existing detectors — which would change their public
+# signatures and break reproducibility of saved sessions — a canonical set of
+# common keys is translated here.
+#
+# Canonical keys:
+#   pre_ms, search_start_ms, search_end_ms,
+#   min_latency_ms, max_latency_ms, min_peak_amplitude
+
+
+def _call_bigoni(signal, fs, common, params):
+    return detect_mep_onset_bigoni(
+        signal, fs,
+        pre_ms=common["pre_ms"],
+        search_start_ms=common["search_start_ms"],
+        search_end_ms=common["search_end_ms"],
+        min_latency_ms=common["min_latency_ms"],
+        max_latency_ms=common["max_latency_ms"],
+        min_peak_amplitude=common["min_peak_amplitude"],
+        smooth_window_ms=params.get("onset_bigoni_smooth_ms", 0.5),
+        min_run_ms=params.get("onset_bigoni_min_run_ms", 0.5),
+    )
+
+
+def _call_bigoni_walkback(signal, fs, common, params):
+    return detect_mep_onset_bigoni_walkback(
+        signal, fs,
+        pre_ms=common["pre_ms"],
+        search_start_ms=common["search_start_ms"],
+        search_end_ms=common["search_end_ms"],
+        min_latency_ms=common["min_latency_ms"],
+        max_latency_ms=common["max_latency_ms"],
+        min_peak_amplitude=common["min_peak_amplitude"],
+        smooth_window_ms=params.get("onset_bigoni_smooth_ms", 0.5),
+        min_run_ms=params.get("onset_bigoni_min_run_ms", 0.5),
+        walkback_sd_mult=params.get("onset_bigoni_walkback_sd", 1.0),
+    )
+
+
+def _call_peak_fraction(signal, fs, common, params):
+    # This detector has no latency-bound parameters, so the physiological
+    # window is enforced here instead. Without this the peak-fraction result
+    # would be the only unbounded member and would inflate the spread.
+    lat = detect_mep_onset_peak_fraction(
+        signal, fs,
+        pre_ms=common["pre_ms"],
+        poststim_start_ms=common["search_start_ms"],
+        poststim_end_ms=common["search_end_ms"],
+        peak_frac=params.get("peak_fraction", 0.15),
+        min_consecutive=params.get("peak_min_consecutive", 5),
+        min_peak_amplitude=common["min_peak_amplitude"],
+        slope_threshold=params.get("slope_threshold", 0.05),
+    )
+    if lat is None:
+        return None
+    lo = common["min_latency_ms"]
+    hi = common["max_latency_ms"]
+    if lo is not None and lat < lo:
+        return None
+    if hi is not None and lat > hi:
+        return None
+    return lat
+
+
+def _call_bootstrap(signal, fs, common, params):
+    return detect_mep_onset_bootstrap(
+        signal, fs,
+        pre_ms=common["pre_ms"],
+        peak_search_start_ms=common["search_start_ms"],
+        peak_search_end_ms=common["search_end_ms"],
+        min_latency_ms=common["min_latency_ms"],
+        max_latency_ms=common["max_latency_ms"],
+        min_peak_amplitude=common["min_peak_amplitude"],
+        criterion=params.get("onset_bootstrap_crit", 1.96),
+        n_boot=params.get("onset_bootstrap_n", 500),
+    )
+
+
+def _call_rms_envelope(signal, fs, common, params):
+    return detect_mep_onset_rms_envelope(
+        signal, fs,
+        pre_ms=common["pre_ms"],
+        search_start_ms=common["search_start_ms"],
+        search_end_ms=common["search_end_ms"],
+        min_latency_ms=common["min_latency_ms"],
+        max_latency_ms=common["max_latency_ms"],
+        min_peak_amplitude=common["min_peak_amplitude"],
+        env_window_ms=params.get("onset_env_window_ms", 5.0),
+        criterion=params.get("onset_env_criterion", 2.5),
+        significance=params.get("onset_env_significance", 0.99),
+        n_boot=params.get("onset_env_n_boot", 500),
+        use_tkeo=params.get("onset_env_tkeo", False),
+        causal_window=params.get("onset_env_causal", False),
+        refine_on_raw=params.get("onset_env_refine", True),
+        refine_window_ms=params.get("onset_env_refine_window_ms", 1.0),
+        refine_sd_mult=params.get("onset_env_refine_sd", 1.0),
+        refine_sustain_ms=params.get("onset_env_refine_sustain_ms", 1.0),
+    )
+
+
+def _call_cusum(signal, fs, common, params):
+    return detect_mep_onset_cusum(
+        signal, fs,
+        pre_ms=common["pre_ms"],
+        search_start_ms=common["search_start_ms"],
+        search_end_ms=common["search_end_ms"],
+        min_latency_ms=common["min_latency_ms"],
+        max_latency_ms=common["max_latency_ms"],
+        min_peak_amplitude=common["min_peak_amplitude"],
+        k_mult=params.get("onset_cusum_k", 0.5),
+        h_mult=params.get("onset_cusum_h", 20.0),
+        use_tkeo=params.get("onset_cusum_tkeo", False),
+    )
+
+
+_ADAPTERS = {
+    "bigoni": _call_bigoni,
+    "bigoni_walkback": _call_bigoni_walkback,
+    "peak_fraction": _call_peak_fraction,
+    "bootstrap": _call_bootstrap,
+    "rms_envelope": _call_rms_envelope,
+    "cusum": _call_cusum,
+}
+
+
+def compute_onset_agreement(
+        signal, fs, *,
+        pre_ms=100,
+        search_start_ms=5,
+        search_end_ms=60,
+        min_latency_ms=None,
+        max_latency_ms=None,
+        min_peak_amplitude=0.05,
+        methods=None,
+        params=None):
+    """
+    Run several onset detectors on one trial and summarise their agreement.
+
+    Parameters
+    ----------
+    signal, fs, pre_ms, search_start_ms, search_end_ms,
+    min_latency_ms, max_latency_ms, min_peak_amplitude
+        Canonical detection arguments, translated per detector.
+    methods : sequence of str or None
+        Member detectors; defaults to ``CONSENSUS_DEFAULT_METHODS``. Unknown
+        names are ignored rather than raising, so a stale saved session cannot
+        abort a run.
+    params : dict or None
+        Method-specific tuning values, keyed exactly as the corresponding
+        ``PipelineConfig`` fields. Missing keys fall back to each detector's
+        own defaults.
+
+    Returns
+    -------
+    OnsetAgreement(per_method, consensus_ms, spread_ms, iqr_ms,
+                   n_detected, n_attempted)
+
+        per_method   : dict method name -> latency_ms or None
+        consensus_ms : median of the non-None latencies, or None
+        spread_ms    : max - min of the non-None latencies, or None if fewer
+                       than two detected
+        iqr_ms       : interquartile range of the non-None latencies; more
+                       robust than spread when one member is an outlier
+        n_detected   : how many members returned a latency
+        n_attempted  : how many members ran
+    """
+    methods = tuple(CONSENSUS_DEFAULT_METHODS if methods is None else methods)
+    params = {} if params is None else dict(params)
+
+    common = {
+        "pre_ms": pre_ms,
+        "search_start_ms": search_start_ms,
+        "search_end_ms": search_end_ms,
+        "min_latency_ms": min_latency_ms,
+        "max_latency_ms": max_latency_ms,
+        "min_peak_amplitude": min_peak_amplitude,
+    }
+
+    per_method = {}
+    attempted = 0
+    for name in methods:
+        fn = _ADAPTERS.get(name)
+        if fn is None:
+            continue
+        attempted += 1
+        try:
+            per_method[name] = fn(signal, fs, common, params)
+        except Exception:
+            # One detector failing on a pathological trial must not lose the
+            # information the others provide.
+            per_method[name] = None
+
+    vals = [v for v in per_method.values() if v is not None]
+    if not vals:
+        return OnsetAgreement(per_method, None, None, None, 0, attempted)
+
+    arr = np.asarray(vals, dtype=float)
+    consensus = round(float(np.median(arr)), 2)
+    if arr.size < 2:
+        return OnsetAgreement(per_method, consensus, None, None,
+                              int(arr.size), attempted)
+
+    spread = round(float(arr.max() - arr.min()), 2)
+    iqr = round(float(np.percentile(arr, 75) - np.percentile(arr, 25)), 2)
+    return OnsetAgreement(per_method, consensus, spread, iqr,
+                          int(arr.size), attempted)
+
+
+def detect_mep_onset_consensus(signal, fs, **kwargs):
+    """
+    Consensus onset latency: median across member detectors.
+
+    Accepts the same canonical keywords as ``compute_onset_agreement``, plus
+    ``methods`` and ``params``. Returns a single float (or None) so that it
+    slots into the onset method registry like any other detector.
+    """
+    return compute_onset_agreement(signal, fs, **kwargs).consensus_ms

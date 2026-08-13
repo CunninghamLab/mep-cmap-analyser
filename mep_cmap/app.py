@@ -144,6 +144,44 @@ def _make_bids_prefix(meta_prefix: str, file_stem: str) -> str:
     return f"{meta_prefix}_{'_'.join(novel)}"
 
 
+
+
+# ── Detection parameter plumbing ─────────────────────────────────────────────
+# The implementations live in detection/defaults.py so they can be tested
+# without importing this module, which requires a working matplotlib Tk
+# backend. These wrappers exist only to bind the prefs singleton.
+
+def _detection_prefs_snapshot():
+    """Detection preferences that have no Tk variable, keyed for params."""
+    from .detection import prefs_detection_snapshot
+    return prefs_detection_snapshot(prefs)
+
+
+def _detection_config_kwargs(params):
+    """The same keys pulled back out of params, for PipelineConfig."""
+    from .detection import config_detection_kwargs
+    return config_detection_kwargs(params)
+
+
+# Detection settings that have a Tk variable, mapped to its attribute name on
+# TMSAnalysisApp. Kept as one table because two code paths need it -- the
+# worker's params snapshot and the inspector, which runs on the GUI thread and
+# has no access to that snapshot. tests/test_gui_detection_wiring.py checks it
+# against detection.TK_BACKED_DETECTION_KEYS, so a setting cannot gain a Tk
+# variable without being reachable from both.
+_DETECTION_TK_ATTRS = {
+    "onset_method":             "onset_method",
+    "peak_fraction":            "onset_peak_fraction",
+    "min_peak_amplitude":       "onset_min_amplitude",
+    "slope_threshold":          "onset_slope_threshold",
+    "onset_bootstrap_crit":     "onset_bootstrap_crit",
+    "onset_bootstrap_n":        "onset_bootstrap_n",
+    "onset_bigoni_smooth_ms":   "onset_bigoni_smooth_ms",
+    "onset_bigoni_min_run_ms":  "onset_bigoni_min_run_ms",
+    "onset_bigoni_walkback_sd": "onset_bigoni_walkback_sd",
+}
+
+
 class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
     def __init__(self, root):
         self.root = root
@@ -717,6 +755,14 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             outlier_threshold = self.outlier_threshold.get(),
 
             # onset detection
+            #
+            # Detection parameters without a dedicated Tk variable are read
+            # straight from preferences here. Listing them explicitly would
+            # mean editing this snapshot, the PipelineConfig construction and
+            # the inspector call site every time a detector gains a parameter
+            # -- and forgetting one silently substitutes a default for the
+            # user's setting, with no error and a plausible result.
+            **_detection_prefs_snapshot(),
             peak_fraction         = self.onset_peak_fraction.get(),
             min_amp               = self.onset_min_amplitude.get(),
             slope_threshold       = self.onset_slope_threshold.get(),
@@ -796,6 +842,29 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         t.start()
 
     # ──────────────────────────────────────────────────────────────
+    def _current_detection_params(self):
+        """Every detection setting as one dict, keyed by PipelineConfig field.
+
+        Global settings come from preferences; the ones Stage 1a can override
+        per file come from their Tk variables and take precedence. Callable
+        from the GUI thread, which is what the inspector needs -- the worker's
+        params snapshot does not exist there.
+        """
+        from .detection import prefs_detection_snapshot
+        out = prefs_detection_snapshot(prefs)
+        for key, attr in _DETECTION_TK_ATTRS.items():
+            var = getattr(self, attr, None)
+            if var is None:
+                continue
+            try:
+                out[key] = var.get()
+            except Exception:
+                # A Tk entry holding a half-typed value must not stop the
+                # inspector opening; the canonical default already sits in
+                # `out` for this key.
+                pass
+        return out
+
     def _open_inspector_gui(self, segments_dict, fs, pre_ms, post_ms,
                             unit, label_map, color_map, analysis_pre_ms=None,
                             extra_segs=None, wide_window_s=3.0, auto_meta=None, underlays=None):
@@ -814,6 +883,17 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         _seed = {k: dict(v) for k, v in (auto_meta or {}).items()}
         for _k, _m in getattr(self, 'segments_metadata', {}).items():
             _seed.setdefault(_k, {}).update(_m)
+        # Detection settings the analysis ran with, forwarded so that
+        # re-detection inside the inspector uses the same algorithm AND the
+        # same parameters. Previously only the method name and a few
+        # method-specific values were passed, so the amplitude gate, peak
+        # fraction and slope threshold silently reverted to detector defaults
+        # during review.
+        #
+        # Built from the Tk variables, NOT from the worker's params snapshot:
+        # this method runs on the GUI thread and never receives it.
+        _det_params = self._current_detection_params()
+
         inspector = DataInspectorWindow(
             self.root, segments_dict, time_axis,
             # Seed = anchored auto onsets, overlaid with saved manual edits.
@@ -832,6 +912,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             onset_bigoni_smooth_ms   = self.onset_bigoni_smooth_ms.get(),
             onset_bigoni_min_run_ms  = self.onset_bigoni_min_run_ms.get(),
             onset_bigoni_walkback_sd = self.onset_bigoni_walkback_sd.get(),
+            detection_params    = _det_params,
             latency_map         = dict(self.latency_map),
             # CSP detection
             csp_search_start_ms = self.csp_search_start_ms.get(),
@@ -942,6 +1023,11 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                 onset_bigoni_smooth_ms   = params.get("onset_bigoni_smooth_ms",   0.5),
                 onset_bigoni_min_run_ms  = params.get("onset_bigoni_min_run_ms",  0.5),
                 onset_bigoni_walkback_sd = params.get("onset_bigoni_walkback_sd", 1.0),
+                # Envelope / CUSUM / consensus / offset settings. Passed as a
+                # single mapping so a new detector parameter needs no edit
+                # here, in run_pipeline's signature, or in its PipelineConfig
+                # construction.
+                detection_params     = _detection_config_kwargs(params),
                 latency_map          = params.get("latency_map", {}),
                 onset_anchor         = params.get("onset_anchor", False),
                 onset_anchor_halfwidth_ms = params.get("onset_anchor_halfwidth_ms", 8.0),
@@ -1313,12 +1399,21 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             row=0, column=2, sticky='e', padx=6)
         tk.Entry(time_frame, textvariable=self.post_time, width=6).grid(
             row=0, column=3, sticky='w')
-        # Row 1
-        tk.Label(time_frame, text="PTP window start (ms):").grid(
-            row=1, column=0, sticky='e', padx=6)
-        tk.Entry(time_frame, textvariable=self.ptp_start, width=6).grid(
-            row=1, column=1, sticky='w')
-        tk.Label(time_frame, text="PTP window end (ms):").grid(
+        # Row 1 — amplitude measurement window.
+        #
+        # Relabelled from a bare "PTP window start/end". These bounds used to
+        # double as the onset search window, so the old label read as a general
+        # "where the response is" setting. They no longer constrain onset at
+        # all: onset uses each event type's latency profile from 1a. Leaving
+        # the old wording implied a coupling that no longer exists and made the
+        # field look contradictory once anchoring was added.
+        self._ptp_start_lbl = tk.Label(
+            time_frame, text="Amplitude window start (ms):")
+        self._ptp_start_lbl.grid(row=1, column=0, sticky='e', padx=6)
+        self._ptp_start_entry = tk.Entry(
+            time_frame, textvariable=self.ptp_start, width=6)
+        self._ptp_start_entry.grid(row=1, column=1, sticky='w')
+        tk.Label(time_frame, text="Amplitude window end (ms):").grid(
             row=1, column=2, sticky='e', padx=6)
         tk.Entry(time_frame, textvariable=self.ptp_end, width=6).grid(
             row=1, column=3, sticky='w')
@@ -1328,11 +1423,73 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         tk.Entry(time_frame, textvariable=self.prestim_ms, width=6).grid(
             row=2, column=1, sticky='w')
 
+        # Row 3 — say plainly what these bounds do and do not control, and show
+        # when PTP anchoring has taken the start over.
+        #
+        # Its own full-width row: placing it at (row 2, column 1) put it on top
+        # of the Pre-stim entry, because grid stacks widgets that share a cell
+        # rather than reflowing around them. wraplength lets the text wrap to
+        # the frame instead of depending on hand-placed newlines, which break
+        # at a different width on every display scale.
+        self._ptp_note = tk.Label(time_frame, text="", anchor="w",
+                                  justify="left", fg="#555", wraplength=680)
+        self._ptp_note.grid(row=3, column=0, columnspan=4, sticky='w',
+                            padx=6, pady=(4, 2))
+
+        def _refresh_ptp_note(*_a):
+            """Keep the start field's label and the note in step with anchoring.
+
+            The field stays EDITABLE when anchoring is on. It is tempting to
+            disable it, since the anchored start supersedes it for most event
+            types -- but ptp_window_for_stim_type falls back to this value for
+            any event type with fewer than `ptp_anchor_min_trials` detected
+            onsets. A peripheral condition with three trials is exactly that
+            case, so disabling the field would take away control of a number
+            still in use, on precisely the conditions most likely to need it.
+
+            Nor is the anchored start "the 1a setting": it is each event type's
+            own median DETECTED onset, which the 1a latency profile bounds but
+            does not determine. Labelling it as a 1a value would be wrong in a
+            way that is hard to notice.
+            """
+            _COMMON = ("Amplitude window: where peak-to-peak is measured. "
+                       "Onset is not limited by it — onset uses each event "
+                       "type's latency profile (1a). ")
+            try:
+                anchored = bool(prefs.ptp_anchor)
+                min_n = int(prefs.ptp_anchor_min_trials)
+                pre = float(prefs.ptp_anchor_pre_ms)
+            except Exception:
+                anchored, min_n, pre = False, 4, 2.0
+            self._ptp_start_entry.config(state="normal")
+            if anchored:
+                self._ptp_start_lbl.config(
+                    text="Amplitude start — fallback (ms):", fg="#555")
+                self._ptp_note.config(
+                    text=_COMMON +
+                         "PTP anchoring is ON: for each event type the start "
+                         "is its median onset minus %g ms, so the value at "
+                         "left is used only as a fallback, for event types "
+                         "with fewer than %d detected onsets. The end above "
+                         "always applies as a ceiling."
+                         % (pre, min_n))
+            else:
+                self._ptp_start_lbl.config(
+                    text="Amplitude window start (ms):", fg="black")
+                self._ptp_note.config(
+                    text=_COMMON +
+                         "For files mixing M-waves and MEPs, enable PTP "
+                         "anchoring in Preferences → Detection so each event "
+                         "type gets its own window.")
+
+        self._refresh_ptp_note = _refresh_ptp_note
+        _refresh_ptp_note()
+
         # ── Separator ────────────────────────────────────────────────────────
         ttk.Separator(time_frame, orient="horizontal").grid(
-            row=3, column=0, columnspan=4, sticky='ew', pady=(8, 4))
+            row=4, column=0, columnspan=4, sticky='ew', pady=(8, 4))
         tk.Label(time_frame, text="MEP Onset Detection").grid(
-            row=3, column=0, columnspan=4, sticky='w', padx=6)
+            row=4, column=0, columnspan=4, sticky='w', padx=6)
 
         # ── Sub-section: Onset Detection ─────────────────────────────────────
         # Method label (read-only, reflects current preference)
@@ -1345,7 +1502,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         _method_display = _METHOD_LABELS.get(self.onset_method.get(), self.onset_method.get())
         self._onset_method_lbl = tk.Label(
             time_frame, text=f"Method: {_method_display}", anchor="w", fg="#444")
-        self._onset_method_lbl.grid(row=4, column=0, columnspan=3, sticky='w', padx=6, pady=(2, 0))
+        self._onset_method_lbl.grid(row=5, column=0, columnspan=3, sticky='w', padx=6, pady=(2, 0))
 
         def _update_onset_label(*_):
             m = self.onset_method.get()
@@ -1366,23 +1523,30 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                 self.onset_peak_fraction.set(_prefs.onset_peak_frac)
                 self.onset_slope_threshold.set(_prefs.onset_slope_threshold)
                 _update_onset_label()
+                # Anchoring may have been toggled in the dialog; the 1c note
+                # and the start field's label describe that setting, so they
+                # would otherwise keep showing the previous state.
+                try:
+                    self._refresh_ptp_note()
+                except Exception:
+                    pass
             open_preferences_dialog(self.root, on_apply=_on_prefs_apply)
 
         tk.Button(
             time_frame, text="⚙ Configure in Preferences → Detection",
             command=_open_detection_prefs, cursor="hand2"
-        ).grid(row=4, column=3, sticky='w', padx=6, pady=(2, 4))
+        ).grid(row=5, column=3, sticky='w', padx=6, pady=(2, 4))
 
         # Onset search-window anchoring (median-waveform seed)
         tk.Checkbutton(
             time_frame,
             text="Anchor onset search window to sample-median onset",
             variable=self.onset_anchor
-        ).grid(row=5, column=0, columnspan=3, sticky='w', padx=6, pady=(0, 4))
+        ).grid(row=6, column=0, columnspan=3, sticky='w', padx=6, pady=(0, 4))
         tk.Label(time_frame, text="Window ± (ms):").grid(
-            row=5, column=3, sticky='e', padx=(6, 2), pady=(0, 4))
+            row=6, column=3, sticky='e', padx=(6, 2), pady=(0, 4))
         tk.Entry(time_frame, textvariable=self.onset_anchor_halfwidth, width=5).grid(
-            row=5, column=3, sticky='w', padx=(96, 6), pady=(0, 4))
+            row=6, column=3, sticky='w', padx=(96, 6), pady=(0, 4))
 
         # ─── CSP Detection Settings ────────────────────────────────────────────────
         csp_frame = tk.LabelFrame(self.main_frame,

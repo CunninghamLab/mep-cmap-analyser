@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mep-cmap-analyser"
-version = "1.3.2"
+version = "1.3.3"
 description = "BIDS-compliant TMS/EMG neurophysiology analysis tool for MEP and CMAP quantification"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -23,6 +23,24 @@ dependencies = [
     "neo>=0.10",
     "pyedflib>=0.1.30",
     "bioread>=3.0",
+]
+
+[project.optional-dependencies]
+# Development and CI tooling. Deliberately NOT in [project] dependencies:
+# installing the application to use it should not pull in a test runner or a
+# linter, and requirements.txt feeds the PyInstaller builds, where extra
+# packages risk being bundled into the shipped binary.
+#
+#   pip install -e ".[dev]"
+#
+# pyflakes is not optional in practice. tests/test_gui_detection_wiring.py
+# skips its undefined-name check when pyflakes is absent, and that check exists
+# because app.py cannot be imported without a working matplotlib Tk backend --
+# so most of it is never executed by the suite, and a name that is not in scope
+# compiles cleanly and fails only when that GUI path runs in front of a user.
+dev = [
+    "pytest>=7.0",
+    "pyflakes>=3.0",
 ]
 
 [project.scripts]

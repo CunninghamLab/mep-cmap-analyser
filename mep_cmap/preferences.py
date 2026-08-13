@@ -9,24 +9,25 @@ from pathlib import Path
 
 PREFS_DIR  = Path.home() / ".mep_cmap"
 PREFS_FILE = PREFS_DIR / "preferences.json"
+# Detection defaults are NOT restated here. They live in
+# mep_cmap.detection.defaults, which is the single source of truth, and are
+# merged in below. Restating them was how PipelineConfig and preferences came
+# to disagree about onset_method in the first place.
+from .detection.defaults import as_pref_defaults as _detection_pref_defaults
+from .detection.defaults import (
+    DETECTION_DEFAULTS_VERSION as _DETECTION_DEFAULTS_VERSION,
+)
+
 DEFAULTS   = {
     "font_scale":          1.0,
-    "addons_path":         None,   # user add-ons folder (None → built-in only)
-    "latency_profiles":    None,   # None → use LATENCY_PROFILE_DEFAULTS
-    "default_latency_key": None,   # None → use DEFAULT_LATENCY_KEY
-    "onset_method":        "bigoni",  # "peak_fraction" | "bootstrap" | "bigoni"
-    # Peak-fraction method parameters
-    "onset_peak_frac":          0.15,
-    "onset_min_peak_amplitude": 0.05,
-    "onset_slope_threshold":    0.08,
-    # Bootstrap method parameters
-    "onset_bootstrap_crit":     1.96,
-    "onset_bootstrap_n":        500,
-    # Bigoni method parameters
-    "onset_bigoni_smooth_ms":   0.5,
-    "onset_bigoni_min_run_ms":  0.5,
-    "onset_bigoni_walkback_sd": 1.0,
+    "addons_path":         None,   # user add-ons folder (None -> built-in only)
+    "latency_profiles":    None,   # None -> use LATENCY_PROFILE_DEFAULTS
+    "default_latency_key": None,   # None -> use DEFAULT_LATENCY_KEY
 }
+DEFAULTS.update(_detection_pref_defaults())
+# Stamped so a superseded default can be recognised rather than shadowed
+# forever by a value the analyst never deliberately chose.
+DEFAULTS["detection_defaults_version"] = _DETECTION_DEFAULTS_VERSION
 
 # ── Canonical latency profiles ────────────────────────────────────────────────
 # Each entry defines the physiological MEP onset search window for a
@@ -85,6 +86,8 @@ class Preferences:
         self.load()
 
     def load(self):
+        self.migration_notes = []
+        stored = {}
         try:
             if PREFS_FILE.exists():
                 stored = json.loads(PREFS_FILE.read_text(encoding="utf-8"))
@@ -92,7 +95,35 @@ class Preferences:
                     if k in DEFAULTS:
                         self._data[k] = v
         except Exception:
-            pass
+            stored = {}
+        # Bring forward defaults that were raised after this file was written,
+        # but only where the stored value is still the one it superseded.
+        #
+        # The version MUST come from `stored`, the file itself. `self._data`
+        # was seeded from DEFAULTS, which carries the current version, so
+        # reading it from there makes every install look up to date and the
+        # migration a no-op -- which is how a stale 60 ms offset cap survived
+        # an upgrade and silently reduced offset detection to 1 trial in 81.
+        # A file with no version key predates the stamp and is version 1.
+        try:
+            from .detection.defaults import migrate_detection_defaults
+            self.migration_notes = migrate_detection_defaults(
+                self._data, stored_version=stored.get(
+                    "detection_defaults_version", 1))
+            if self.migration_notes:
+                self.save()
+        except Exception:
+            self.migration_notes = []
+
+    def reset_detection(self):
+        """Drop stored detection settings so the canonical defaults apply."""
+        from .detection.defaults import reset_detection_defaults
+        removed = reset_detection_defaults(self._data)
+        for key in removed:
+            if key in DEFAULTS:
+                self._data[key] = DEFAULTS[key]
+        self.save()
+        return removed
 
     def save(self):
         try:
@@ -166,55 +197,219 @@ class Preferences:
 
     # ── Onset detection method ────────────────────────────────────────────────
 
+    def _det(self, key):
+        """Stored detection value, falling back to the canonical default."""
+        return self._data.get(key, DEFAULTS.get(key))
+
     @property
     def onset_method(self) -> str:
-        """Active onset detection method key. One of: 'peak_fraction', 'bootstrap'."""
-        return str(self._data.get("onset_method", "peak_fraction"))
+        """Active onset detection method key; see detection.ONSET_METHOD_LABELS."""
+        return str(self._det("onset_method"))
 
     # ── Peak-fraction parameters ──────────────────────────────────────────────
 
     @property
     def onset_peak_frac(self) -> float:
-        return float(self._data.get("onset_peak_frac", 0.15))
+        return float(self._det("onset_peak_frac"))
 
     @property
     def onset_min_peak_amplitude(self) -> float:
-        return float(self._data.get("onset_min_peak_amplitude", 0.05))
+        return float(self._det("onset_min_peak_amplitude"))
 
     @property
     def onset_slope_threshold(self) -> float:
-        return float(self._data.get("onset_slope_threshold", 0.08))
+        return float(self._det("onset_slope_threshold"))
 
     # ── Bootstrap parameters ──────────────────────────────────────────────────
 
     @property
     def onset_bootstrap_crit(self) -> float:
-        return float(self._data.get("onset_bootstrap_crit", 1.96))
+        return float(self._det("onset_bootstrap_crit"))
 
     @property
     def onset_bootstrap_n(self) -> int:
-        return int(self._data.get("onset_bootstrap_n", 500))
+        return int(self._det("onset_bootstrap_n"))
 
     @property
     def onset_bigoni_smooth_ms(self) -> float:
-        return float(self._data.get("onset_bigoni_smooth_ms", 0.5))
+        return float(self._det("onset_bigoni_smooth_ms"))
 
     @property
     def onset_bigoni_min_run_ms(self) -> float:
-        return float(self._data.get("onset_bigoni_min_run_ms", 0.5))
+        return float(self._det("onset_bigoni_min_run_ms"))
 
     @property
     def onset_bigoni_walkback_sd(self) -> float:
-        return float(self._data.get("onset_bigoni_walkback_sd", 1.0))
+        return float(self._det("onset_bigoni_walkback_sd"))
+
+    # ── RMS envelope parameters ───────────────────────────────────────────────
+
+    @property
+    def onset_env_window_ms(self) -> float:
+        return float(self._det("onset_env_window_ms"))
+
+    @property
+    def onset_env_criterion(self) -> float:
+        return float(self._det("onset_env_criterion"))
+
+    @property
+    def onset_env_significance(self) -> float:
+        return float(self._det("onset_env_significance"))
+
+    @property
+    def onset_env_n_boot(self) -> int:
+        return int(self._det("onset_env_n_boot"))
+
+    @property
+    def onset_env_min_run_ms(self) -> float:
+        return float(self._det("onset_env_min_run_ms"))
+
+    @property
+    def onset_env_min_response_ms(self) -> float:
+        return float(self._det("onset_env_min_response_ms"))
+
+    @property
+    def onset_env_tkeo(self) -> bool:
+        return bool(self._det("onset_env_tkeo"))
+
+    @property
+    def onset_env_causal(self) -> bool:
+        return bool(self._det("onset_env_causal"))
+
+    @property
+    def onset_env_refine(self) -> bool:
+        return bool(self._det("onset_env_refine"))
+
+    @property
+    def onset_env_refine_window_ms(self) -> float:
+        return float(self._det("onset_env_refine_window_ms"))
+
+    @property
+    def onset_env_refine_sd(self) -> float:
+        return float(self._det("onset_env_refine_sd"))
+
+    @property
+    def onset_env_refine_sustain_ms(self) -> float:
+        return float(self._det("onset_env_refine_sustain_ms"))
+
+    # ── CUSUM parameters ──────────────────────────────────────────────────────
+
+    @property
+    def onset_cusum_k(self) -> float:
+        return float(self._det("onset_cusum_k"))
+
+    @property
+    def onset_cusum_h(self) -> float:
+        return float(self._det("onset_cusum_h"))
+
+    @property
+    def onset_cusum_max_accum_ms(self) -> float:
+        return float(self._det("onset_cusum_max_accum_ms"))
+
+    @property
+    def onset_cusum_min_response_ms(self) -> float:
+        return float(self._det("onset_cusum_min_response_ms"))
+
+    @property
+    def onset_cusum_tkeo(self) -> bool:
+        return bool(self._det("onset_cusum_tkeo"))
+
+    # ── Consensus / agreement ─────────────────────────────────────────────────
+
+    @property
+    def onset_consensus_methods(self) -> list:
+        val = self._det("onset_consensus_methods")
+        return list(val) if val else list(DEFAULTS["onset_consensus_methods"])
+
+    @property
+    def onset_agreement(self) -> bool:
+        return bool(self._det("onset_agreement"))
+
+    # ── MEP offset ────────────────────────────────────────────────────────────
+
+    @property
+    def mep_offset_enabled(self) -> bool:
+        return bool(self._det("mep_offset_enabled"))
+
+    @property
+    def mep_offset_min_duration_ms(self) -> float:
+        return float(self._det("mep_offset_min_duration_ms"))
+
+    @property
+    def mep_offset_max_duration_ms(self) -> float:
+        return float(self._det("mep_offset_max_duration_ms"))
+
+    @property
+    def mep_offset_min_return_ms(self) -> float:
+        return float(self._det("mep_offset_min_return_ms"))
+
+    @property
+    def mep_offset_env_window_ms(self) -> float:
+        return float(self._det("mep_offset_env_window_ms"))
+
+    @property
+    def mep_offset_criterion(self) -> float:
+        return float(self._det("mep_offset_criterion"))
+
+    @property
+    def mep_offset_peak_frac(self) -> float:
+        return float(self._det("mep_offset_peak_frac"))
+
+    # ── PTP window anchoring ──────────────────────────────────────────────────
+
+    @property
+    def ptp_anchor(self) -> bool:
+        return bool(self._det("ptp_anchor"))
+
+    @property
+    def ptp_anchor_pre_ms(self) -> float:
+        return float(self._det("ptp_anchor_pre_ms"))
+
+    @property
+    def ptp_anchor_duration_ms(self) -> float:
+        return float(self._det("ptp_anchor_duration_ms"))
+
+    @property
+    def ptp_anchor_min_trials(self) -> int:
+        return int(self._det("ptp_anchor_min_trials"))
+
+    def set_detection_prefs(self, **kwargs):
+        """
+        Persist any subset of detection preferences by config field name.
+
+        Complements set_onset_prefs, whose fixed positional signature would
+        need extending for every new parameter. Unknown keys are rejected
+        rather than silently written, so a typo cannot create a dead
+        preference that never reads back.
+        """
+        from .detection.defaults import DETECTION_DEFAULTS, pref_key_for
+        unknown = set(kwargs) - set(DETECTION_DEFAULTS)
+        if unknown:
+            raise KeyError("unknown detection preference(s): %s"
+                           % ", ".join(sorted(unknown)))
+        for key, value in kwargs.items():
+            self._data[pref_key_for(key)] = value
+        self.save()
 
     def set_onset_prefs(self, method: str,
                         peak_frac: float, min_peak_amplitude: float,
                         slope_threshold: float,
                         bootstrap_crit: float, bootstrap_n: int,
-                        bigoni_smooth_ms: float = 0.5,
-                        bigoni_min_run_ms: float = 0.5,
-                        bigoni_walkback_sd: float = 1.0):
-        """Persist all onset detection preferences."""
+                        bigoni_smooth_ms: float = None,
+                        bigoni_min_run_ms: float = None,
+                        bigoni_walkback_sd: float = None):
+        """Persist the onset detection preferences exposed by the GUI.
+
+        Bigoni parameters default to None rather than to literals, so the
+        canonical values in detection.defaults are the only place they are
+        written down.
+        """
+        if bigoni_smooth_ms is None:
+            bigoni_smooth_ms = DEFAULTS["onset_bigoni_smooth_ms"]
+        if bigoni_min_run_ms is None:
+            bigoni_min_run_ms = DEFAULTS["onset_bigoni_min_run_ms"]
+        if bigoni_walkback_sd is None:
+            bigoni_walkback_sd = DEFAULTS["onset_bigoni_walkback_sd"]
         self._data["onset_method"]              = method
         self._data["onset_peak_frac"]           = round(float(peak_frac), 4)
         self._data["onset_min_peak_amplitude"]  = round(float(min_peak_amplitude), 4)
@@ -467,133 +662,332 @@ def open_preferences_dialog(root, on_apply=None):
     det_tab = tk.Frame(notebook)
     notebook.add(det_tab, text="Detection")
 
-    tk.Label(det_tab, text="Onset Latency Detection Method",
+    # ── Scrollable body ──────────────────────────────────────────────────────
+    # Seven methods plus their parameters, the offset settings and the
+    # agreement toggle no longer fit a fixed-height tab on a laptop screen.
+    _det_canvas = tk.Canvas(det_tab, highlightthickness=0, borderwidth=0)
+    _det_scroll = ttk.Scrollbar(det_tab, orient="vertical",
+                                command=_det_canvas.yview)
+    _det_body = tk.Frame(_det_canvas)
+    _det_body.bind(
+        "<Configure>",
+        lambda e: _det_canvas.configure(scrollregion=_det_canvas.bbox("all")))
+    _det_win = _det_canvas.create_window((0, 0), window=_det_body, anchor="nw")
+    _det_canvas.bind(
+        "<Configure>",
+        lambda e: _det_canvas.itemconfigure(_det_win, width=e.width))
+    _det_canvas.configure(yscrollcommand=_det_scroll.set)
+    _det_canvas.pack(side="left", fill="both", expand=True)
+    _det_scroll.pack(side="right", fill="y")
+
+    def _det_wheel(event):
+        _det_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+    _det_canvas.bind_all("<MouseWheel>", _det_wheel)
+
+    tk.Label(_det_body, text="Onset Latency Detection Method",
              font=("TkDefaultFont", 11, "bold")).pack(pady=(14, 4), anchor="w", padx=16)
 
-    tk.Label(det_tab,
+    tk.Label(_det_body,
              text="Sets the global default method. Individual files can override\n"
                   "this in Stage 1a without affecting the preference here.",
              justify="left", fg="grey").pack(anchor="w", padx=16, pady=(0, 10))
 
     method_var = tk.StringVar(value=prefs.onset_method)
 
-    # ── Method descriptions ───────────────────────────────────────────────────
-    METHOD_DESCRIPTIONS = {
-        "peak_fraction": (
-            "Peak Fraction\n\n"
-            "Finds the largest peak in the MEP window, sets a threshold at a\n"
-            "fraction of that peak, then backtracks to find the onset. Fast and\n"
-            "works well on clean, high-amplitude MEPs."
-        ),
-        "bootstrap": (
-            "Bootstrap Threshold\n\n"
-            "Estimates a noise threshold from the pre-stimulus baseline using a\n"
-            "bootstrap distribution, then finds the onset via a peak-anchored\n"
-            "backward scan within the physiological latency window. More robust\n"
-            "on noisy or low-amplitude signals."
-        ),
-        "bigoni_walkback": (
-            "Derivative-based + Walkback (Modified Bigoni)\n\n"
-            "Runs the Bigoni derivative algorithm to find the steepest rising\n"
-            "edge, then walks back to the true point of departure from\n"
-            "baseline. Corrects the systematic late-placement of the standard\n"
-            "Bigoni method on clean waveforms. The SD multiplier controls\n"
-            "how far back the walkback travels — lower = earlier onset."
-        ),
-        "bigoni": (
-            "Derivative-based (Bigoni et al. 2022)\n\n"
-            "Identifies the onset as the start of the longest sustained positive\n"
-            "derivative run in the rising edge of the MEP. Does not rely on\n"
-            "pre-stimulus baseline statistics — robust on active-contraction data\n"
-            "and biphasic waveforms. Reference: J Neural Eng 19 (2022) 024002."
-        ),
-    }
+    # ── Method radios, generated from the detection registry ─────────────────
+    # Built from ONSET_METHOD_LABELS rather than a literal list, so registering
+    # a detector makes it selectable without a matching edit here. The previous
+    # hard-coded list is why three methods were reachable from the pipeline but
+    # invisible in the GUI.
+    from .detection import ONSET_METHOD_HINTS, ONSET_METHOD_LABELS
 
-    # Radio buttons
-    radio_frame = tk.Frame(det_tab)
+    radio_frame = tk.Frame(_det_body)
     radio_frame.pack(anchor="w", padx=16, pady=(0, 6))
 
-    desc_lbl = tk.Label(det_tab, text="", justify="left", fg="#444",
+    desc_lbl = tk.Label(_det_body, text="", justify="left", fg="#444",
                         wraplength=460, anchor="w")
     desc_lbl.pack(anchor="w", padx=16, pady=(0, 12))
 
     def _update_desc(*_):
-        desc_lbl.config(text=METHOD_DESCRIPTIONS.get(method_var.get(), ""))
+        m = method_var.get()
+        desc_lbl.config(text="%s\n\n%s" % (
+            ONSET_METHOD_LABELS.get(m, m), ONSET_METHOD_HINTS.get(m, "")))
         _toggle_param_frames()
 
-    for key, label in [("peak_fraction", "Peak Fraction"),
-                        ("bootstrap",    "Bootstrap Threshold"),
-                        ("bigoni",       "Derivative-based (Bigoni et al. 2022)"),
-                        ("bigoni_walkback", "Derivative-based + Walkback (Modified Bigoni)")]:
-        tk.Radiobutton(radio_frame, text=label, variable=method_var,
-                       value=key, command=_update_desc)\
-            .pack(anchor="w", pady=2)
+    _ORDER = ["bigoni", "bigoni_walkback", "rms_envelope", "cusum",
+              "consensus", "peak_fraction", "bootstrap"]
+    _ordered = [k for k in _ORDER if k in ONSET_METHOD_LABELS]
+    _ordered += [k for k in ONSET_METHOD_LABELS if k not in _ordered]
+    for key in _ordered:
+        tk.Radiobutton(radio_frame, text=ONSET_METHOD_LABELS[key],
+                       variable=method_var, value=key, command=_update_desc)\
+            .pack(anchor="w", pady=1)
 
-    # ── Parameter frames (show/hide based on selection) ───────────────────────
-    # Peak-fraction parameters
-    pf_frame = tk.LabelFrame(det_tab, text="Peak Fraction parameters", padx=10, pady=8)
-
-    def _pf_row(parent, label, var, row):
-        tk.Label(parent, text=label, anchor="w", width=28)\
+    # ── Row helper ───────────────────────────────────────────────────────────
+    def _pf_row(parent, label, var, row, hint=None):
+        tk.Label(parent, text=label, anchor="w", width=30)\
             .grid(row=row, column=0, sticky="w", pady=3)
         tk.Entry(parent, textvariable=var, width=8, justify="center")\
             .grid(row=row, column=1, padx=8, sticky="w")
+        if hint:
+            tk.Label(parent, text=hint, fg="grey", anchor="w")\
+                .grid(row=row, column=2, sticky="w", padx=(4, 0))
 
+    def _check(parent, label, var, row, hint=None):
+        tk.Checkbutton(parent, text=label, variable=var, anchor="w")\
+            .grid(row=row, column=0, columnspan=2, sticky="w", pady=2)
+        if hint:
+            tk.Label(parent, text=hint, fg="grey", anchor="w")\
+                .grid(row=row, column=2, sticky="w", padx=(4, 0))
+
+    # ── Applies to every method ──────────────────────────────────────────────
+    # min_peak_amplitude gates all seven detectors, but used to sit inside the
+    # "Peak Fraction parameters" frame and was therefore hidden whenever any
+    # other method was selected -- while still applying.
+    common_frame = tk.LabelFrame(_det_body, text="Applies to all methods",
+                                 padx=10, pady=8)
+    pf_min_amp_var = tk.StringVar(value=str(prefs.onset_min_peak_amplitude))
+    _pf_row(common_frame, "Min peak amplitude (mV)", pf_min_amp_var, 0,
+            "response smaller than this is not detected")
+    common_frame.pack(anchor="w", padx=16, pady=(0, 8), fill="x")
+
+    # ── Peak-fraction ────────────────────────────────────────────────────────
+    pf_frame = tk.LabelFrame(_det_body, text="Peak Fraction parameters",
+                             padx=10, pady=8)
     pf_peak_frac_var = tk.StringVar(value=str(prefs.onset_peak_frac))
-    pf_min_amp_var   = tk.StringVar(value=str(prefs.onset_min_peak_amplitude))
     pf_slope_var     = tk.StringVar(value=str(prefs.onset_slope_threshold))
+    _pf_row(pf_frame, "Peak fraction (0-1)",     pf_peak_frac_var, 0)
+    _pf_row(pf_frame, "Slope threshold (mV/ms)", pf_slope_var,     1)
 
-    _pf_row(pf_frame, "Peak fraction (0–1)",        pf_peak_frac_var, 0)
-    _pf_row(pf_frame, "Min peak amplitude (mV)",    pf_min_amp_var,   1)
-    _pf_row(pf_frame, "Slope threshold (mV/ms)",    pf_slope_var,     2)
-
-    # Bootstrap parameters
-    bs_frame = tk.LabelFrame(det_tab, text="Bootstrap parameters", padx=10, pady=8)
-
+    # ── Bootstrap (legacy) ───────────────────────────────────────────────────
+    bs_frame = tk.LabelFrame(_det_body, text="Bootstrap parameters",
+                             padx=10, pady=8)
     bs_crit_var = tk.StringVar(value=str(prefs.onset_bootstrap_crit))
     bs_n_var    = tk.StringVar(value=str(prefs.onset_bootstrap_n))
+    _pf_row(bs_frame, "Criterion (SD multiplier)", bs_crit_var, 0)
+    _pf_row(bs_frame, "Bootstrap iterations",      bs_n_var,    1)
+    tk.Label(bs_frame,
+             text="Retained so analyses run on v1.3.x reproduce exactly.\n"
+                  "Its threshold is clipped to a multiple of the baseline\n"
+                  "mean, which places onsets early; prefer RMS Envelope\n"
+                  "for new work.",
+             fg="#a00", justify="left").grid(row=2, column=0, columnspan=3,
+                                             sticky="w", pady=(6, 0))
 
-    _pf_row(bs_frame, "Criterion (SD multiplier)",  bs_crit_var, 0)
-    _pf_row(bs_frame, "Bootstrap iterations",       bs_n_var,    1)
-
-    # Bigoni parameters
-    bg_frame = tk.LabelFrame(det_tab, text="Derivative-based parameters", padx=10, pady=12)
-
-
-    bg_smooth_var  = tk.StringVar(value=str(prefs.onset_bigoni_smooth_ms))
-    bg_run_var     = tk.StringVar(value=str(prefs.onset_bigoni_min_run_ms))
-    bg_wb_sd_var   = tk.StringVar(value=str(prefs.onset_bigoni_walkback_sd))
-
-    _pf_row(bg_frame, "Smoothing window (ms)",      bg_smooth_var, 0)
-    _pf_row(bg_frame, "Min positive run (ms)",      bg_run_var,    1)
-
+    # ── Bigoni ───────────────────────────────────────────────────────────────
+    bg_frame = tk.LabelFrame(_det_body, text="Derivative-based parameters",
+                             padx=10, pady=12)
+    bg_smooth_var = tk.StringVar(value=str(prefs.onset_bigoni_smooth_ms))
+    bg_run_var    = tk.StringVar(value=str(prefs.onset_bigoni_min_run_ms))
+    bg_wb_sd_var  = tk.StringVar(value=str(prefs.onset_bigoni_walkback_sd))
+    _pf_row(bg_frame, "Smoothing window (ms)", bg_smooth_var, 0)
+    _pf_row(bg_frame, "Min positive run (ms)", bg_run_var,    1)
     tk.Label(bg_frame,
              text="Set smoothing to 0 to disable. Min run filters\n"
                   "single-sample noise spikes from onset selection.",
-             fg="grey", justify="left").grid(row=2, column=0, columnspan=2,
+             fg="grey", justify="left").grid(row=2, column=0, columnspan=3,
                                              sticky="w", pady=(4, 0))
 
-    wb_frame = tk.LabelFrame(det_tab, text="Walkback parameters", padx=10, pady=8)
+    wb_frame = tk.LabelFrame(_det_body, text="Walkback parameters",
+                             padx=10, pady=8)
     _pf_row(wb_frame, "Walkback SD multiplier", bg_wb_sd_var, 0)
     tk.Label(wb_frame, text="Lower = earlier onset. Default 1.0.",
-             fg="grey", justify="left").grid(row=1, column=0, columnspan=2,
+             fg="grey", justify="left").grid(row=1, column=0, columnspan=3,
                                              sticky="w", pady=(4, 0))
 
+    # ── RMS envelope ─────────────────────────────────────────────────────────
+    env_frame = tk.LabelFrame(_det_body, text="RMS Envelope parameters",
+                              padx=10, pady=8)
+    env_win_var     = tk.StringVar(value=str(prefs.onset_env_window_ms))
+    env_crit_var    = tk.StringVar(value=str(prefs.onset_env_criterion))
+    env_sig_var     = tk.StringVar(value=str(prefs.onset_env_significance))
+    env_nboot_var   = tk.StringVar(value=str(prefs.onset_env_n_boot))
+    env_minrun_var  = tk.StringVar(value=str(prefs.onset_env_min_run_ms))
+    env_minresp_var = tk.StringVar(value=str(prefs.onset_env_min_response_ms))
+    env_tkeo_var    = tk.BooleanVar(value=prefs.onset_env_tkeo)
+    env_causal_var  = tk.BooleanVar(value=prefs.onset_env_causal)
+    env_refine_var  = tk.BooleanVar(value=prefs.onset_env_refine)
+    env_rwin_var    = tk.StringVar(value=str(prefs.onset_env_refine_window_ms))
+    env_rsd_var     = tk.StringVar(value=str(prefs.onset_env_refine_sd))
+    env_rsus_var    = tk.StringVar(value=str(prefs.onset_env_refine_sustain_ms))
+    _pf_row(env_frame, "Envelope window (ms)",    env_win_var,     0)
+    _pf_row(env_frame, "Criterion (SD multiplier)", env_crit_var,  1)
+    _pf_row(env_frame, "Significance",            env_sig_var,     2,
+            "for the run-length criterion")
+    _pf_row(env_frame, "Bootstrap iterations",    env_nboot_var,   3)
+    _pf_row(env_frame, "Min above-threshold (ms)", env_minrun_var, 4)
+    _pf_row(env_frame, "Min response width (ms)", env_minresp_var, 5,
+            "rejects single-sample artefacts; 0 disables")
+    _check(env_frame, "Teager-Kaiser preconditioning", env_tkeo_var, 6,
+           "sharpens low-SNR onsets")
+    _check(env_frame, "Causal window", env_causal_var, 7)
+    _check(env_frame, "Refine onset on a short window", env_refine_var, 8,
+           "strongly recommended")
+    _pf_row(env_frame, "  Refine window (ms)",     env_rwin_var,  9)
+    _pf_row(env_frame, "  Refine SD multiplier",   env_rsd_var,  10)
+    _pf_row(env_frame, "  Refine sustain (ms)",    env_rsus_var, 11)
+    tk.Label(env_frame,
+             text="With refinement off, a wide envelope window places the\n"
+                  "onset several ms early. Leave it on unless comparing\n"
+                  "against a published unrefined implementation.",
+             fg="grey", justify="left").grid(row=12, column=0, columnspan=3,
+                                             sticky="w", pady=(6, 0))
+
+    # ── CUSUM ────────────────────────────────────────────────────────────────
+    cs_frame = tk.LabelFrame(_det_body, text="CUSUM parameters",
+                             padx=10, pady=8)
+    cs_k_var       = tk.StringVar(value=str(prefs.onset_cusum_k))
+    cs_h_var       = tk.StringVar(value=str(prefs.onset_cusum_h))
+    cs_accum_var   = tk.StringVar(value=str(prefs.onset_cusum_max_accum_ms))
+    cs_minresp_var = tk.StringVar(value=str(prefs.onset_cusum_min_response_ms))
+    cs_tkeo_var    = tk.BooleanVar(value=prefs.onset_cusum_tkeo)
+    _pf_row(cs_frame, "Allowance k (SD)",        cs_k_var,       0,
+            "shifts smaller than this are ignored")
+    _pf_row(cs_frame, "Decision interval h (SD)", cs_h_var,      1,
+            "higher = fewer false alarms")
+    _pf_row(cs_frame, "Max accumulation (ms)",   cs_accum_var,   2,
+            "0 = classical unbounded CUSUM")
+    _pf_row(cs_frame, "Min response width (ms)", cs_minresp_var, 3)
+    _check(cs_frame, "Teager-Kaiser preconditioning", cs_tkeo_var, 4)
+
+    # ── Consensus ────────────────────────────────────────────────────────────
+    cons_frame = tk.LabelFrame(_det_body, text="Consensus members",
+                               padx=10, pady=8)
+    _cons_selected = set(prefs.onset_consensus_methods)
+    cons_vars = {}
+    _r = 0
+    for key in _ordered:
+        if key == "consensus":
+            continue
+        v = tk.BooleanVar(value=key in _cons_selected)
+        cons_vars[key] = v
+        tk.Checkbutton(cons_frame, text=ONSET_METHOD_LABELS[key],
+                       variable=v, anchor="w")\
+            .grid(row=_r, column=0, columnspan=3, sticky="w", pady=1)
+        _r += 1
+    tk.Label(cons_frame,
+             text="The reported onset is the median of the members that\n"
+                  "detect one. An odd number of members is preferable.\n"
+                  "Bootstrap Threshold is slow and best left unticked.",
+             fg="grey", justify="left").grid(row=_r, column=0, columnspan=3,
+                                             sticky="w", pady=(6, 0))
+
+    _METHOD_FRAMES = {
+        "peak_fraction":   [pf_frame],
+        "bootstrap":       [bs_frame],
+        "bigoni":          [bg_frame],
+        "bigoni_walkback": [bg_frame, wb_frame],
+        "rms_envelope":    [env_frame],
+        "cusum":           [cs_frame],
+        "consensus":       [cons_frame],
+    }
+
+    # ── MEP offset (independent of the onset method) ─────────────────────────
+    off_frame = tk.LabelFrame(_det_body, text="MEP Offset & Duration",
+                              padx=10, pady=8)
+    off_en_var     = tk.BooleanVar(value=prefs.mep_offset_enabled)
+    off_mindur_var = tk.StringVar(value=str(prefs.mep_offset_min_duration_ms))
+    off_maxdur_var = tk.StringVar(value=str(prefs.mep_offset_max_duration_ms))
+    off_ret_var    = tk.StringVar(value=str(prefs.mep_offset_min_return_ms))
+    off_win_var    = tk.StringVar(value=str(prefs.mep_offset_env_window_ms))
+    off_crit_var   = tk.StringVar(value=str(prefs.mep_offset_criterion))
+    off_frac_var   = tk.StringVar(value=str(prefs.mep_offset_peak_frac))
+    _check(off_frame, "Detect MEP offset and duration", off_en_var, 0)
+    _pf_row(off_frame, "Min duration (ms)",      off_mindur_var, 1)
+    _pf_row(off_frame, "Max duration (ms)",      off_maxdur_var, 2,
+            "raise for slow or polyphasic responses")
+    _pf_row(off_frame, "Min return to baseline (ms)", off_ret_var, 3)
+    _pf_row(off_frame, "Envelope window (ms)",   off_win_var,    4)
+    _pf_row(off_frame, "Criterion (SD multiplier)", off_crit_var, 5)
+    _pf_row(off_frame, "Peak fraction floor (0-1)", off_frac_var, 6,
+            "scales the return threshold to the response")
+    tk.Label(off_frame,
+             text="Where a cortical silent period is detected, its start IS\n"
+                  "the end of the MEP and is reported as the offset. Where\n"
+                  "there is none, the return to baseline is detected instead,\n"
+                  "which also gives AUC an endpoint at rest.",
+             fg="grey", justify="left").grid(row=7, column=0, columnspan=3,
+                                             sticky="w", pady=(6, 0))
+    off_frame.pack(anchor="w", padx=16, pady=(8, 8), fill="x")
+
+    # ── PTP measurement window anchoring ─────────────────────────────────────
+    ptpa_frame = tk.LabelFrame(_det_body, text="PTP Window Anchoring",
+                               padx=10, pady=8)
+    ptpa_en_var   = tk.BooleanVar(value=prefs.ptp_anchor)
+    ptpa_pre_var  = tk.StringVar(value=str(prefs.ptp_anchor_pre_ms))
+    ptpa_dur_var  = tk.StringVar(value=str(prefs.ptp_anchor_duration_ms))
+    ptpa_min_var  = tk.StringVar(value=str(prefs.ptp_anchor_min_trials))
+    _check(ptpa_frame, "Anchor PTP window to each event type's median onset",
+           ptpa_en_var, 0)
+    _pf_row(ptpa_frame, "Window starts before onset (ms)", ptpa_pre_var, 1)
+    _pf_row(ptpa_frame, "Window length from onset (ms)",   ptpa_dur_var, 2)
+    _pf_row(ptpa_frame, "Min onsets before anchoring",     ptpa_min_var, 3,
+            "below this the file-wide window is kept")
+    tk.Label(ptpa_frame,
+             text="The PTP window in 1c is one setting for the whole file, but\n"
+                  "each event type has its own latency profile. A recording\n"
+                  "containing both M-waves and MEPs cannot be measured by one\n"
+                  "window: with a 10 ms start, an M-wave beginning at 4 ms has\n"
+                  "most of its response excluded from the amplitude. Anchoring\n"
+                  "gives each event type a window placed on its own median\n"
+                  "onset. The 1c window end is still applied as a ceiling.",
+             fg="grey", justify="left").grid(row=4, column=0, columnspan=3,
+                                             sticky="w", pady=(6, 0))
+    ptpa_frame.pack(anchor="w", padx=16, pady=(0, 8), fill="x")
+
+    # ── Agreement ────────────────────────────────────────────────────────────
+    ag_frame = tk.LabelFrame(_det_body, text="Onset Method Agreement",
+                             padx=10, pady=8)
+    ag_var = tk.BooleanVar(value=prefs.onset_agreement)
+    _check(ag_frame, "Compare methods on every trial", ag_var, 0)
+    tk.Label(ag_frame,
+             text="Runs the consensus members alongside the selected method\n"
+                  "and reports how far apart they land, as\n"
+                  "Onset_Disagreement(ms). Trials where methods diverge are\n"
+                  "the ones worth reviewing by hand. Slows detection roughly\n"
+                  "in proportion to the number of members.",
+             fg="grey", justify="left").grid(row=1, column=0, columnspan=3,
+                                             sticky="w", pady=(4, 0))
+    ag_frame.pack(anchor="w", padx=16, pady=(0, 12), fill="x")
+
     def _toggle_param_frames():
-        m = method_var.get()
-        bs_frame.pack_forget()
-        pf_frame.pack_forget()
-        bg_frame.pack_forget()
-        wb_frame.pack_forget()
-        if m == "peak_fraction":
-            pf_frame.pack(anchor="w", padx=16, pady=(0, 8), fill="x")
-        elif m == "bootstrap":
-            bs_frame.pack(anchor="w", padx=16, pady=(0, 8), fill="x")
-        elif m == "bigoni":
-            bg_frame.pack(anchor="w", padx=16, pady=(0, 8), fill="x")
-        elif m == "bigoni_walkback":
-            bg_frame.pack(anchor="w", padx=16, pady=(0, 4), fill="x")
-            wb_frame.pack(anchor="w", padx=16, pady=(0, 8), fill="x")
+        for _f in (pf_frame, bs_frame, bg_frame, wb_frame,
+                   env_frame, cs_frame, cons_frame):
+            _f.pack_forget()
+        # Offset and agreement are method-independent and stay put; repacking
+        # them keeps them below the method-specific frames.
+        off_frame.pack_forget()
+        ptpa_frame.pack_forget()
+        ag_frame.pack_forget()
+        for _f in _METHOD_FRAMES.get(method_var.get(), []):
+            _f.pack(anchor="w", padx=16, pady=(0, 8), fill="x")
+        off_frame.pack(anchor="w", padx=16, pady=(8, 8), fill="x")
+        ptpa_frame.pack(anchor="w", padx=16, pady=(0, 8), fill="x")
+        ag_frame.pack(anchor="w", padx=16, pady=(0, 12), fill="x")
+
+    # ── Restore detection defaults ───────────────────────────────────────────
+    def _restore_detection_defaults():
+        from tkinter import messagebox
+        if not messagebox.askyesno(
+                "Restore detection defaults",
+                "Reset every setting on this tab to its shipped default?\n\n"
+                "Latency profiles, fonts and add-on paths are not affected.",
+                parent=win):
+            return
+        prefs.reset_detection()
+        messagebox.showinfo(
+            "Detection defaults restored",
+            "Close and reopen Preferences to see the restored values.",
+            parent=win)
+
+    _rst = tk.Frame(_det_body)
+    _rst.pack(anchor="w", padx=16, pady=(0, 14))
+    tk.Button(_rst, text="Restore detection defaults",
+              command=_restore_detection_defaults).pack(side="left")
+    tk.Label(_rst,
+             text="  Use after updating if a value looks stale: settings saved\n"
+                  "  by an earlier version take precedence over new defaults.",
+             fg="grey", justify="left").pack(side="left")
 
     # Initialise
     _update_desc()
@@ -641,19 +1035,79 @@ def open_preferences_dialog(root, on_apply=None):
         def_key = tuple(raw_key) if len(raw_key) == 2 else DEFAULT_LATENCY_KEY
         prefs.set_latency_prefs(updated, def_key)
 
-        # Onset detection
-        try:
-            pf   = float(pf_peak_frac_var.get())
-            mpa  = float(pf_min_amp_var.get())
-            slp  = float(pf_slope_var.get())
-            crit = float(bs_crit_var.get())
-            n    = int(bs_n_var.get())
-            bsm  = float(bg_smooth_var.get())
-            brn  = float(bg_run_var.get())
-            bwb  = float(bg_wb_sd_var.get())
-            prefs.set_onset_prefs(method_var.get(), pf, mpa, slp, crit, n, bsm, brn, bwb)
-        except ValueError:
-            pass
+        # ── Detection ────────────────────────────────────────────────────────
+        # Fields are parsed individually so that one malformed entry does not
+        # discard every other edit on the tab. The previous single try/except
+        # around the whole block silently dropped all onset settings if any one
+        # box held a typo -- the dialog closed as though it had saved.
+        _bad = []
+
+        def _num(var, key, cast=float):
+            try:
+                return cast(var.get())
+            except (TypeError, ValueError):
+                _bad.append(key)
+                return None
+
+        _det = {
+            "onset_method":                method_var.get(),
+            "peak_fraction":               _num(pf_peak_frac_var, "Peak fraction"),
+            "min_peak_amplitude":          _num(pf_min_amp_var, "Min peak amplitude"),
+            "slope_threshold":             _num(pf_slope_var, "Slope threshold"),
+            "onset_bootstrap_crit":        _num(bs_crit_var, "Bootstrap criterion"),
+            "onset_bootstrap_n":           _num(bs_n_var, "Bootstrap iterations", int),
+            "onset_bigoni_smooth_ms":      _num(bg_smooth_var, "Smoothing window"),
+            "onset_bigoni_min_run_ms":     _num(bg_run_var, "Min positive run"),
+            "onset_bigoni_walkback_sd":    _num(bg_wb_sd_var, "Walkback SD"),
+            "onset_env_window_ms":         _num(env_win_var, "Envelope window"),
+            "onset_env_criterion":         _num(env_crit_var, "Envelope criterion"),
+            "onset_env_significance":      _num(env_sig_var, "Envelope significance"),
+            "onset_env_n_boot":            _num(env_nboot_var, "Envelope iterations", int),
+            "onset_env_min_run_ms":        _num(env_minrun_var, "Min above-threshold"),
+            "onset_env_min_response_ms":   _num(env_minresp_var, "Envelope min response width"),
+            "onset_env_tkeo":              bool(env_tkeo_var.get()),
+            "onset_env_causal":            bool(env_causal_var.get()),
+            "onset_env_refine":            bool(env_refine_var.get()),
+            "onset_env_refine_window_ms":  _num(env_rwin_var, "Refine window"),
+            "onset_env_refine_sd":         _num(env_rsd_var, "Refine SD multiplier"),
+            "onset_env_refine_sustain_ms": _num(env_rsus_var, "Refine sustain"),
+            "onset_cusum_k":               _num(cs_k_var, "CUSUM allowance k"),
+            "onset_cusum_h":               _num(cs_h_var, "CUSUM decision interval h"),
+            "onset_cusum_max_accum_ms":    _num(cs_accum_var, "CUSUM max accumulation"),
+            "onset_cusum_min_response_ms": _num(cs_minresp_var, "CUSUM min response width"),
+            "onset_cusum_tkeo":            bool(cs_tkeo_var.get()),
+            "onset_agreement":             bool(ag_var.get()),
+            "mep_offset_enabled":          bool(off_en_var.get()),
+            "mep_offset_min_duration_ms":  _num(off_mindur_var, "Offset min duration"),
+            "mep_offset_max_duration_ms":  _num(off_maxdur_var, "Offset max duration"),
+            "mep_offset_min_return_ms":    _num(off_ret_var, "Min return to baseline"),
+            "mep_offset_env_window_ms":    _num(off_win_var, "Offset envelope window"),
+            "mep_offset_criterion":        _num(off_crit_var, "Offset criterion"),
+            "mep_offset_peak_frac":        _num(off_frac_var, "Offset peak fraction"),
+            "ptp_anchor":                  bool(ptpa_en_var.get()),
+            "ptp_anchor_pre_ms":           _num(ptpa_pre_var, "PTP anchor pre-onset"),
+            "ptp_anchor_duration_ms":      _num(ptpa_dur_var, "PTP anchor duration"),
+            "ptp_anchor_min_trials":       _num(ptpa_min_var, "PTP anchor min onsets", int),
+        }
+
+        _members = [k for k, v in cons_vars.items() if v.get()]
+        if _members:
+            _det["onset_consensus_methods"] = _members
+        elif method_var.get() == "consensus":
+            _bad.append("Consensus members (none selected)")
+
+        # Drop only the fields that failed to parse; keep everything valid.
+        prefs.set_detection_prefs(
+            **{k: v for k, v in _det.items() if v is not None})
+
+        if _bad:
+            from tkinter import messagebox
+            messagebox.showwarning(
+                "Some settings were not saved",
+                "These fields could not be read and kept their previous "
+                "values:\n\n  - " + "\n  - ".join(_bad) +
+                "\n\nEverything else on the Detection tab was saved.",
+                parent=win)
 
         prefs.set_addons_path(addons_path_var.get())
 

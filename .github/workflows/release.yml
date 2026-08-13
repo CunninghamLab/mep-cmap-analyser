@@ -151,7 +151,13 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          pip install pytest
+          # pyflakes is not optional here. app.py cannot be imported without a
+          # working matplotlib Tk backend, so most of it is never executed by
+          # the suite; the undefined-name check is what covers that blind spot,
+          # and tests/test_gui_detection_wiring.py SKIPS it when pyflakes is
+          # absent. A skipped guard on the job that gates publication is the
+          # same as no guard.
+          pip install pytest pyflakes
           pip install mne || echo "MNE unavailable - parity test will skip"
       - name: Tag must match TOOL_VERSION
         run: |

@@ -47,6 +47,16 @@ from .detection     import (compute_ptp, compute_rms, compute_auc,
                              detect_mep_onset_bootstrap,
                              detect_mep_onset_bigoni,
                              detect_mep_onset_bigoni_walkback,
+                             detect_mep_onset_rms_envelope,
+                             detect_mep_onset_cusum,
+                             detect_mep_onset_consensus,
+                             compute_onset_agreement,
+                             dispatch_onset,
+                             resolve_mep_offset,
+                             detector_params,
+                             config_detection_kwargs,
+                             DEFAULT_ONSET_METHOD,
+                             DETECTION_DEFAULTS,
                              compute_bootstrap_threshold)
 from .normalisation import (compute_mmax, apply_normalisation,
                             apply_emg_compensation, EXCLUDED_DECISIONS)
@@ -122,6 +132,10 @@ def clamp_config_to_epoch_bounds(cfg, bounds):
     return cfg, changes
 
 
+# Short alias so the field list below stays readable.
+_DD = DETECTION_DEFAULTS
+
+
 @dataclass
 class PipelineConfig:
     """Bundles all analysis settings so subfunctions share one parameter object."""
@@ -158,16 +172,59 @@ class PipelineConfig:
     filter_family:     str   = "butter"
     cheby_ripple:      float = 1.0
     # Onset detection
-    peak_fraction:         float = 0.15
-    min_peak_amplitude:    float = 0.05
-    slope_threshold:       float = 0.08
-    # "peak_fraction" | "bootstrap" | "bigoni" | "bigoni_walkback"
-    onset_method:              str   = "peak_fraction"
-    onset_bootstrap_crit:      float = 1.96
-    onset_bootstrap_n:         int   = 500
-    onset_bigoni_smooth_ms:    float = 0.5
-    onset_bigoni_min_run_ms:   float = 0.5
-    onset_bigoni_walkback_sd:  float = 1.0
+    #
+    # Every default below is read from mep_cmap.detection.defaults rather than
+    # written as a literal. That module is the single source of truth shared
+    # with preferences.py and the GUI; restating values here is what allowed
+    # onset_method to default to "peak_fraction" in this dataclass while
+    # preferences defaulted to "bigoni". tests/test_detection_defaults.py
+    # fails if the two ever drift apart again.
+    peak_fraction:         float = _DD["peak_fraction"]
+    min_peak_amplitude:    float = _DD["min_peak_amplitude"]
+    slope_threshold:       float = _DD["slope_threshold"]
+    # See detection.ONSET_METHOD_LABELS for the full set of keys.
+    onset_method:              str   = DEFAULT_ONSET_METHOD
+    onset_bootstrap_crit:      float = _DD["onset_bootstrap_crit"]
+    onset_bootstrap_n:         int   = _DD["onset_bootstrap_n"]
+    onset_bigoni_smooth_ms:    float = _DD["onset_bigoni_smooth_ms"]
+    onset_bigoni_min_run_ms:   float = _DD["onset_bigoni_min_run_ms"]
+    onset_bigoni_walkback_sd:  float = _DD["onset_bigoni_walkback_sd"]
+    # RMS envelope
+    onset_env_window_ms:         float = _DD["onset_env_window_ms"]
+    onset_env_criterion:         float = _DD["onset_env_criterion"]
+    onset_env_significance:      float = _DD["onset_env_significance"]
+    onset_env_n_boot:            int   = _DD["onset_env_n_boot"]
+    onset_env_min_run_ms:        float = _DD["onset_env_min_run_ms"]
+    onset_env_min_response_ms:   float = _DD["onset_env_min_response_ms"]
+    onset_env_tkeo:              bool  = _DD["onset_env_tkeo"]
+    onset_env_causal:            bool  = _DD["onset_env_causal"]
+    onset_env_refine:            bool  = _DD["onset_env_refine"]
+    onset_env_refine_window_ms:  float = _DD["onset_env_refine_window_ms"]
+    onset_env_refine_sd:         float = _DD["onset_env_refine_sd"]
+    onset_env_refine_sustain_ms: float = _DD["onset_env_refine_sustain_ms"]
+    # CUSUM
+    onset_cusum_k:               float = _DD["onset_cusum_k"]
+    onset_cusum_h:               float = _DD["onset_cusum_h"]
+    onset_cusum_max_accum_ms:    float = _DD["onset_cusum_max_accum_ms"]
+    onset_cusum_min_response_ms: float = _DD["onset_cusum_min_response_ms"]
+    onset_cusum_tkeo:            bool  = _DD["onset_cusum_tkeo"]
+    # Consensus / per-trial method agreement
+    onset_consensus_methods: list = field(
+        default_factory=lambda: list(_DD["onset_consensus_methods"]))
+    onset_agreement:             bool  = _DD["onset_agreement"]
+    # MEP offset (return of the response to baseline)
+    mep_offset_enabled:          bool  = _DD["mep_offset_enabled"]
+    mep_offset_min_duration_ms:  float = _DD["mep_offset_min_duration_ms"]
+    mep_offset_max_duration_ms:  float = _DD["mep_offset_max_duration_ms"]
+    mep_offset_min_return_ms:    float = _DD["mep_offset_min_return_ms"]
+    mep_offset_env_window_ms:    float = _DD["mep_offset_env_window_ms"]
+    mep_offset_criterion:        float = _DD["mep_offset_criterion"]
+    mep_offset_peak_frac:        float = _DD["mep_offset_peak_frac"]
+    # PTP measurement window anchored per stimulus type
+    ptp_anchor:                  bool  = _DD["ptp_anchor"]
+    ptp_anchor_pre_ms:           float = _DD["ptp_anchor_pre_ms"]
+    ptp_anchor_duration_ms:      float = _DD["ptp_anchor_duration_ms"]
+    ptp_anchor_min_trials:       int   = _DD["ptp_anchor_min_trials"]
     latency_map:           dict  = field(default_factory=dict)
     # Onset search-window anchoring (median-waveform seed; MEP onset only).
     # When enabled, the per-trial onset search window for each stim type is
@@ -425,68 +482,72 @@ def pipeline_review_outliers(stim_type, name, emg_segments, prestim_segments,
     return rejected_indices, log_entries
 
 
+ARTEFACT_FLOOR_MS = 2.0
+
+
+def onset_search_window(cfg, min_lat, max_lat):
+    """Search bounds (ms post-stim) for onset detection on one stimulus type.
+
+    The onset search window is derived from the physiological latency profile
+    widened by the PTP window -- NOT taken from the PTP window, as it was until
+    v1.3.2.
+
+    The PTP window is a single per-file setting; the latency profile is per
+    stimulus type. Passing ``cfg.ptp_start`` as the search floor therefore let
+    an amplitude-measurement setting silently override the physiological bounds
+    configured in Stage 1b, and it did so without failing. Measured on a
+    deltoid-like case (true onset 8.9 ms, profile 8-16 ms, PTP window
+    10-50 ms), every trial returned exactly 10.00 ms: the window edge reported
+    as a latency, with a between-trial SD of zero. Implausibly consistent
+    numbers are the signature, which makes this far more dangerous than a
+    detector that returns None.
+
+    Widening is safe in both directions. Every detector still bounds its result
+    by ``min_latency_ms`` / ``max_latency_ms``, so a wider search cannot yield
+    an onset outside the profile -- it only stops the profile being clipped.
+    The floor is held at the artefact blanking period so widening can never
+    drag the peak search onto the stimulus artefact.
+
+    Returns
+    -------
+    (search_start_ms, search_end_ms)
+    """
+    lo = float(cfg.ptp_start)
+    hi = float(cfg.ptp_end)
+    if min_lat is not None:
+        lo = min(lo, float(min_lat))
+    if max_lat is not None:
+        hi = max(hi, float(max_lat))
+    lo = max(lo, ARTEFACT_FLOOR_MS)
+    if hi <= lo:
+        hi = float(cfg.ptp_end)
+    return lo, hi
+
+
 def _detect_onset_dispatch(signal, fs, cfg, min_lat, max_lat):
     """Run the configured onset detector on a single trace and return onset (ms).
 
-    Standalone copy of the per-trial dispatch used by pipeline_quantify_segments,
-    so the onset-anchoring feature can detect an anchor on the median waveform
-    using the *same* method and parameters as the per-trial detection, without
-    altering the per-trial code path. Returns None if no onset is detected.
+    Thin wrapper over ``detection.dispatch_onset``, which is the single place
+    that maps a method name onto a detector. The inspector calls the same
+    function, so the two can no longer disagree about which algorithm ran or
+    which parameters it used -- see detection/dispatch.py for the drift this
+    replaced.
 
-    NOTE: ``pre_ms`` MUST be ``cfg.pre_ms`` here — segs_all are extracted with
+    NOTE: ``pre_ms`` MUST be ``cfg.pre_ms`` here -- segs_all are extracted with
     ``samples_before = cfg.pre_ms`` of pre-stim (pipeline_extract_segments), so
-    the stimulus sits at ``cfg.pre_ms``·fs/1000, NOT ``cfg.prestim_ms``. Passing
+    the stimulus sits at ``cfg.pre_ms``*fs/1000, NOT ``cfg.prestim_ms``. Passing
     prestim_ms mislocates the stimulus and the detector searches the wrong
     region (returns None even when a clear MEP is present).
     """
-    if cfg.onset_method == "bootstrap":
-        return detect_mep_onset_bootstrap(
-            signal, fs,
-            pre_ms=cfg.pre_ms,
-            peak_search_start_ms=cfg.ptp_start,
-            peak_search_end_ms=cfg.ptp_end,
-            min_latency_ms=min_lat,
-            max_latency_ms=max_lat,
-            min_peak_amplitude=cfg.min_peak_amplitude,
-            criterion=cfg.onset_bootstrap_crit,
-            n_boot=cfg.onset_bootstrap_n,
-        )
-    elif cfg.onset_method == "bigoni":
-        return detect_mep_onset_bigoni(
-            signal, fs,
-            pre_ms=cfg.pre_ms,
-            search_start_ms=cfg.ptp_start,
-            search_end_ms=cfg.ptp_end,
-            min_latency_ms=min_lat,
-            max_latency_ms=max_lat,
-            min_peak_amplitude=cfg.min_peak_amplitude,
-            smooth_window_ms=cfg.onset_bigoni_smooth_ms,
-            min_run_ms=cfg.onset_bigoni_min_run_ms,
-        )
-    elif cfg.onset_method == "bigoni_walkback":
-        return detect_mep_onset_bigoni_walkback(
-            signal, fs,
-            pre_ms=cfg.pre_ms,
-            search_start_ms=cfg.ptp_start,
-            search_end_ms=cfg.ptp_end,
-            min_latency_ms=min_lat,
-            max_latency_ms=max_lat,
-            min_peak_amplitude=cfg.min_peak_amplitude,
-            smooth_window_ms=cfg.onset_bigoni_smooth_ms,
-            min_run_ms=cfg.onset_bigoni_min_run_ms,
-            walkback_sd_mult=cfg.onset_bigoni_walkback_sd,
-        )
-    else:
-        return detect_mep_onset_peak_fraction(
-            signal, fs,
-            pre_ms=cfg.pre_ms,
-            poststim_start_ms=cfg.ptp_start,
-            poststim_end_ms=cfg.ptp_end,
-            peak_frac=cfg.peak_fraction,
-            min_consecutive=5,
-            min_peak_amplitude=cfg.min_peak_amplitude,
-            slope_threshold=cfg.slope_threshold,
-        )
+    _lo, _hi = onset_search_window(cfg, min_lat, max_lat)
+    return dispatch_onset(
+        signal, fs, detector_params(cfg),
+        pre_ms=cfg.pre_ms,
+        search_start_ms=_lo,
+        search_end_ms=_hi,
+        min_latency_ms=min_lat,
+        max_latency_ms=max_lat,
+    )
 
 
 def pipeline_detect_onsets(stim_type, segs_all, out_set,
@@ -556,14 +617,120 @@ def pipeline_detect_onsets(stim_type, segs_all, out_set,
 
     for idx, seg in enumerate(segs_all):
         onsets[idx] = _detect_onset_dispatch(seg, fs, cfg, _eff_min_lat, _eff_max_lat)
+
+    _warn_if_onsets_pinned_to_a_bound(
+        stim_type, onsets, fs, _eff_min_lat, _eff_max_lat, log_callback)
     return onsets
+
+
+def _warn_if_onsets_pinned_to_a_bound(stim_type, onsets, fs,
+                                      min_lat, max_lat, log_callback):
+    """Flag latencies that have collapsed onto a search-window boundary.
+
+    A detector reporting the edge of its own search window produces a latency
+    that looks like a measurement and is not one. It is far more damaging than
+    a detector returning None, because the numbers are plausible and their
+    between-trial consistency reads as good data rather than as a warning.
+    Before the search window was decoupled from the PTP window, a deltoid
+    profile against the default PTP window gave exactly 10.00 ms on every
+    trial.
+
+    That specific cause is fixed, but the same shape can still arise from a
+    latency profile set too narrowly for the muscle. This makes it loud.
+    """
+    vals = [v for v in onsets.values() if v is not None]
+    # Three is enough. On a real file a peripheral condition with only three
+    # detected trials sat 3/3 on its lower bound and stayed silent at a
+    # threshold of four -- the conditions with fewest usable trials are exactly
+    # the ones where a wrong latency profile does most damage.
+    if len(vals) < 3:
+        return
+    tol = 1.5 * 1000.0 / float(fs)          # a sample and a half
+    for bound, edge in ((min_lat, "lower"), (max_lat, "upper")):
+        if bound is None:
+            continue
+        n_at = sum(1 for v in vals if abs(v - float(bound)) <= tol)
+        frac = n_at / float(len(vals))
+        if frac >= 0.5:
+            log_callback(
+                f"⚠️ '{stim_type}': {n_at}/{len(vals)} onsets sit on the "
+                f"{edge} latency bound ({float(bound):g} ms). These are the "
+                f"edge of the search window, not measurements - widen the "
+                f"latency profile for this stimulus type in Stage 1b."
+            )
+
+
+def ptp_window_for_stim_type(stim_type, onsets, fs, cfg,
+                             default_start_idx, default_end_idx,
+                             samples_before, log_callback=print):
+    """PTP measurement window (sample indices) for one stimulus type.
+
+    Returns the file-wide window unchanged unless ``cfg.ptp_anchor`` is on and
+    the condition has enough detected onsets to trust a median.
+
+    Why per stimulus type
+    ---------------------
+    The PTP window is one setting for the whole file; the latency profile is
+    per stimulus type. A recording containing both M-waves and MEPs therefore
+    cannot be measured correctly by a single window. On a real mixed file with
+    the default 10-50 ms window, the conditions whose M-wave onset was 4 ms had
+    the first 6 ms of every response excluded from the amplitude measurement --
+    and an M-wave's entire biphasic deflection lasts only 5-15 ms, so what was
+    reported as peak-to-peak amplitude was largely the signal AFTER the
+    response had finished.
+
+    Anchoring is per stimulus type, not per trial. Per-trial anchoring would
+    make amplitude a function of onset-detection error: jitter would propagate
+    straight into the primary outcome, trials with no detected onset would have
+    no amplitude at all, and within-condition amplitudes would no longer be
+    measured over a common window. The condition median is computed from the
+    same onsets that seed the inspector, so the window is identical for every
+    trial in the condition and the measurement stays comparable.
+
+    The user's PTP window end is kept as a hard ceiling, so an anchored window
+    can never extend past what was configured.
+    """
+    if not getattr(cfg, "ptp_anchor", False):
+        return default_start_idx, default_end_idx, None
+
+    vals = [v for v in onsets.values() if v is not None]
+    min_n = int(getattr(cfg, "ptp_anchor_min_trials", 4))
+    if len(vals) < min_n:
+        log_callback(
+            f"   PTP anchor '{stim_type}': only {len(vals)} onset(s) detected "
+            f"(need {min_n}) - keeping the file-wide PTP window.")
+        return default_start_idx, default_end_idx, None
+
+    median_onset = float(np.median(vals))
+    start_ms = median_onset - float(cfg.ptp_anchor_pre_ms)
+    end_ms = median_onset + float(cfg.ptp_anchor_duration_ms)
+
+    # Never earlier than the artefact floor, never later than the configured
+    # PTP window end.
+    start_ms = max(start_ms, ARTEFACT_FLOOR_MS)
+    end_ms = min(end_ms, float(cfg.ptp_end))
+    if end_ms <= start_ms:
+        log_callback(
+            f"   ⚠️ PTP anchor '{stim_type}': median onset {median_onset:.1f} ms "
+            f"leaves no room below the PTP window end ({cfg.ptp_end} ms) - "
+            f"keeping the file-wide window.")
+        return default_start_idx, default_end_idx, None
+
+    s_idx = samples_before + int(round(start_ms * fs / 1000.0))
+    e_idx = samples_before + int(round(end_ms * fs / 1000.0))
+    log_callback(
+        f"   📐 PTP anchor '{stim_type}': median onset {median_onset:.1f} ms "
+        f"-> PTP window {start_ms:.1f}-{end_ms:.1f} ms "
+        f"(file-wide was {cfg.ptp_start}-{cfg.ptp_end} ms)")
+    return s_idx, e_idx, (start_ms, end_ms)
 
 
 def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
                                 out_set, excluded_set, segments_metadata,
                                 ptp_start_idx, ptp_end_idx,
                                 fs, cfg: PipelineConfig,
-                                custom_labels, name, auto_onsets, log_callback=print):
+                                custom_labels, name, auto_onsets,
+                                log_callback=print, agreement_out=None):
     """Per-trial quantification of PTP, latency, silent period and AUC.
 
     Returns
@@ -582,6 +749,13 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
     rms_z_full = (zscore(rms_all) if len(rms_all) > 1
                   else np.zeros_like(rms_all))
     ptps = np.empty(len(segs_all))
+
+    # Physiological onset window for this stim type, used by the agreement
+    # calculation. Mirrors pipeline_detect_onsets' unnarrowed bounds.
+    _ag_lat = cfg.latency_map.get(stim_type, (10.0, 50.0))
+    _ag_min_lat, _ag_max_lat = _ag_lat if _ag_lat else (10.0, 50.0)
+    _agreement_warned = False
+    _offset_warned = False
 
     auto_rows, manual_rows = [], []
     latencies, silent_durs = [], []
@@ -660,6 +834,89 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
             sp_mep_offset_ms = None
             sp_emg_return_ms = None
 
+        # ── Onset method agreement (opt-in) ──────────────────────────────
+        # Computed independently of which method is SELECTED, so the
+        # disagreement columns are available even on a plain Bigoni run. Off by
+        # default: it runs every member detector on every trial.
+        #
+        # The bounds come from cfg.latency_map, NOT from any anchor-narrowed
+        # window. Narrowing the search window would compress the spread between
+        # members artificially and make the disagreement metric look better the
+        # more constrained the search was, which is exactly backwards.
+        agreement = None
+        if getattr(cfg, "onset_agreement", False):
+            try:
+                _ag_lo, _ag_hi = onset_search_window(
+                    cfg, _ag_min_lat, _ag_max_lat)
+                agreement = compute_onset_agreement(
+                    seg, fs,
+                    pre_ms=cfg.pre_ms,
+                    search_start_ms=_ag_lo,
+                    search_end_ms=_ag_hi,
+                    min_latency_ms=_ag_min_lat,
+                    max_latency_ms=_ag_max_lat,
+                    min_peak_amplitude=cfg.min_peak_amplitude,
+                    methods=cfg.onset_consensus_methods,
+                    params=detector_params(cfg),
+                )
+            except Exception as _exc:
+                # Reported, not swallowed. An early version of this block
+                # referenced names that a refactor had moved out of scope; the
+                # bare handler turned a NameError into silently blank columns
+                # that looked like "agreement was simply off".
+                agreement = None
+                if not _agreement_warned:
+                    log_callback(
+                        f"⚠️ Onset agreement failed for '{stim_type}' "
+                        f"({type(_exc).__name__}: {_exc}); "
+                        f"agreement columns will be blank.")
+                    _agreement_warned = True
+
+        # ── MEP offset ───────────────────────────────────────────────────
+        # One precedence rule, applied in one place: a manual marker wins;
+        # otherwise, when cSP is enabled and detected, the end of the MEP and
+        # the start of the silent period are the SAME physical event and are
+        # reported as the same number; otherwise the envelope detector finds
+        # the return to baseline. MEP_Offset_Source records which branch fired
+        # so no value's provenance has to be inferred.
+        mep_offset_ms = mep_duration_ms = None
+        mep_offset_src = "none"
+        if getattr(cfg, "mep_offset_enabled", True):
+            # Phase 3 will add a draggable offset marker; reading it here now
+            # means that work needs no further pipeline change.
+            _man_off = None
+            if mk in segments_metadata and "mep_offset_idx" in segments_metadata[mk]:
+                _man_off = ((segments_metadata[mk]["mep_offset_idx"] - _insp_sb)
+                            * 1000.0 / fs)
+            try:
+                _res = resolve_mep_offset(
+                    seg, fs,
+                    onset_ms=man_lat,
+                    csp_start_ms=sp_mep_offset_ms,
+                    csp_enabled=(stim_type in cfg.csp_types),
+                    manual_offset_ms=_man_off,
+                    pre_ms=cfg.pre_ms,
+                    search_end_ms=cfg.post_ms,
+                    min_duration_ms=cfg.mep_offset_min_duration_ms,
+                    max_duration_ms=cfg.mep_offset_max_duration_ms,
+                    min_return_ms=cfg.mep_offset_min_return_ms,
+                    env_window_ms=cfg.mep_offset_env_window_ms,
+                    criterion=cfg.mep_offset_criterion,
+                    peak_frac=cfg.mep_offset_peak_frac,
+                )
+                mep_offset_ms  = _res.offset_ms
+                mep_duration_ms = _res.duration_ms
+                mep_offset_src = _res.source
+            except Exception as _exc:
+                mep_offset_ms = mep_duration_ms = None
+                mep_offset_src = "none"
+                if not _offset_warned:
+                    log_callback(
+                        f"⚠️ MEP offset detection failed for '{stim_type}' "
+                        f"({type(_exc).__name__}: {_exc}); "
+                        f"MEP_Offset(ms) will be blank.")
+                    _offset_warned = True
+
         # ── AUC ──────────────────────────────────────────────────────────
         auc_val = None
         if mk in segments_metadata and "auc_start_idx" in segments_metadata[mk]:
@@ -678,6 +935,19 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
             if a1 > a0:
                 auc_val = float(_np_trapz(np.abs(seg[a0:a1]), dx=1 / fs))
                 auc_vals_all.append(auc_val)
+        elif (man_lat is not None and mep_offset_ms is not None
+              and mep_offset_src == "envelope"):
+            # No cSP to close the window, but the response has a detected end.
+            # This is what gives resting-state recordings a principled AUC
+            # instead of requiring the endpoint to be dragged by hand.
+            a0 = _segs_sb + int(round(man_lat * fs / 1000.0))
+            a1 = _segs_sb + int(round(mep_offset_ms * fs / 1000.0))
+            a0 = min(max(0, a0), len(seg) - 1)
+            a1 = min(max(0, a1), len(seg))
+            if a1 > a0:
+                auc_val = compute_auc(seg, a0, a1, fs)
+                if auc_val is not None:
+                    auc_vals_all.append(auc_val)
         elif mk not in segments_metadata and stim_type in cfg.csp_types:
             # Unreviewed segment with CSP enabled — try auto-detect onset+CSP
             # and compute AUC if both succeed
@@ -780,6 +1050,32 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
         manual_row[_col_ptp_rms] = round(float(man_ptp)  / _rms_val, 4) \
                                    if _rms_val > 0 else None
         # Normalised_PTP_per_PreStimRMS filled later by apply_normalisation
+
+        # ── New trailing columns ─────────────────────────────────────────
+        # `common` is a positional list sized to the historical row width, so
+        # both rows are widened to the full schema before these are written by
+        # name-resolved index.  Same reason _trials_frame pads: appending to
+        # LAT_COLS must never desynchronise a builder.
+        _w = len(LAT_COLS)
+        auto_row   = auto_row   + [""] * (_w - len(auto_row))
+        manual_row = manual_row + [""] * (_w - len(manual_row))
+
+        for _row in (auto_row, manual_row):
+            _row[_C_OFF]     = mep_offset_ms
+            _row[_C_DUR]     = mep_duration_ms
+            _row[_C_OFF_SRC] = mep_offset_src
+
+        if agreement is not None:
+            # Retain the per-method breakdown for the comparison report. The
+            # detector runs have already happened; without this the individual
+            # latencies are computed and thrown away.
+            if agreement_out is not None:
+                agreement_out[(stim_type, idx)] = agreement
+            for _row in (auto_row, manual_row):
+                _row[_C_AG_CONS] = agreement.consensus_ms
+                _row[_C_AG_SPRD] = agreement.spread_ms
+                _row[_C_AG_IQR]  = agreement.iqr_ms
+                _row[_C_AG_N]    = agreement.n_detected
 
         auto_rows.append(auto_row)
         manual_rows.append(manual_row)
@@ -1039,6 +1335,25 @@ LAT_COLS = [
     # to full width in pipeline_write_outputs.
     "Clipped",          # trial contains ADC-saturated samples -> PTP underestimated
     "Units_Assumed",    # amplitude unit was not declared by the file
+    # MEP offset and duration.  Appended, like the flags above, so that any row
+    # builder emitting a shorter row stays valid; _trials_frame pads.
+    #
+    # NOTE ON cSP_MEP_Offset(ms): when cSP detection is enabled for a stimulus
+    # type and a silent period is found, MEP_Offset(ms) carries the SAME value,
+    # because the end of the MEP and the start of the silent period are one
+    # event.  MEP_Offset_Source reads "csp_start" on exactly those rows.  Use
+    # MEP_Offset(ms) in new analyses: it is also populated at rest, where there
+    # is no silent period and cSP_MEP_Offset(ms) is blank.
+    "MEP_Offset(ms)",        # end of the evoked response, re: stim
+    "MEP_Duration(ms)",      # MEP_Offset(ms) - Latency(ms)
+    "MEP_Offset_Source",     # manual | csp_start | envelope | none
+    # Per-trial agreement between onset detectors.  Populated only when
+    # cfg.onset_agreement is on; blank otherwise.  High disagreement flags a
+    # trial for manual review; it does NOT mean the reported onset is wrong.
+    "Onset_Consensus(ms)",   # median across the consensus member detectors
+    "Onset_Disagreement(ms)",# max - min across members
+    "Onset_IQR(ms)",         # interquartile range; robust to one stray member
+    "Onset_Methods_N",       # members that returned a latency
 ]
 
 # Column indices resolved by name. Any code writing a single field into a row
@@ -1055,6 +1370,13 @@ _C_DET_WC  = LAT_COLS.index("PTP_Detrended_WithinCond(mV)")
 _C_DET_WZ  = LAT_COLS.index("PTP_Detrended_WithinCond_Z")
 _C_DET_SV  = LAT_COLS.index("PTP_Detrended_Session(mV)")
 _C_DET_SZ  = LAT_COLS.index("PTP_Detrended_Session_Z")
+_C_OFF     = LAT_COLS.index("MEP_Offset(ms)")
+_C_DUR     = LAT_COLS.index("MEP_Duration(ms)")
+_C_OFF_SRC = LAT_COLS.index("MEP_Offset_Source")
+_C_AG_CONS = LAT_COLS.index("Onset_Consensus(ms)")
+_C_AG_SPRD = LAT_COLS.index("Onset_Disagreement(ms)")
+_C_AG_IQR  = LAT_COLS.index("Onset_IQR(ms)")
+_C_AG_N    = LAT_COLS.index("Onset_Methods_N")
 
 
 def _trials_frame(rows):
@@ -1119,6 +1441,15 @@ def pipeline_write_outputs(latency_manual, results_out, bids_prefix):
         "EMGComp_Method", "EMGComp_N", "EMGComp_Slope", "EMGComp_Intercept",
         "EMGComp_InterceptWeight", "EMGComp_Adjustment(mV)",
         "EMGComp_PseudoR2", "EMGComp_Rho_Pre", "EMGComp_Rho_Post",
+        # MEP offset / duration
+        "Mean_MEP_Offset(ms)", "SD_MEP_Offset(ms)",
+        "Mean_MEP_Duration(ms)", "SD_MEP_Duration(ms)",
+        # Modal offset provenance across the trials contributing to the mean.
+        # Reported rather than averaged because the field is categorical; a
+        # sample mixing "csp_start" and "envelope" rows is worth noticing.
+        "MEP_Offset_Source_Mode",
+        # Onset agreement (blank unless onset_agreement is enabled)
+        "Mean_Onset_Disagreement(ms)", "SD_Onset_Disagreement(ms)",
     ]
 
     def _alpha_sort(df, col):
@@ -1166,6 +1497,23 @@ def pipeline_write_outputs(latency_manual, results_out, bids_prefix):
             vals = grp[col].dropna()
             return vals.iloc[0] if len(vals) else ""
 
+        def _mode_col(grp, col):
+            """
+            Most common value of a categorical column.
+
+            Used for MEP_Offset_Source, where averaging is meaningless. Ties
+            resolve to whichever value pandas orders first, which is acceptable
+            because a tie is itself the signal worth noticing: it means the
+            sample mixes provenances.
+            """
+            if col not in grp.columns:
+                return ""
+            vals = grp[col].replace("", pd.NA).dropna()
+            if not len(vals):
+                return ""
+            counts = vals.value_counts()
+            return "" if not len(counts) else str(counts.index[0])
+
         def _build_summary(df):
             rows = []
             for (fname, st, lbl), grp in df.groupby(
@@ -1212,6 +1560,15 @@ def pipeline_write_outputs(latency_manual, results_out, bids_prefix):
                     _mn(_col(clean,"EMGComp_PseudoR2")),
                     _mn(_col(clean,"EMGComp_Rho_Pre")),
                     _mn(_col(clean,"EMGComp_Rho_Post")),
+                    # MEP offset / duration
+                    _mn(_col(clean,"MEP_Offset(ms)")),
+                    _sd(_col(clean,"MEP_Offset(ms)")),
+                    _mn(_col(clean,"MEP_Duration(ms)")),
+                    _sd(_col(clean,"MEP_Duration(ms)")),
+                    _mode_col(clean, "MEP_Offset_Source"),
+                    # Onset agreement
+                    _mn(_col(clean,"Onset_Disagreement(ms)")),
+                    _sd(_col(clean,"Onset_Disagreement(ms)")),
                 ])
             return pd.DataFrame(rows, columns=SUM_HDR)
 
@@ -1673,6 +2030,14 @@ def run_pipeline(input_path,
                  onset_bigoni_smooth_ms=0.5,
                  onset_bigoni_min_run_ms=0.5,
                  onset_bigoni_walkback_sd=1.0,
+                 # Envelope / CUSUM / consensus / MEP-offset settings, as one
+                 # mapping keyed by PipelineConfig field name. A dict rather
+                 # than a keyword per parameter: this signature already runs to
+                 # sixty-odd arguments, and every detector added would extend
+                 # it here, at the PipelineConfig construction below, and at
+                 # the call site in app.py -- with a missing entry silently
+                 # substituting a default rather than raising.
+                 detection_params=None,
                  latency_map=None,
                  onset_anchor=False,
                  onset_anchor_halfwidth_ms=8.0,
@@ -1727,6 +2092,7 @@ def run_pipeline(input_path,
         onset_bigoni_smooth_ms=onset_bigoni_smooth_ms,
         onset_bigoni_min_run_ms=onset_bigoni_min_run_ms,
         onset_bigoni_walkback_sd=onset_bigoni_walkback_sd,
+        **config_detection_kwargs(detection_params or {}),
         latency_map=latency_map or {},
         onset_anchor=onset_anchor,
         onset_anchor_halfwidth_ms=onset_anchor_halfwidth_ms,
@@ -1982,6 +2348,19 @@ def run_pipeline(input_path,
                     _st, _info["segs_all"], _info["outlier_set"],
                     ptp_start_idx, ptp_end_idx, fs, cfg,
                     log_callback=log_callback)
+
+            # ── Stage 5d: PTP window per stimulus type ────────────────────────
+            # Derived AFTER onsets, because the anchor is each condition's own
+            # median onset. Onset detection itself no longer depends on the PTP
+            # window (see onset_search_window), so there is no circularity: the
+            # physiological latency profile governs onset, and onset governs
+            # where amplitude is measured.
+            ptp_window_by_type = {}
+            for _st in stats_per_type:
+                ptp_window_by_type[_st] = ptp_window_for_stim_type(
+                    _st, auto_onsets_by_type.get(_st, {}), fs, cfg,
+                    ptp_start_idx, ptp_end_idx, samples_before,
+                    log_callback=log_callback)
             # Seed for the inspector, in inspector index space (stim @ _insp_sb).
             _insp_sb_seed = int(round(cfg.prestim_ms * fs / 1000))
             auto_meta = {}
@@ -2127,16 +2506,19 @@ def run_pipeline(input_path,
             # ── Stage 7: Quantify all segments ────────────────────────────────
             _ptps_per_stim       = {}
             _stim_times_per_stim = {}
+            _agreement_by_trial  = {}
             for stim_type, info in stats_per_type.items():
                 auto_r, man_r, sum_r, with_r, ptps_arr = pipeline_quantify_segments(
                     stim_type,
                     info["segs_all"], info["prestim_all"],
                     info["outlier_set"], excluded_sets[stim_type],
                     segments_metadata,
-                    ptp_start_idx, ptp_end_idx,
+                    *ptp_window_by_type.get(
+                        stim_type, (ptp_start_idx, ptp_end_idx, None))[:2],
                     fs, cfg, custom_labels or {}, name,
                     auto_onsets_by_type.get(stim_type, {}),
-                    log_callback=log_callback)
+                    log_callback=log_callback,
+                    agreement_out=_agreement_by_trial)
 
                 latency_auto.extend(auto_r)
                 latency_manual.extend(man_r)
@@ -2144,6 +2526,45 @@ def run_pipeline(input_path,
                 with_out_rows.append(with_r)
                 _ptps_per_stim[stim_type]       = ptps_arr
                 _stim_times_per_stim[stim_type] = info["stim_times_s"]
+
+            # ── Stage 7b: Onset-method comparison report ──────────────────────
+            # Follows cfg.onset_agreement, not the selected method: agreement
+            # runs the member detectors whatever is selected, and comparing
+            # methods while running the one you trust is how a method choice
+            # gets justified.
+            if getattr(cfg, "onset_agreement", False):
+                try:
+                    from .onset_methods_report import (
+                        collect_agreement_rows, write_onset_method_figures,
+                        write_onset_method_tables)
+                    _m_rows = collect_agreement_rows(
+                        _agreement_by_trial, name, cfg.custom_labels)
+                    _written = write_onset_method_tables(
+                        _m_rows, results_out, _bids_prefix)
+                    _written += write_onset_method_figures(
+                        _m_rows, _agreement_by_trial,
+                        {st: info["segs_all"] for st, info in stats_per_type.items()},
+                        fs, cfg.pre_ms, figures_out, _bids_prefix,
+                        unit=unit, custom_labels=cfg.custom_labels,
+                        selected_method=cfg.onset_method,
+                        log_callback=log_callback)
+                    if _written:
+                        from .onset_methods_report import (
+                            FIGURE_SUBDIR_SUFFIX as _FSUF)
+                        log_callback(
+                            f"📊 Onset-method comparison: {len(_written)} "
+                            f"file(s) written — tables in results/, figures "
+                            f"in figures/{_bids_prefix}_{_FSUF}/")
+                except Exception as _exc:
+                    log_callback(f"⚠️ Onset-method comparison failed "
+                                 f"({type(_exc).__name__}: {_exc})")
+            elif getattr(cfg, "onset_method", "") == "consensus":
+                # Consensus reports a median but keeps no breakdown unless
+                # agreement is on. Saying so beats writing nothing silently.
+                log_callback(
+                    "ℹ️ Consensus is selected but 'Compare methods on every "
+                    "trial' is off, so no method-comparison tables or figures "
+                    "were produced. Enable it in Preferences → Detection.")
 
             # ── Stage 8: Pooled z-scores and detrending ───────────────────────
             pipeline_compute_pooled_stats(

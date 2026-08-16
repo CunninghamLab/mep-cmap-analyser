@@ -264,6 +264,10 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         # Channels whose 1a setup has been confirmed. Confirmation
         # is per channel because the setup is.
         self._chan_confirmed = set()
+        # Where this file's stimulus events come from. Empty means
+        # the file's own markers, which is what every file did
+        # before sources were configurable.
+        self.event_sources = []
         
     # ───────────────────────────────────────────────────────────────────────────
     def _poll_queue(self):
@@ -610,6 +614,77 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             return
         self.log("🔁 Channel assignment cleared — choose again.")
         self._browse_file_path(fpath)
+
+    def _open_event_sources(self):
+        """Configure where stimulus events come from.
+
+        One dialogue, reached from tab 1a and from Channel Assignment. The
+        second entry point matters because the first setup of a file is when
+        the question arises; the first matters because it has to be revisable
+        afterwards without reopening the file.
+        """
+        from .event_source_dialog import EventSourceDialog
+        from .io import list_event_sources
+
+        fpath = self.file_path.get()
+        if not fpath or not os.path.isfile(fpath):
+            messagebox.showinfo("No file", "Load a file first.",
+                                parent=self.root)
+            return
+        try:
+            available = list_event_sources(fpath)
+        except Exception as exc:
+            messagebox.showerror(
+                "Cannot list sources",
+                f"This file's channels could not be listed "
+                f"({type(exc).__name__}: {exc}).", parent=self.root)
+            return
+
+        _names = list(available.get("analogue") or [])
+
+        def _read(name):
+            wave, fs, _unit = extract_emg_waveform_and_fs(
+                fpath, _names.index(name))
+            return wave, fs
+
+        dlg = EventSourceDialog(self.root, fpath, self.event_sources,
+                                available, _read, log=self.log)
+        self.root.wait_window(dlg.top)
+        if dlg.result is None:
+            return
+
+        self.event_sources = dlg.result
+        if not self.event_sources:
+            self.log("   Event sources cleared — the file's own markers will "
+                     "be used.")
+        else:
+            self.log("🔗 Event sources:")
+            for _s in self.event_sources:
+                self.log(f"      {_s.describe()}")
+        self._apply_event_sources()
+
+    def _apply_event_sources(self):
+        """Re-read the stimulus times and rebuild tab 1a from them."""
+        from .io import extract_events
+
+        fpath = self.file_path.get()
+        try:
+            events, warnings = extract_events(fpath, self.event_sources)
+        except Exception as exc:
+            messagebox.showerror(
+                "Event sources",
+                f"Events could not be read with these sources "
+                f"({type(exc).__name__}: {exc}).", parent=self.root)
+            return
+        for w in warnings:
+            self.log(f"   ⚠️  {w}")
+        if not events:
+            self.log("   ⚠️  No events found with these sources.")
+            return
+        self.stim_events = events
+        self.log("   " + ", ".join(f"{k}: {len(v)}"
+                                   for k, v in sorted(events.items())))
+        self._build_labels_tab(sorted(events))
 
     def _shutdown(self):
         """Cancel pending callbacks, then leave the main loop.
@@ -2086,6 +2161,8 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                           for (st, i), m in _mm.items()}
                 for _c, _mm in self._chan_segment_meta.items()},
             "chan_confirmed": sorted(self._chan_confirmed),
+            "event_sources": [_s.to_dict()
+                              for _s in self.event_sources],
             "analyse_channels": sorted(self.analyse_channels),
         }
         return session
@@ -2362,6 +2439,12 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         # of every other one -- applying them to a second channel is what
         # produced negative peak-to-peak values.
         self._chan_confirmed = set(sess.get("chan_confirmed") or [])
+        try:
+            from .event_sources import EventSource as _ES
+            self.event_sources = [_ES.from_dict(d)
+                                  for d in (sess.get("event_sources") or [])]
+        except Exception:
+            self.event_sources = []
         self.analyse_channels = set(sess.get("analyse_channels") or [])
         _per_chan = sess.get("chan_segment_meta")
         self._chan_segment_meta = {}
@@ -2628,6 +2711,9 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         # updating every one of those sites.
         self.segments_metadata = {}
         self._chan_segment_meta = {}
+        # Event sources describe one recording's channels and markers, so they
+        # cannot carry to another file any more than a channel index can.
+        self.event_sources = []
 
         # ── 0. Per-channel 1a setup is FILE-level, not session-level ──────────
         #
@@ -5261,6 +5347,15 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
 
                         btn = tk.Frame(dlg)
                         btn.pack(pady=(4, 12))
+                        # Second entry point. The first setup of a file
+                        # is when the question of where events come
+                        # from arises; sending the analyst to another
+                        # tab to answer it makes the capability easy
+                        # to miss.
+                        tk.Button(btn, text="Event sources\u2026", width=16,
+                                  command=lambda: (dlg.destroy(),
+                                                   self._open_event_sources())
+                                  ).pack(side="left", padx=6)
                         tk.Button(btn, text="Save & continue",
                                   width=16, command=_ok).pack(side="left", padx=6)
                         tk.Button(btn, text="Cancel",
@@ -5556,6 +5651,11 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
 
                 btn_r = _tk.Frame(dlg)
                 btn_r.pack(pady=(4, 12))
+                # Second entry point; see the note in the Spike2 dialogue.
+                _tk.Button(btn_r, text="Event sources\u2026", width=14,
+                           command=lambda: (dlg.destroy(),
+                                            self._open_event_sources())
+                           ).pack(side="left", padx=6)
                 _tk.Button(btn_r, text="Save & continue", width=14,
                            command=_save).pack(side="left", padx=6)
                 _tk.Button(btn_r, text="Cancel", width=10,
@@ -6634,6 +6734,9 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         tk.Button(footer, text="Copy this setup to all channels",
                   command=self._copy_setup_to_all_channels)\
             .pack(side="left", padx=(12, 4), pady=6)
+        tk.Button(footer, text="🔗 Event sources…",
+                  command=self._open_event_sources)\
+            .pack(side="left", padx=(4, 4), pady=6)
         # A scan that correctly finds nothing changes nothing on this tab, and
         # is then indistinguishable from a button that does not work. The log
         # carries the detail but lives on tab 1c, so the outcome has to be

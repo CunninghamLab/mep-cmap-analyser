@@ -35,6 +35,7 @@ times and would drift nine ways.
   * detect_threshold_crossings   -- a TTL or analogue trigger
   * generate_interval_events     -- fixed timing, for triggers the file omits
   * merge_event_sources          -- several sources into one mapping
+  * decimate_for_preview         -- a long recording reduced for display
 """
 
 from dataclasses import asdict, dataclass
@@ -255,3 +256,47 @@ def merge_event_sources(per_source, near_ms=NEAR_SIMULTANEOUS_MS):
             f"protocol, no action is needed")
 
     return merged, warnings
+
+
+def decimate_for_preview(signal, fs, max_points=4000, t0=0.0):
+    """Reduce a recording to something a preview plot can draw.
+
+    Returns ``(times, lows, highs)``: for each displayed column, the minimum
+    and maximum of the samples it covers. Plotting those as a filled band
+    preserves every transient, which plain subsampling does not -- and a
+    stimulus trigger is exactly the kind of one-sample spike that subsampling
+    drops. A preview that loses the pulses would be worse than none, since the
+    analyst would set a level against a trace that does not show what the
+    detector sees.
+
+    A recording of two thousand seconds at five kilohertz is ten million
+    samples; drawing that directly is slow enough to make the level box feel
+    broken.
+    """
+    x = np.asarray(signal, dtype=float).ravel()
+    n = x.size
+    if n == 0:
+        return np.array([]), np.array([]), np.array([])
+
+    step = max(1, int(np.ceil(n / max(1, int(max_points)))))
+    if step == 1:
+        t = t0 + np.arange(n) / float(fs)
+        return t, x, x
+
+    usable = (n // step) * step
+    block = x[:usable].reshape(-1, step)
+    lows, highs = block.min(axis=1), block.max(axis=1)
+    if usable < n:                      # keep the tail rather than dropping it
+        tail = x[usable:]
+        lows = np.append(lows, tail.min())
+        highs = np.append(highs, tail.max())
+    t = t0 + (np.arange(lows.size) * step + step / 2.0) / float(fs)
+    return t, lows, highs
+
+
+# A refractory suggestion was written here and removed. It proposed half the
+# shortest detected interval, which on a protocol with ten-second spacing gave
+# five seconds -- long enough to discard every stimulus of a faster block in
+# the same recording. The fixed default is 50 ms, and the preview shows what
+# any value does; a suggestion with no evidence behind it is worse than none,
+# because it arrives looking like an answer.

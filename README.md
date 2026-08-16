@@ -40,6 +40,15 @@ The tool is not limited to any single measure or paradigm. It handles motor evok
 > bounded by the offset; latency changes only on stimulus types given an event
 > delay. Peak-to-peak, cSP and normalisation are unchanged except where
 > amplitude-window anchoring previously fell back to the file-wide window.
+>
+> **Check any analysis whose session was saved with File → Save session.** That
+> path wrote thirteen fewer settings than the automatic save, among them the
+> latency profiles, both muscle-group dropdowns, the onset method and every
+> onset detector parameter. Reloading such a session restored the file and most
+> of its settings but silently reverted those, so a subsequent run could use a
+> latency window and a detector the analyst had not chosen. Sessions written by
+> the automatic save — which is what runs after the Data Inspector closes — were
+> always complete. Both now use one builder.
 
 ### Multiple channels in one analysis
 
@@ -70,6 +79,93 @@ join a multi-channel dataset.
 
 The pipeline itself is unchanged: it receives one channel's settings per run and
 knows nothing of the others.
+
+### Where stimulus events come from
+
+Every reader exposed `extract_stim_times(path, marker_name)`, and every reader
+meant something different by it: the event channel to read, the label to attach
+to threshold detections, or nothing at all. The shared signature was a
+coincidence of naming rather than an interface, so asking a reader for something
+it did not already do was impossible — the one parameter that could have carried
+the request already meant something else.
+
+That is why LabChart MATLAB read its comment table and nothing else. Not a
+missing feature so much as a missing question: the format carries comments,
+digital inputs and fixed-interval sampling, and the tool could only ask for the
+first.
+
+Events now come from an explicit list of **sources**, of three kinds:
+
+- **The file's own events** — comments, markers, annotations, event channels:
+  whatever the format already carries.
+- **A trigger channel** — a crossing on any analogue channel, with a level, an
+  edge and a refractory period so that a pulse which rings is counted once.
+- **Fixed interval** — for recordings triggered by something the file does not
+  record. Nothing is detected here: the times are asserted, and no part of the
+  recording can confirm them.
+
+Several may be combined, each contributing its own stimulus type. Two sources
+producing the *same* type is reported as an error rather than merged, since that
+gives a trial count matching neither. Events from different sources falling
+within a few milliseconds of each other are **kept and reported**: they may be
+one stimulus logged twice, or two genuine stimuli in a paired-pulse protocol,
+and nothing in the data distinguishes those — merging would silently halve a
+paired-pulse trial count.
+
+**Threshold and interval detection are format-independent.** Both need only a
+waveform and a time base, which every reader already provides, so they are
+written once and available everywhere. A reader has only to say which of its
+channels are analogue.
+
+`extract_stim_times` is unchanged and is what a file's-own-events source calls,
+so a file configured the way every file was configured before runs through no
+new code. That contract is checked on real recordings covering six formats, and
+on files the tests build themselves for three of them, so it holds wherever the
+suite runs rather than only where the sample recordings live.
+
+### Choosing a level
+
+A threshold level is not checkable by reading it. Two volts is right or wrong
+depending on the trigger's amplitude, its baseline and whether the pulse rings,
+none of which is visible from the box it was typed into.
+
+**Event sources…**, on tab 1a and in the channel assignment dialogue, draws the
+chosen channel with the level across it, every detected crossing marked, and a
+count that updates as the level changes.
+
+The trace is reduced by minimum and maximum per column rather than by
+subsampling. A stimulus trigger is a one-sample spike: on a two-thousand-second
+recording at five kilohertz, plain subsampling drew a flat line while the
+detector found two hundred events. A preview that hides the pulses is worse than
+none, because the level would then be set against a trace showing nothing of
+what the detector sees.
+
+### Choosing channels
+
+The channel assignment dialogue offers a **tick list** rather than a single
+choice, and appears every time a file is opened with the previous choices
+pre-selected — it had appeared only when no saved assignment existed, so after
+the first open the channel and trigger choices became invisible and
+unchangeable, and the only way back was deleting the derivatives folder and the
+sidecars by hand. Those two decisions determine what the whole analysis
+measures. **File → Reassign channels…** discards a saved assignment explicitly.
+
+There is deliberately no primary channel: every selected channel is analysed
+identically with its own setup, so a primary would imply a hierarchy that does
+not exist. The first selected is where configuration starts.
+
+Both dialogues were changed. Multi-channel analysis is not a Spike2 feature, and
+leaving the other as a single choice made the capability reachable for one
+format out of ten.
+
+### Files no reader can open
+
+Format detection ended by assuming anything unrecognised was a Spike2 text
+export, so a Word document, a configuration file or an ADInstruments `.adicht`
+all failed somewhere downstream with a message naming the wrong format. A binary
+file matching no known signature is now identified as unreadable, and where the
+extension is recognised the message says what to do instead — for `.adicht`,
+that LabChart can export text or `.adibin`, both of which this tool reads.
 
 ### Event delay: when the marker is not the stimulus
 
@@ -221,6 +317,22 @@ selections are reported as they are rather than collapsed to their outer bounds.
   window wins over the profile, because a typed value must not be overwritten, but
   the only previous symptom of the two disagreeing was onsets pinning at the
   bottom of a profile the tab was no longer showing.
+- **Marker edits no longer cross between channels.** A marker position is an
+  index into one channel's waveform and means nothing applied to another. In a
+  multi-channel run the second channel inherited the first's, which produced
+  *negative* peak-to-peak values where the stored maximum sample sat below the
+  stored minimum, and reported every offset as manually set when none had been.
+  Edits are now held per channel through the analysis, the Data Inspector and
+  the session file. A session written before this carries one unattributed map;
+  it is used for single-channel review, where it unambiguously belongs to the
+  channel on screen, and ignored in a multi-channel run rather than guessed at.
+- **A negative peak-to-peak can no longer be written.** It is a magnitude. The
+  value propagated into the normalisation and z-score columns as though it
+  meant something.
+- **The Data Inspector no longer raises when a key is pressed as it closes.**
+  Arrow-key navigation redraws the window, and events queued before the window
+  was destroyed still arrive; in a multi-channel run the window closes twice as
+  often, so this was easy to hit.
 
 ### New onset detection method: derivative ratio (Boyles et al. 2026)
 

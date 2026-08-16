@@ -37,11 +37,13 @@ parameter never changes a function signature anywhere.
   * dispatch_onset
 """
 
-from .defaults import DETECTION_DEFAULTS, DEFAULT_ONSET_METHOD
+from .defaults import (DETECTION_DEFAULTS, DEFAULT_ONSET_METHOD,
+                       METHOD_ALIASES as _METHOD_ALIASES)
 from .onset_bigoni import detect_mep_onset_bigoni
+from .onset_boyles import detect_mep_onset_boyles
 from .onset_bigoni_walkback import detect_mep_onset_bigoni_walkback
 from .onset_bootstrap import detect_mep_onset_bootstrap
-from .onset_consensus import detect_mep_onset_consensus
+from .onset_methods_median import detect_mep_onset_methods_median
 from .onset_cusum import detect_mep_onset_cusum
 from .onset_peak_fraction import detect_mep_onset_peak_fraction
 from .onset_rms_envelope import detect_mep_onset_rms_envelope
@@ -53,7 +55,8 @@ def dispatch_onset(signal, fs, params=None, *,
                    search_end_ms,
                    min_latency_ms=None,
                    max_latency_ms=None,
-                   method=None):
+                   method=None,
+                   template=None):
     """
     Run the configured onset detector on one trace.
 
@@ -77,6 +80,17 @@ def dispatch_onset(signal, fs, params=None, *,
     min_latency_ms  : float or None  physiological floor (ms post-stim)
     max_latency_ms  : float or None  physiological ceiling (ms post-stim)
     method          : str or None  override ``params["onset_method"]``
+    template        : 1-D np.ndarray or None  condition average/median waveform,
+                      the same length as ``signal``.
+
+                      Only the derivative-ratio method uses this, and only for
+                      its peak-jitter gate. It is a keyword on the shared
+                      dispatch rather than a parameter of that method because
+                      it is DATA, not a setting: it cannot travel in the params
+                      dict alongside scalars, and adding a second dispatch
+                      entry point for one method is how the duplicated dispatch
+                      this module replaced came about. Callers with no
+                      condition average pass None and the gate is skipped.
 
     Returns
     -------
@@ -93,6 +107,8 @@ def dispatch_onset(signal, fs, params=None, *,
         p.update({k: v for k, v in params.items() if v is not None})
     if method is None:
         method = p.get("onset_method", DEFAULT_ONSET_METHOD)
+    # v1.3.3 called this method "consensus"; saved sessions still say so.
+    method = _METHOD_ALIASES.get(method, method)
 
     amp = p["min_peak_amplitude"]
 
@@ -175,8 +191,8 @@ def dispatch_onset(signal, fs, params=None, *,
             use_tkeo=p["onset_cusum_tkeo"],
         )
 
-    if method == "consensus":
-        return detect_mep_onset_consensus(
+    if method == "boyles":
+        return detect_mep_onset_boyles(
             signal, fs,
             pre_ms=pre_ms,
             search_start_ms=search_start_ms,
@@ -184,8 +200,34 @@ def dispatch_onset(signal, fs, params=None, *,
             min_latency_ms=min_latency_ms,
             max_latency_ms=max_latency_ms,
             min_peak_amplitude=amp,
-            methods=p["onset_consensus_methods"],
+            template=template,
+            block_ms=p["onset_boyles_block_ms"],
+            baseline_start_ms=p["onset_boyles_baseline_start_ms"],
+            baseline_end_ms=p["onset_boyles_baseline_end_ms"],
+            amplitude_gate=p["onset_boyles_amplitude_gate"],
+            peak_jitter_ms=p["onset_boyles_peak_jitter_ms"],
+            peak_window_length=p["onset_boyles_peak_window_length"],
+            ratio_cutoff=p["onset_boyles_ratio_cutoff"],
+            boyles_max_latency_ms=p["onset_boyles_max_latency_ms"],
+            deriv_check_ms=p["onset_boyles_deriv_check_ms"],
+            deriv_check_duty=p["onset_boyles_deriv_check_duty"],
+            base_deriv_sds=p["onset_boyles_base_deriv_sds"],
+            deriv_check_window_length=p["onset_boyles_deriv_window_length"],
+            literal=p["onset_boyles_literal"],
+        )
+
+    if method == "methods_median":
+        return detect_mep_onset_methods_median(
+            signal, fs,
+            pre_ms=pre_ms,
+            search_start_ms=search_start_ms,
+            search_end_ms=search_end_ms,
+            min_latency_ms=min_latency_ms,
+            max_latency_ms=max_latency_ms,
+            min_peak_amplitude=amp,
+            methods=p["onset_methods_median_members"],
             params=p,
+            template=template,
         )
 
     return detect_mep_onset_peak_fraction(

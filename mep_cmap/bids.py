@@ -12,7 +12,7 @@ import re
 import datetime
 from dataclasses import dataclass, field, asdict
 
-TOOL_VERSION = "1.3.3"
+TOOL_VERSION = "1.3.4"
 
 
 @dataclass
@@ -65,13 +65,29 @@ class StudyMetadata:
         ses = self.session        or "ses-01"
         return os.path.join(sub, ses)
 
-    def to_sidecar(self, source_file: str, filter_settings: dict) -> dict:
-        """Return a dict ready to be serialised as a JSON sidecar."""
+    def to_sidecar(self, source_file: str, filter_settings: dict,
+                   event_delay_ms: dict = None,
+                   event_delay_source: dict = None) -> dict:
+        """Return a dict ready to be serialised as a JSON sidecar.
+
+        ``event_delay_ms`` records any correction applied between the file's
+        event markers and the actual stimulus, per stimulus type, and
+        ``event_delay_source`` says whether each was measured from the stimulus
+        artefact or typed in.
+
+        A delay shifts every latency in the file, so it has to be recorded --
+        and the distinction between a measured and a typed value matters when
+        someone else reads the derivative and asks where the number came from.
+        Both are written even when empty, so their absence in a sidecar means
+        "this version did not support delays" rather than "no delay was set".
+        """
         d = asdict(self)
         d["source_file"]     = os.path.basename(source_file)
         d["date_processed"]  = datetime.date.today().isoformat()
         d["tool_version"]    = TOOL_VERSION
         d["filter_settings"] = filter_settings
+        d["event_delay_ms"]     = dict(event_delay_ms or {})
+        d["event_delay_source"] = dict(event_delay_source or {})
         return d
 
 

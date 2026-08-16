@@ -1,6 +1,6 @@
 # MEP-CMAP Analyser
 
-**Version 1.3.3 | August 2026**  
+**Version 1.3.4 | August 2026**  
 *Author:* [*Justin Andrushko PhD, Northumbria University*](https://researchportal.northumbria.ac.uk/en/persons/justin-w-andrushko/)
 
 *Collaborators:* [*David Cunningham PhD*](https://fescenter.org/team/investigators/cunningham-david-phd/) *(*[*TMS Analysis ToolBox*](https://github.com/CunninghamLab/TMSAnalysisToolBox)*) ·* [*Nicholas Holmes PhD*](https://www.birmingham.ac.uk/staff/profiles/sportex/holmes-nick) *·* [*TMSMultiLab*](https://github.com/TMSMultiLab/TMSMultiLab/wiki)
@@ -31,6 +31,263 @@ The tool is not limited to any single measure or paradigm. It handles motor evok
 
 ---
 
+## What's New in 1.3.4
+
+> **Reprocess if you use MEP offset, duration, AUC, or any file whose event
+> markers are mistimed.** This release corrects three faults in offset detection
+> and adds a correction for markers that do not coincide with the stimulus.
+> Offsets and durations change on most recordings; AUC changes where it is
+> bounded by the offset; latency changes only on stimulus types given an event
+> delay. Peak-to-peak, cSP and normalisation are unchanged except where
+> amplitude-window anchoring previously fell back to the file-wide window.
+
+### Multiple channels in one analysis
+
+The analysis now runs **once per selected channel**, in sequence, each pass using
+that channel's own setup on tab 1a — labels, gaps, delays, cSP assignment,
+references and latency profiles. An iSP recorded on one channel and a
+contralateral MEP on another are different muscles under the same marker, and
+they need different latency windows.
+
+Channels are chosen in the **Channel Assignment** dialogue when a Spike2 file is
+first opened, which is now a tick list rather than a single choice, or afterwards
+from the **Analyse** button beside the channel dropdown. There is deliberately no
+"primary" channel: every ticked channel is analysed identically, so a primary
+would imply a hierarchy that does not exist. The first ticked is simply where
+configuration starts. **File → Reassign channels…** reopens the dialogue for a
+file already assigned.
+
+**Confirm Setup** walks through the selected channels, returning to tab 1a on
+each until all are confirmed, and the analysis refuses to start while any remain
+unconfirmed. A channel never configured starts from defaults rather than
+inheriting the previous one's table; **Copy this setup to all channels** is the
+only way settings move between them.
+
+Where more than one channel is analysed, output filenames carry a `channel-`
+entity so the passes do not overwrite each other. A `Channel` column is written
+to the trial and summary files either way, so a single-channel result can still
+join a multi-channel dataset.
+
+The pipeline itself is unchanged: it receives one channel's settings per run and
+knows nothing of the others.
+
+### Event delay: when the marker is not the stimulus
+
+The event marker in a recording is not always the instant the stimulus fired. A
+trigger written by software after the pulse, a stimulator delay setting, or a
+different signal path for one block will all shift it, usually by a fixed amount.
+
+The consequence is not a visibly wrong latency. It is an epoch whose zero is
+wrong, so part of the response falls into the pre-stimulus window — and then
+every measure defined relative to the baseline fails, each in a way that looks
+like a separate fault. On one recording whose markers for a single condition were
+2 ms late, the derivative-ratio detector returned no onsets at all from fifteen
+trials, peak-to-peak was read from a shoulder rather than the peak, and the offset
+landed part-way down a deflection. Those were diagnosed as three unrelated
+problems before the common cause was found.
+
+A **Delay (ms)** column in tab 1a applies a per-stimulus-type correction when
+epoching, so everything measured from zero moves with it, including reported
+latencies. **Detect delays** measures it from the stimulus artefact and fills the
+column in.
+
+The artefact is located by **peak slope, not peak amplitude** — it is the
+steepest feature in the epoch but not always the largest, and on a supramaximal
+M-wave an amplitude search returns the response instead. Two guards decide whether
+a delay is proposed at all:
+
+- **The spread across trials.** A genuine fixed delay measures a fraction of a
+  millisecond in standard deviation; markers that truly jitter measured 3.9 ms on
+  a real recording. Above a threshold the scan reports the spread and proposes
+  nothing, because a single correction would then be wrong on every trial rather
+  than right on average.
+- **The width of the transient.** Without an artefact — a shielded rig, or one
+  where it has been removed — the steepest feature is the response's own rising
+  edge, and because that edge is consistent it would pass the spread test and be
+  proposed with confidence. Across two real recordings the artefact measured
+  0.4–0.6 ms wide at half its maximum against 4.6 ms for a response edge, so the
+  two separate cleanly.
+
+Nothing is applied silently: proposals populate the column for review, the value
+and whether it was measured or typed are written to the BIDS sidecar, and changing
+a delay marks affected files stale in the queue.
+
+### Offset detection: three corrections
+
+**The refinement no longer reports its own search boundary.** It scanned a fixed
+neighbourhood for the first sustained quiet run; when the fine envelope was
+already quiet at the start of that neighbourhood — the normal case, since a
+centred coarse window places the crossing late — it returned the neighbourhood's
+lower bound. The reported offset was then `crossing − envelope_window` on every
+trial: a function of a smoothing setting rather than of the signal. It now walks
+back to the last sample that was genuinely still elevated, which removes the
+dependence on the search radius entirely. Across envelope windows of 3, 5 and
+8 ms the offset now varies by 0.6 ms where it previously moved with the setting.
+
+**The baseline is estimated robustly.** The envelope uses a centred window, so a
+stimulus artefact smears backwards by half of it. The guard covered an artefact at
+zero; one landing even slightly earlier reached past it, and a handful of
+contaminated samples then dominated the mean and standard deviation. On a real
+recording this raised the threshold seventy-three-fold against a neighbouring
+condition, and the offset was reported while the response was still at a quarter
+of its peak. The median and median absolute deviation are unmoved by a short
+contaminated tail.
+
+**The peak-fraction floor is off by default.** It was introduced to fix offset
+detection failing on eighty of eighty-one trials — but the cause there was a 60 ms
+duration cap, and once that was raised the baseline threshold alone found every
+trial. What the floor does is shorten the answer, in proportion to response size,
+so it truncates hardest on the largest and cleanest responses. Measured against an
+independent settle reference on a real M-wave recording, it cut the offset by 45
+to 97 ms depending on its value; at zero the same reference gave errors of −5.9
+and +2.3 ms. On a resting MEP recording, where responses are an order of magnitude
+smaller, the two settings give identical offsets.
+
+**The return threshold now knows where the signal settles.** It was derived from
+the pre-stimulus baseline alone, which assumes the signal comes back to where it
+started. Measured across every condition of one session, the envelope floor late
+in the epoch sat 1.3 to 2.0 times the pre-stimulus floor, so that was a target the
+signal never reached and the offset landed wherever the envelope happened to dip.
+The floor is now the larger of the two. Medians moved earlier in every condition
+tested; trial-to-trial scatter improved in five of eight and worsened in two.
+
+### Data Inspector
+
+**MEP offset and duration** appear in the read-out, updating as markers are
+dragged. Where a cortical silent period is detected, its start marker *is* the
+offset marker — the two are one physical event, and two draggable markers for one
+event can be moved apart. Otherwise the offset gets a marker of its own.
+
+**The area-under-curve window is tied to the onset and offset** in both
+directions, and is reconciled whenever a trial is drawn rather than only when a
+marker is moved. It previously ended at a fixed 50 ms after onset and could
+disagree with the results file. A background silent-period search that set the
+window for every stimulus type — including resting recordings, where the concept
+does not apply — no longer runs for types not assigned to cSP.
+
+**The amplitude window now comes from the analysis.** The Inspector re-derived it
+from the file-wide setting and knew nothing of anchoring, so with anchoring
+enabled the review measured a different interval from the analysis.
+
+**A failed onset detection is reported as such.** The marker fell back to the
+stimulus, which read as "Latency: 0.0 ms" — and that index was returned by *Save
+edits & close* as a manual override, silently turning a blank latency into a
+measured zero. Nothing derived from a non-detection is now exported.
+
+**Show event-type median** draws the condition's median waveform behind the trial:
+the same waveform the derivative-ratio detector compares against, so what is shown
+is what the algorithm saw.
+
+### Amplitude window anchoring
+
+When a stimulus type has too few detected onsets to anchor, the fallback is now
+that type's own **latency profile** rather than the file-wide window. The
+file-wide start is the very thing anchoring exists to replace — typically 10 ms,
+which sits after the peak of an M-wave — so the condition already in trouble was
+also the one whose amplitude was truncated. On a real recording the first phase of
+a 3.8 mV response fell outside the window entirely and peak-to-peak was read from
+a 2.1 mV shoulder.
+
+### Selecting a data range
+
+The crop dialogue now describes what a selection **contains**, not only its time
+bounds: how many events of each stimulus type, and where they sit in the file's
+own numbering.
+
+```
+Selection: 2 ranges · A: 45 events (#1–45 of 90) · C: 30 events (#1–30 of 30)
+```
+
+Indices are per stimulus type, matching the Data Inspector, and discontinuous
+selections are reported as they are rather than collapsed to their outer bounds.
+
+### Smaller changes
+
+- The **sampling rate and amplitude unit** are reported when a file is opened.
+  Both were read automatically but neither was shown until the analysis ran, so
+  opening a file gave no way to confirm what had been detected.
+- The **filter preview** accepts every format the readers handle. It carried its
+  own list of extensions that had not been updated when EDF, BrainVision, MATLAB,
+  AcqKnowledge and CSV support was added, so a `.mat` file silently failed to load
+  there and the preview asked for a sampling rate the file had already declared.
+  The M-wave reference file dialogue had drifted the same way.
+- **Tab 1a's guidance** now states what the Gap setting does to the background
+  window: with a 10 ms gap and a 100 ms pre-stimulus window it runs from −110 to
+  −10 ms, a full 100 ms shifted back rather than 90 ms.
+- Quitting no longer prints Tk errors about invalid command names. Callbacks that
+  reschedule themselves were left queued against an interpreter that was being
+  torn down. The window close button now follows the same path as **File → Exit**.
+- A **Latency window that contradicts its muscle group** is reported. A saved
+  window wins over the profile, because a typed value must not be overwritten, but
+  the only previous symptom of the two disagreeing was onsets pinning at the
+  bottom of a profile the tab was no longer showing.
+
+### New onset detection method: derivative ratio (Boyles et al. 2026)
+
+Working backwards from the first peak of the response, each candidate sample is
+scored by the ratio of the mean absolute derivative *ahead* of it to the mean
+absolute derivative *behind* it; the onset is the earliest sample still reaching a
+set fraction of the maximum ratio, subject to three slope and latency gates. It is
+methodologically independent of everything else here — not a threshold crossing,
+not a run length in the derivative, not a cumulative change point — which is what
+makes it useful as a member method. Ported from the MATLAB reference
+implementation in the [TMSMultiLab library](https://github.com/TMSMultiLab/TMSMultiLab).
+See [MEP Onset Detection](#mep-onset-detection).
+
+**Detectors can now receive a condition average.** The derivative-ratio method
+needs a grand-mean waveform to reject trials whose peak falls far from the
+expected latency. The analysis supplies the outlier-screened median waveform for
+each stimulus type — the same waveform onset anchoring already used, now computed
+whether or not anchoring is enabled. No other method uses it, and none changes
+behaviour as a result. The Data Inspector supplies the same waveform, so review
+and analysis apply the same gate.
+
+**Three corrections to the reference implementation, each switchable.** The
+published MATLAB code contains three details that its own comments contradict.
+They are corrected by default and reproduced exactly under *Reproduce the
+published implementation literally*:
+
+1. The slope comparison window is fixed in **samples**, not milliseconds. The
+   reference computes the correct 5 ms width in samples and then never uses it,
+   indexing with the literal default `5` instead — so the window is 2.5 ms at
+   2 kHz, 1 ms at 5 kHz, 0.5 ms at 10 kHz. Measured on a real recording, literal
+   detection fell from 18 of 20 trials at 1 kHz to 11 of 20 at 5 kHz while the
+   corrected version held at 18 of 20; at 1 kHz the two agree exactly, since
+   5 samples *is* 5 ms there.
+2. The amplitude gate compares the response's peak-to-peak against the baseline
+   **maximum** rather than the baseline peak-to-peak, making it roughly half as
+   strict as its name implies.
+3. The peak-jitter gate compares the trial's **largest** peak against the
+   condition average's **first** peak. On a biphasic response whose second phase
+   is larger, those differ by the peak-to-trough interval on every trial.
+
+**A limitation of the derivative-ratio method.** All of its gates are stated in
+absolute derivatives, so it needs the response to be spectrally *richer* than the
+baseline, not merely larger. Measured at the published window on synthetic data,
+detection of a smooth response fell from 19 of 20 trials at a 0.012 mV baseline to
+0 of 20 at 0.020 mV, while a response with harmonic content still gave 16 of 20;
+the RMS envelope method scored 20 of 20 throughout. Quiet resting recordings sit
+well inside the working range — on a real recording with a 0.0034 mV pre-stimulus
+RMS it found 17–18 of 20 trials per condition — but a noisy baseline or heavy
+low-pass filtering will disable it, and it fails by returning nothing rather than
+a wrong latency. It is also bounded by the first peak, so the reported onset can
+never precede it.
+
+The method is **off by default and not among the default member methods**: it has
+the most parameters of any detector here, two of them scaled by the trial's own
+peak-to-trough interval, its published validation was on three participants, and
+adding it would make the member method count even — turning the median into an
+average of two.
+
+**Renamed: "Consensus" is now "Median across methods".** The former name implied
+that the agreed value was the correct one, which is precisely what the method's
+own output cautions against. `Onset_Consensus(ms)` becomes
+`Onset_MethodsMedian(ms)`. Sessions and preference files written by the
+previous release continue to work: the former method key still resolves, and
+the renamed preference is carried across on first load.
+
+---
+
 ## What's New in 1.3.3
 
 > **Important: reprocess if you use onset latency or AUC.** This release fixes
@@ -52,8 +309,8 @@ the PTP window, and the log warns whenever onsets collapse onto a search bound.
 
 **Four new onset detection methods**, bringing the total to seven: an RMS
 envelope detector with SD-scaled threshold, a CUSUM change-point detector,
-optional Teager–Kaiser preconditioning, and a consensus method that takes the
-median across several detectors. See [MEP Onset Detection](#mep-onset-detection).
+optional Teager–Kaiser preconditioning, and a method that takes the median
+across several detectors. See [MEP Onset Detection](#mep-onset-detection).
 
 **MEP offset and duration** are now detected and reported, giving `MEP_Offset(ms)`
 and `MEP_Duration(ms)`. Where a cortical silent period is detected its start *is*
@@ -72,10 +329,10 @@ Anchoring** in Preferences → Detection to give each stimulus type a window pla
 on its own median onset; the 1c window end still applies as a ceiling.
 
 **Onset method agreement and comparison outputs.** With *Compare methods on every
-trial* enabled, every consensus member runs on every trial and the spread between
+trial* enabled, every member method runs on every trial and the spread between
 them is reported as `Onset_Disagreement(ms)` — a direct triage signal for which
 trials need manual review. The individual latencies are also written to two CSVs
-and five figure types, including Bland–Altman against a leave-one-out consensus.
+and five figure types, including Bland–Altman against a leave-one-out median.
 See [Onset Method Comparison](#onset-method-comparison).
 
 **Analysis and review now use identical detection.** The Data Inspector carried
@@ -321,7 +578,7 @@ New formats are easy to add: a single `formats/<name>.py` module with three publ
 
 ### MEP Onset Detection
 
-Seven detection methods are available. The global default is set in **Settings →
+Eight detection methods are available. The global default is set in **Settings →
 Preferences → Detection** and can be overridden per file in 1a without affecting
 the preference. All methods share the same physiological latency bounds (see
 [Physiological Latency Profiles](#physiological-latency-profiles)) and return
@@ -366,10 +623,27 @@ applies the Teager–Kaiser energy operator before detection, amplifying compone
 that are both large and fast-changing. Sharpens the contrast of the transition
 rather than the amplitude, which helps most at low signal-to-noise ratio.
 
-**Consensus** — runs several detectors and reports the median of those that find
-an onset. Slower, but the spread between members is reported as
-`Onset_Disagreement(ms)`, which flags the trials worth reviewing by hand. Members
-are chosen in Preferences.
+**Derivative ratio — Boyles et al. 2026** — scores each candidate sample by the
+ratio of the mean absolute derivative after it to the mean absolute derivative
+before it, working back from the first peak, and takes the earliest sample still
+reaching a set fraction of the maximum ratio. Three gates follow: a latency
+ceiling, a requirement that most of the first few forward derivatives exceed the
+baseline mean derivative, and a requirement that the following window be clearly
+steeper than baseline. Requires a condition average, which the analysis supplies.
+Independent of the other methods in what it measures, which is its value in a
+consensus. Note that its gates are stated in absolute derivatives, so heavily
+low-pass filtered data will defeat it, and that the search is bounded by the
+first peak so the onset can never precede it. Three details of the published
+implementation are corrected by default; see
+[What's New in 1.3.4](#whats-new-in-134) and the *Reproduce the published
+implementation literally* option.
+
+**Median across methods** — runs several detectors and reports the median of
+those that find an onset. The median is not a verdict on which method is right;
+it is the middle value, chosen because it resists one stray member. Its main
+value is that the spread between members is reported as
+`Onset_Disagreement(ms)`, which flags the trials worth reviewing by hand.
+Members are chosen in Preferences.
 
 **Peak-fraction** — finds the largest positive and negative peaks, then scans
 back from the dominant peak to where the signal first crosses a fraction of it
@@ -442,7 +716,7 @@ printed to the log rather than changing silently.
 
 ### Onset Method Comparison
 
-With **Compare methods on every trial** enabled, every consensus member runs on
+With **Compare methods on every trial** enabled, every member method runs on
 every trial regardless of which method is selected — so a method choice can be
 justified while still running the one you trust. Beyond the per-trial agreement
 columns, this writes:
@@ -456,7 +730,7 @@ columns, this writes:
   method across the file; Bland–Altman of each method against the others; and the
   distribution of disagreement
 
-Bland–Altman uses a **leave-one-out consensus**: the method under test is
+Bland–Altman uses a **leave-one-out median**: the method under test is
 excluded from the median it is compared against. Comparing a method with a
 composite that contains it is a part-whole comparison, which drags the bias
 toward zero and narrows the limits, flattering every method. On real data this
@@ -715,7 +989,7 @@ excitability-compensation block when that option is run.
 |`Measure`|Optional auxiliary / manual measurement (blank unless used)|
 |`cSP_Duration(ms)`, `cSP_MEP_Offset(ms)`, `cSP_EMG_Return(ms)`, `cSP_MEP_Ratio(ms/mV)`|Silent-period duration (`Not Marked` when absent), stimulus→cSP-start, stimulus→EMG-return, and cSP ÷ PTP ratio (Orth & Rothwell, 2004 [5])|
 |`MEP_Offset(ms)`, `MEP_Duration(ms)`, `MEP_Offset_Source`|End of the evoked response, its duration from onset, and which rule produced the offset (`manual` / `csp_start` / `envelope` / `none`). Where a silent period is detected, `MEP_Offset(ms)` and `cSP_MEP_Offset(ms)` carry the same value by design — they are the same physical event|
-|`Onset_Consensus(ms)`, `Onset_Disagreement(ms)`, `Onset_IQR(ms)`, `Onset_Methods_N`|Populated only when *Compare methods on every trial* is enabled: the median across onset detection methods, the max–min spread, the interquartile range (robust to one stray method), and how many methods found an onset. High disagreement flags a trial for review; it does not mean the reported onset is wrong|
+|`Onset_MethodsMedian(ms)`, `Onset_Disagreement(ms)`, `Onset_IQR(ms)`, `Onset_Methods_N`|Populated only when *Compare methods on every trial* is enabled: the median across onset detection methods, the max–min spread, the interquartile range (robust to one stray method), and how many methods found an onset. High disagreement flags a trial for review; it does not mean the reported onset is wrong|
 |`PreStimRMS`, `PreStimPTP`, `PTP_per_PreStimRMS`, `Z_PreStimRMS`|Pre-stimulus baseline EMG: RMS, peak-to-peak, PTP-per-RMS, and standardised RMS|
 |`Z_PTP_Within`, `Z_PTP_Pooled`|PTP z-scores within each condition and pooled across conditions|
 |`PTP_Detrended_WithinCond(mV)` + `_Z`, `PTP_Detrended_Session(mV)` + `_Z`|Amplitude detrended within condition and across the whole session (fatigue / potentiation), each with its z-score|
@@ -901,7 +1175,7 @@ The optional Rust extension `mep_cmap_io` provides accelerated I/O for the Spike
 
 If you use MEP-CMAP Analyser in published research, please cite:
 
-> Justin W. Andrushko. (2026). jandrushko/mep-cmap-analyser: MEP-CMAP Analyser (Version v1.3.3) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.21810844
+> Justin W. Andrushko. (2026). jandrushko/mep-cmap-analyser: MEP-CMAP Analyser (Version v1.3.4) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.21810844
 > Northumbria University. https://github.com/jandrushko/mep-cmap-analyser
 
 ---

@@ -34,8 +34,7 @@ These outputs follow ``cfg.onset_agreement``, NOT the selected onset method.
 The two are independent: agreement runs the member detectors whatever method is
 selected, and comparing methods while running the one you trust is the more
 useful case -- that is how a method choice gets justified. Selecting
-Selecting the median-across-methods detector without enabling agreement
-produces no comparison outputs,
+``methods_median`` without enabling agreement produces no comparison outputs,
 and
 the pipeline says so rather than writing nothing silently.
 
@@ -288,21 +287,6 @@ def figures_subdir(figures_out, bids_prefix, create=False):
     return path
 
 
-def _display(method):
-    """Readable name for a method key, for figure text only.
-
-    Tables keep the key: it is what a script matches on, and renaming it would
-    break anyone's analysis. Figures are read by people, so they get the label.
-    Unknown keys fall through unchanged rather than raising, so a method added
-    without a short label still plots.
-    """
-    try:
-        from .detection import ONSET_METHOD_SHORT_LABELS
-        return ONSET_METHOD_SHORT_LABELS.get(method, method)
-    except Exception:
-        return method
-
-
 def _safe(stim_type):
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in str(stim_type))
 
@@ -335,19 +319,9 @@ def plot_onset_methods_on_trace(stim_type, segs, fs, pre_ms, rows,
                     n, endpoint=False)
     median_wave = np.median(segs, axis=0)
 
-    # The strip's y-tick labels are method names plus a detection count, and
-    # the longest ("Median across methods  (20/20)") overflowed a hard-coded
-    # left margin and was clipped. Size the margin from the labels that will
-    # actually be drawn: a fixed value is a guess that goes stale the moment a
-    # method with a longer name is added.
-    fig_w = 11.0
-    label_chars = max(len(_display(m)) for m in methods) + len("  (00/00)")
-    # ~4.7 pt per character at 8 pt in the default sans face, plus tick padding.
-    left_margin = min(0.34, 0.045 + (label_chars * 4.7) / (fig_w * 72.0))
-
-    fig = _new_figure((fig_w, 7.0))
+    fig = _new_figure((11, 7.0))
     gs = fig.add_gridspec(2, 1, height_ratios=[2.6, 1.5], hspace=0.30,
-                          left=left_margin, right=0.97, top=0.88, bottom=0.09)
+                          left=0.16, right=0.97, top=0.88, bottom=0.09)
     ax = fig.add_subplot(gs[0])
     ax_strip = fig.add_subplot(gs[1], sharex=ax)
 
@@ -378,7 +352,7 @@ def plot_onset_methods_on_trace(stim_type, segs, fs, pre_ms, rows,
         if is_selected:
             tag = "  ← reported"
         elif is_consensus:
-            tag = "  (median)"
+            tag = "  (methods_median)"
         ln = ax.axvline(
             med,
             ls="-" if (is_consensus or is_selected) else "--",
@@ -386,7 +360,7 @@ def plot_onset_methods_on_trace(stim_type, segs, fs, pre_ms, rows,
             lw=2.4 if (is_consensus or is_selected) else 1.4,
             alpha=1.0 if (is_consensus or is_selected) else 0.85,
             zorder=5 if (is_consensus or is_selected) else 4,
-            label=f"{_display(m)} \u2014 {med:.1f} ms{tag}")
+            label=f"{m} — {med:.1f} ms{tag}")
         handles.append(ln)
 
     # Detection counts belong on the tick labels, not as text anchored to the
@@ -400,7 +374,7 @@ def plot_onset_methods_on_trace(stim_type, segs, fs, pre_ms, rows,
         ax_strip.scatter(vals, np.full(len(vals), i),
                          s=18, color=colours[m], alpha=0.75,
                          edgecolors="none")
-        ytick_labels.append(f"{_display(m)}  ({len(vals)}/{n_tot})")
+        ytick_labels.append(f"{m}  ({len(vals)}/{n_tot})")
 
     ax_strip.set_yticks(range(len(methods)))
     ax_strip.set_yticklabels(ytick_labels, fontsize=8)
@@ -459,8 +433,7 @@ def plot_method_agreement(rows, figures_out, bids_prefix):
             ax.hlines(np.median(vals), i - .28, i + .28,
                       color="black", lw=1.6, zorder=4)
         ax.set_xticks(range(len(methods)))
-        ax.set_xticklabels([_display(m) for m in methods],
-                           rotation=35, ha="right", fontsize=7)
+        ax.set_xticklabels(methods, rotation=35, ha="right", fontsize=7)
         ax.set_title(str(stim), fontsize=10)
         if k % ncol == 0:
             ax.set_ylabel("Onset latency (ms)")
@@ -610,16 +583,13 @@ def plot_bland_altman(rows, figures_out, bids_prefix, use_loo=True):
             ax.annotate(lab, xy=(xr, y), xytext=(-3, 2),
                         textcoords="offset points", ha="right", va="bottom",
                         fontsize=7, color="0.25")
-        ax.set_title(f"{_display(m)}   (n={len(d)})", fontsize=10)
+        ax.set_title(f"{m}   (n={len(d)})", fontsize=10)
         ax.set_xlabel("Mean of method and reference (ms)", fontsize=8)
         if k % ncol == 0:
             ax.set_ylabel("Method − reference (ms)", fontsize=9)
         ax.grid(alpha=0.22)
 
-    # Prose, not an identifier. An earlier repair pass converted this back into
-    # the registry key and it appeared as "methods_median" in the figure title.
-    ref_name = ("leave-one-out median of the other methods" if use_loo
-                else "median across all methods")
+    ref_name = ("leave-one-out methods_median" if use_loo else "methods_median")
     fig.suptitle(f"Bland-Altman: each method vs the {ref_name}", fontsize=12)
     handles, labels = fig.axes[0].get_legend_handles_labels()
     if handles:

@@ -73,13 +73,44 @@ def load_config(file_path: str) -> dict:
     return json.loads(p.read_text(encoding="utf-8"))
 
 
-def save_config(file_path: str, emg_channel: str, stim_channel: str) -> None:
+def save_config(file_path: str, emg_channel: str, stim_channel: str,
+                analysis_channels=None) -> None:
+    """Record the channel assignment beside the recording.
+
+    ``emg_channel`` stays the FIRST channel to be analysed, so a build without
+    multi-channel support reads this sidecar unchanged and analyses that one
+    rather than failing on an unfamiliar key.
+
+    Channels are stored by NAME, not index. An index means nothing if the
+    recording is re-exported with a different channel order, and this file is
+    where names are resolved in the first place.
+    """
     p = _sidecar_path(file_path)
-    p.write_text(
-        json.dumps({"emg_channel": emg_channel, "stim_channel": stim_channel},
-                   indent=2),
-        encoding="utf-8",
-    )
+    cfg = {"emg_channel": emg_channel, "stim_channel": stim_channel}
+    names = [str(c) for c in (analysis_channels or []) if str(c).strip()]
+    if names:
+        cfg["analysis_channels"] = names
+    p.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
+def analysis_channels_from_config(cfg, available):
+    """Channel names to analyse, filtered to those the file actually has.
+
+    A sidecar written before multi-channel support has no ``analysis_channels``
+    and loads as the single channel it names -- no migration, no prompt.
+
+    A stored name absent from the file is dropped rather than shifting the
+    selection onto a neighbour: the recording has been re-exported or renamed,
+    and silently analysing a different channel is worse than analysing fewer.
+    Returns ``(names, dropped)`` so the caller can report what went missing.
+    """
+    stored = list((cfg or {}).get("analysis_channels")
+                  or ([cfg.get("emg_channel")] if (cfg or {}).get("emg_channel")
+                      else []))
+    have = list(available or [])
+    names = [n for n in stored if n in have]
+    dropped = [n for n in stored if n not in have]
+    return names, dropped
 
 
 # ---------------------------------------------------------------------------

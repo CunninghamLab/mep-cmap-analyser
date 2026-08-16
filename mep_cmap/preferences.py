@@ -314,12 +314,65 @@ class Preferences:
     def onset_cusum_tkeo(self) -> bool:
         return bool(self._det("onset_cusum_tkeo"))
 
+    # ── Derivative ratio (Boyles et al. 2026) ─────────────────────────────────
+
+    @property
+    def onset_boyles_block_ms(self) -> float:
+        return float(self._det("onset_boyles_block_ms"))
+
+    @property
+    def onset_boyles_baseline_start_ms(self) -> float:
+        return float(self._det("onset_boyles_baseline_start_ms"))
+
+    @property
+    def onset_boyles_baseline_end_ms(self) -> float:
+        return float(self._det("onset_boyles_baseline_end_ms"))
+
+    @property
+    def onset_boyles_amplitude_gate(self) -> float:
+        return float(self._det("onset_boyles_amplitude_gate"))
+
+    @property
+    def onset_boyles_peak_jitter_ms(self) -> float:
+        return float(self._det("onset_boyles_peak_jitter_ms"))
+
+    @property
+    def onset_boyles_peak_window_length(self) -> float:
+        return float(self._det("onset_boyles_peak_window_length"))
+
+    @property
+    def onset_boyles_ratio_cutoff(self) -> float:
+        return float(self._det("onset_boyles_ratio_cutoff"))
+
+    @property
+    def onset_boyles_max_latency_ms(self) -> float:
+        return float(self._det("onset_boyles_max_latency_ms"))
+
+    @property
+    def onset_boyles_deriv_check_ms(self) -> float:
+        return float(self._det("onset_boyles_deriv_check_ms"))
+
+    @property
+    def onset_boyles_deriv_check_duty(self) -> float:
+        return float(self._det("onset_boyles_deriv_check_duty"))
+
+    @property
+    def onset_boyles_base_deriv_sds(self) -> float:
+        return float(self._det("onset_boyles_base_deriv_sds"))
+
+    @property
+    def onset_boyles_deriv_window_length(self) -> float:
+        return float(self._det("onset_boyles_deriv_window_length"))
+
+    @property
+    def onset_boyles_literal(self) -> bool:
+        return bool(self._det("onset_boyles_literal"))
     # ── Consensus / agreement ─────────────────────────────────────────────────
 
     @property
-    def onset_consensus_methods(self) -> list:
-        val = self._det("onset_consensus_methods")
-        return list(val) if val else list(DEFAULTS["onset_consensus_methods"])
+    def onset_methods_median_members(self) -> list:
+        val = self._det("onset_methods_median_members")
+        return list(val) if val else list(DEFAULTS["onset_methods_median_members"])
 
     @property
     def onset_agreement(self) -> bool:
@@ -715,7 +768,7 @@ def open_preferences_dialog(root, on_apply=None):
         _toggle_param_frames()
 
     _ORDER = ["bigoni", "bigoni_walkback", "rms_envelope", "cusum",
-              "consensus", "peak_fraction", "bootstrap"]
+              "methods_median", "peak_fraction", "bootstrap"]
     _ordered = [k for k in _ORDER if k in ONSET_METHOD_LABELS]
     _ordered += [k for k in ONSET_METHOD_LABELS if k not in _ordered]
     for key in _ordered:
@@ -850,14 +903,64 @@ def open_preferences_dialog(root, on_apply=None):
     _pf_row(cs_frame, "Min response width (ms)", cs_minresp_var, 3)
     _check(cs_frame, "Teager-Kaiser preconditioning", cs_tkeo_var, 4)
 
+    # ── Derivative ratio (Boyles et al. 2026) ────────────────────────────────
+    by_frame = tk.LabelFrame(_det_body, text="Derivative Ratio parameters",
+                             padx=10, pady=8)
+    by_block_var   = tk.StringVar(value=str(prefs.onset_boyles_block_ms))
+    by_bstart_var  = tk.StringVar(value=str(prefs.onset_boyles_baseline_start_ms))
+    by_bend_var    = tk.StringVar(value=str(prefs.onset_boyles_baseline_end_ms))
+    by_gate_var    = tk.StringVar(value=str(prefs.onset_boyles_amplitude_gate))
+    by_jitter_var  = tk.StringVar(value=str(prefs.onset_boyles_peak_jitter_ms))
+    by_pwin_var    = tk.StringVar(value=str(prefs.onset_boyles_peak_window_length))
+    by_cut_var     = tk.StringVar(value=str(prefs.onset_boyles_ratio_cutoff))
+    by_maxlat_var  = tk.StringVar(value=str(prefs.onset_boyles_max_latency_ms))
+    by_dchk_var    = tk.StringVar(value=str(prefs.onset_boyles_deriv_check_ms))
+    by_duty_var    = tk.StringVar(value=str(prefs.onset_boyles_deriv_check_duty))
+    by_sds_var     = tk.StringVar(value=str(prefs.onset_boyles_base_deriv_sds))
+    by_dwin_var    = tk.StringVar(value=str(prefs.onset_boyles_deriv_window_length))
+    by_literal_var = tk.BooleanVar(value=prefs.onset_boyles_literal)
+    _pf_row(by_frame, "Slope window (ms)",           by_block_var,  0,
+            "either side of each candidate")
+    _pf_row(by_frame, "Baseline start (ms pre-stim)", by_bstart_var, 1,
+            "clamped to the pre-stim data present")
+    _pf_row(by_frame, "Baseline end (ms pre-stim)",  by_bend_var,   2)
+    _pf_row(by_frame, "Amplitude gate (ratio)",      by_gate_var,   3,
+            "response vs baseline peak-to-peak")
+    _pf_row(by_frame, "Peak jitter (ms)",            by_jitter_var, 4,
+            "vs the condition average's peak")
+    _pf_row(by_frame, "Search back (x peak-trough)", by_pwin_var,   5)
+    _pf_row(by_frame, "Ratio cutoff (0-1)",          by_cut_var,    6,
+            "fraction of the peak derivative ratio")
+    _pf_row(by_frame, "Max latency (ms)",            by_maxlat_var, 7,
+            "the tighter of this and the 1a profile applies")
+    _pf_row(by_frame, "Initial slope window (ms)",   by_dchk_var,   8)
+    _pf_row(by_frame, "  fraction that must exceed", by_duty_var,   9)
+    _pf_row(by_frame, "Overall slope (SD above)",    by_sds_var,   10)
+    _pf_row(by_frame, "Overall window (x peak-trough)", by_dwin_var, 11)
+    _check(by_frame, "Reproduce the published implementation literally",
+           by_literal_var, 12)
+    tk.Label(by_frame,
+             text="Needs a condition average, which the analysis supplies from\n"
+                  "the outlier-screened trials of each event type.\n\n"
+                  "Three details of the reference MATLAB code do not match its\n"
+                  "own comments: the slope window is fixed in samples rather\n"
+                  "than milliseconds, so it shrinks as sampling rate rises; the\n"
+                  "amplitude gate compares a peak-to-peak against a single peak;\n"
+                  "and the peak-jitter gate compares the trial's largest peak\n"
+                  "against the average's first peak. All three are corrected\n"
+                  "here. Tick the box above only to reproduce the published\n"
+                  "method exactly.",
+             fg="grey", justify="left").grid(row=13, column=0, columnspan=3,
+                                             sticky="w", pady=(6, 0))
+
     # ── Consensus ────────────────────────────────────────────────────────────
-    cons_frame = tk.LabelFrame(_det_body, text="Consensus members",
+    cons_frame = tk.LabelFrame(_det_body, text="Median across methods \u2014 members",
                                padx=10, pady=8)
-    _cons_selected = set(prefs.onset_consensus_methods)
+    _cons_selected = set(prefs.onset_methods_median_members)
     cons_vars = {}
     _r = 0
     for key in _ordered:
-        if key == "consensus":
+        if key == "methods_median":
             continue
         v = tk.BooleanVar(value=key in _cons_selected)
         cons_vars[key] = v
@@ -867,8 +970,11 @@ def open_preferences_dialog(root, on_apply=None):
         _r += 1
     tk.Label(cons_frame,
              text="The reported onset is the median of the members that\n"
-                  "detect one. An odd number of members is preferable.\n"
-                  "Bootstrap Threshold is slow and best left unticked.",
+                  "detect one. The median is not a verdict on which method is\n"
+                  "right \u2014 it is the middle value, chosen because it resists\n"
+                  "one stray member. An odd number of members keeps the median\n"
+                  "a value some method actually reported. Bootstrap Threshold\n"
+                  "is slow and best left unticked.",
              fg="grey", justify="left").grid(row=_r, column=0, columnspan=3,
                                              sticky="w", pady=(6, 0))
 
@@ -879,7 +985,8 @@ def open_preferences_dialog(root, on_apply=None):
         "bigoni_walkback": [bg_frame, wb_frame],
         "rms_envelope":    [env_frame],
         "cusum":           [cs_frame],
-        "consensus":       [cons_frame],
+        "boyles":          [by_frame],
+        "methods_median":       [cons_frame],
     }
 
     # ── MEP offset (independent of the onset method) ─────────────────────────
@@ -911,7 +1018,8 @@ def open_preferences_dialog(root, on_apply=None):
     off_frame.pack(anchor="w", padx=16, pady=(8, 8), fill="x")
 
     # ── PTP measurement window anchoring ─────────────────────────────────────
-    ptpa_frame = tk.LabelFrame(_det_body, text="PTP Window Anchoring",
+    ptpa_frame = tk.LabelFrame(_det_body,
+                           text="Amplitude (PTP) Window Anchoring",
                                padx=10, pady=8)
     ptpa_en_var   = tk.BooleanVar(value=prefs.ptp_anchor)
     ptpa_pre_var  = tk.StringVar(value=str(prefs.ptp_anchor_pre_ms))
@@ -941,7 +1049,7 @@ def open_preferences_dialog(root, on_apply=None):
     ag_var = tk.BooleanVar(value=prefs.onset_agreement)
     _check(ag_frame, "Compare methods on every trial", ag_var, 0)
     tk.Label(ag_frame,
-             text="Runs the consensus members alongside the selected method\n"
+             text="Runs the member methods alongside the selected method\n"
                   "and reports how far apart they land, as\n"
                   "Onset_Disagreement(ms). Trials where methods diverge are\n"
                   "the ones worth reviewing by hand. Slows detection roughly\n"
@@ -952,7 +1060,7 @@ def open_preferences_dialog(root, on_apply=None):
 
     def _toggle_param_frames():
         for _f in (pf_frame, bs_frame, bg_frame, wb_frame,
-                   env_frame, cs_frame, cons_frame):
+                   env_frame, cs_frame, by_frame, cons_frame):
             _f.pack_forget()
         # Offset and agreement are method-independent and stay put; repacking
         # them keeps them below the method-specific frames.
@@ -1076,6 +1184,19 @@ def open_preferences_dialog(root, on_apply=None):
             "onset_cusum_max_accum_ms":    _num(cs_accum_var, "CUSUM max accumulation"),
             "onset_cusum_min_response_ms": _num(cs_minresp_var, "CUSUM min response width"),
             "onset_cusum_tkeo":            bool(cs_tkeo_var.get()),
+            "onset_boyles_block_ms":            _num(by_block_var, "Boyles slope window"),
+            "onset_boyles_baseline_start_ms":   _num(by_bstart_var, "Boyles baseline start"),
+            "onset_boyles_baseline_end_ms":     _num(by_bend_var, "Boyles baseline end"),
+            "onset_boyles_amplitude_gate":      _num(by_gate_var, "Boyles amplitude gate"),
+            "onset_boyles_peak_jitter_ms":      _num(by_jitter_var, "Boyles peak jitter"),
+            "onset_boyles_peak_window_length":  _num(by_pwin_var, "Boyles search back"),
+            "onset_boyles_ratio_cutoff":        _num(by_cut_var, "Boyles ratio cutoff"),
+            "onset_boyles_max_latency_ms":      _num(by_maxlat_var, "Boyles max latency"),
+            "onset_boyles_deriv_check_ms":      _num(by_dchk_var, "Boyles initial slope window"),
+            "onset_boyles_deriv_check_duty":    _num(by_duty_var, "Boyles initial slope fraction"),
+            "onset_boyles_base_deriv_sds":      _num(by_sds_var, "Boyles overall slope SD"),
+            "onset_boyles_deriv_window_length": _num(by_dwin_var, "Boyles overall window"),
+            "onset_boyles_literal":             bool(by_literal_var.get()),
             "onset_agreement":             bool(ag_var.get()),
             "mep_offset_enabled":          bool(off_en_var.get()),
             "mep_offset_min_duration_ms":  _num(off_mindur_var, "Offset min duration"),
@@ -1092,9 +1213,9 @@ def open_preferences_dialog(root, on_apply=None):
 
         _members = [k for k, v in cons_vars.items() if v.get()]
         if _members:
-            _det["onset_consensus_methods"] = _members
-        elif method_var.get() == "consensus":
-            _bad.append("Consensus members (none selected)")
+            _det["onset_methods_median_members"] = _members
+        elif method_var.get() == "methods_median":
+            _bad.append("Median across methods \u2014 members (none selected)")
 
         # Drop only the fields that failed to parse; keep everything valid.
         prefs.set_detection_prefs(

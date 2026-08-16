@@ -33,8 +33,9 @@ from the output alone:
     otherwise              -> source 'envelope'   (detector below)
     nothing usable         -> source 'none'
 
-  * detect_mep_offset    -- envelope return-to-baseline detector
-  * resolve_mep_offset   -- precedence rule + duration
+  * detect_mep_offset      -- envelope return-to-baseline detector
+  * resolve_mep_offset     -- precedence rule + duration
+  * offset_marker_field    -- which marker carries the offset, for the Inspector
   * OFFSET_SOURCES
 """
 
@@ -68,6 +69,10 @@ def detect_mep_offset(
         n_boot=500,
         min_return_ms=10.0,
         peak_frac=0.12,
+        # Use the settled level late in the epoch as a floor under the return
+        # threshold when it sits above the pre-stimulus level. Set to 0 to
+        # judge the return against the pre-stimulus baseline alone.
+        settle_frac=1.0,
         use_tkeo=False,
         refine_forward=True,
         refine_window_ms=1.0,
@@ -144,7 +149,32 @@ def detect_mep_offset(
     guard = env_win // 2 + 1
     env_pre = env[:max(0, stim_idx - guard)]
 
-    base = compute_envelope_baseline(env_pre, criterion=criterion)
+    base = compute_envelope_baseline(env_pre, criterion=criterion, robust=True)
+
+    # Where has the signal actually SETTLED?
+    #
+    # The return threshold has been derived from the pre-stimulus baseline
+    # alone, which assumes the signal comes back to where it started. On real
+    # recordings it often does not: measured across every condition of one
+    # session, the envelope floor late in the epoch sat 1.3 to 2.0 times the
+    # pre-stimulus floor. "Return to the pre-stimulus level" is then a target
+    # the signal never reaches, and the detector waits for a chance dip --
+    # reporting an offset 50 to 90 ms after the trace has visibly flattened,
+    # and dragging the area-under-curve window along with it.
+    #
+    # So the floor is taken as the LARGER of the two: where the signal started,
+    # and where it ends up. The late window is placed well past any plausible
+    # response and is only used when there is enough of it to be meaningful.
+    settled = None
+    if settle_frac > 0:
+        # max_duration_ms is optional; fall back to the end of the search
+        # window, which is the other bound on how late an offset can be.
+        _tail_ms = (float(max_duration_ms) if max_duration_ms
+                    else float(search_end_ms))
+        tail_lo = int(stim_idx + _tail_ms * fs / 1000.0)
+        if 0 < tail_lo < env.size - int(20 * fs / 1000.0):
+            settled = compute_envelope_baseline(env[tail_lo:], criterion=criterion,
+                                                robust=True)
     if base is None:
         return None
 
@@ -184,6 +214,12 @@ def detect_mep_offset(
     # held to a floor it will never reach.
     peak_env = float(np.max(env[peak_idx:end_idx])) if end_idx > peak_idx else 0.0
     return_threshold = base.threshold
+    if settled is not None and settled.threshold > return_threshold:
+        # The signal has settled ABOVE where it started, so the pre-stimulus
+        # threshold can never be met and the offset would be reported wherever
+        # the envelope happened to dip. Judge the return against where the
+        # trace actually flattens instead.
+        return_threshold = float(settled.threshold)
     if peak_frac and peak_frac > 0 and peak_env > 0:
         return_threshold = max(return_threshold, float(peak_frac) * peak_env)
 
@@ -201,8 +237,12 @@ def detect_mep_offset(
             refine_window_ms=refine_window_ms,
             refine_sd_mult=refine_sd_mult,
             refine_sustain_ms=refine_sustain_ms,
-            floor_level=(float(peak_frac) * peak_env
-                         if (peak_frac and peak_frac > 0) else 0.0))
+            # The refinement must not walk back past the settled level either,
+            # or it undoes the correction just applied.
+            floor_level=max(
+                float(peak_frac) * peak_env
+                if (peak_frac and peak_frac > 0) else 0.0,
+                float(settled.threshold) if settled is not None else 0.0))
         if refined is not None:
             offset_idx = refined
 
@@ -238,21 +278,53 @@ def _refine_offset_anchor(signal, fs, *, anchor_idx, floor_idx, ceiling_idx,
     fine_win = max(1, int(round(refine_window_ms * fs / 1000.0)))
     pre_hi = max(0, stim_idx - (fine_win // 2 + 1))
     fine_base = compute_envelope_baseline(fine[:pre_hi],
-                                          criterion=refine_sd_mult)
+                                          criterion=refine_sd_mult, robust=True)
     if fine_base is None:
         return None
 
     sustain = max(1, int(round(refine_sustain_ms * fs / 1000.0)))
-    lo = max(int(floor_idx), int(anchor_idx) - int(search_radius))
-    hi = min(int(ceiling_idx), int(anchor_idx) + int(search_radius) + 1)
-    if lo >= hi:
+    anchor_idx = int(anchor_idx)
+    floor_idx = int(floor_idx)
+    if anchor_idx <= floor_idx or anchor_idx >= fine.size:
         return None
 
     # Carry the coarse stage's relative floor through, or the refinement walks
     # the offset back to wherever the strict baseline threshold was last
     # crossed and undoes the correction it was called to make.
     thr = max(fine_base.threshold, float(floor_level))
-    return find_sustained_run(fine, thr, sustain, lo=lo, hi=hi, above=False)
+
+    # Walk BACK from the coarse crossing to the last sample that was still
+    # elevated; the response ends just after it.
+    #
+    # The previous version scanned a fixed neighbourhood for the first
+    # sustained sub-threshold run. When the fine envelope was already quiet at
+    # the start of that neighbourhood -- the normal case, since the coarse
+    # window smears the crossing late -- it returned the neighbourhood's own
+    # lower bound. The reported offset was then exactly `anchor - env_window_ms`
+    # on every trial: a function of a smoothing setting rather than of the
+    # data, and visibly parked at an arbitrary point on the trace.
+    #
+    # Searching backwards for the last elevated sample removes the dependence
+    # on the search radius entirely: the answer is where the signal actually
+    # stopped.
+    last_active = None
+    for i in range(anchor_idx, floor_idx - 1, -1):
+        if fine[i] > thr:
+            last_active = i
+            break
+    if last_active is None:
+        # Quiet all the way back to the peak, which means the coarse crossing
+        # was not late after all. Keep it rather than inventing a landmark.
+        return None
+
+    # Require the quiet stretch after it to be real, not a single dip.
+    end = min(last_active + 1 + sustain, fine.size)
+    if end - (last_active + 1) < sustain:
+        return None
+    if float(np.mean(fine[last_active + 1:end] <= thr)) < 0.5:
+        return None
+
+    return min(last_active + 1, int(ceiling_idx) - 1)
 
 
 def resolve_mep_offset(
@@ -313,3 +385,31 @@ def resolve_mep_offset(
     if offset is None:
         return _finish(None, "none")
     return _finish(offset, "envelope")
+
+
+# ── Which marker carries the offset in the Data Inspector ────────────────────
+
+def offset_marker_field(csp_enabled, has_csp_markers):
+    """Name of the metadata key the offset marker should read and write.
+
+    During voluntary contraction the end of the MEP and the start of the
+    cortical silent period are the same physical event, so the Inspector shows
+    ONE marker for them, not two. Two draggable markers for one event can be
+    moved apart, and then the file contains two different answers to the same
+    question with nothing to say which is right.
+
+    Returns
+    -------
+    "silent_start_idx" when a silent period is enabled and marked -- the
+    existing cSP-start marker doubles as the offset marker, and dragging it
+    moves both.
+
+    "mep_offset_idx" otherwise -- a dedicated marker, which is what a
+    resting-state recording needs since it has no silent period.
+
+    ``resolve_mep_offset`` applies the same precedence when quantifying, so
+    what the analyst drags and what the pipeline reports are the same thing.
+    """
+    if csp_enabled and has_csp_markers:
+        return "silent_start_idx"
+    return "mep_offset_idx"

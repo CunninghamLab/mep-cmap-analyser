@@ -19,7 +19,8 @@ onset_bootstrap      : bootstrap peak-anchored backward scan onset detector
 onset_bigoni         : derivative-based onset detector (Bigoni et al. 2022)
 onset_rms_envelope   : RMS envelope + SD threshold, refined on a short window
 onset_cusum          : CUSUM change-point onset detector
-onset_consensus      : multi-detector median + per-trial agreement metrics
+onset_boyles         : derivative-ratio detector (Boyles et al. 2026)
+onset_methods_median : median across detectors + per-trial agreement metrics
 offset_detection     : MEP offset (return to baseline) + precedence resolution
 csp_detection        : cortical silent period bootstrap detector
 quantification       : PTP, RMS, AUC, pre-stim RMS/PTP scalar metrics
@@ -36,8 +37,9 @@ detect_mep_onset()   : calls whichever onset method is configured in
 # ── Re-export everything so existing imports remain unchanged ─────────────────
 
 from .defaults import (                                               # noqa: F401
-    DEFAULT_CONSENSUS_METHODS,
+    DEFAULT_METHODS_MEDIAN_MEMBERS,
     DEFAULT_ONSET_METHOD,
+    METHOD_ALIASES,
     DETECTION_DEFAULTS,
     OFFSET_DEFAULTS,
     ONSET_DEFAULTS,
@@ -77,10 +79,11 @@ from .onset_bigoni_walkback import detect_mep_onset_bigoni_walkback  # noqa: F40
 
 from .onset_rms_envelope import detect_mep_onset_rms_envelope        # noqa: F401
 from .onset_cusum import detect_mep_onset_cusum                      # noqa: F401
-from .onset_consensus import (                                        # noqa: F401
-    CONSENSUS_DEFAULT_METHODS,
+from .onset_boyles import detect_mep_onset_boyles                    # noqa: F401
+from .onset_methods_median import (                                        # noqa: F401
+    METHODS_MEDIAN_DEFAULT_MEMBERS,
     compute_onset_agreement,
-    detect_mep_onset_consensus,
+    detect_mep_onset_methods_median,
 )
 
 from .dispatch import dispatch_onset                                  # noqa: F401
@@ -88,6 +91,7 @@ from .dispatch import dispatch_onset                                  # noqa: F4
 from .offset_detection import (                                       # noqa: F401
     OFFSET_SOURCES,
     detect_mep_offset,
+    offset_marker_field,
     resolve_mep_offset,
 )
 
@@ -112,6 +116,14 @@ DETECTION_VERSION = "2026-modular-v4"
 # Add new methods here — the dispatcher and preferences UI pick them up
 # automatically via ONSET_METHOD_LABELS.
 
+# Saved sessions and preferences written by v1.3.3 name this method
+# "consensus". It was renamed because "consensus" implies the agreed value is
+# the correct one, which is precisely the inference the method's own outputs
+# warn against. The old key still resolves so those files keep working; it is
+# absent from the labels, so it never appears as a choice in the interface.
+_METHOD_ALIASES = {"consensus": "methods_median"}
+
+
 _METHOD_REGISTRY = {
     "peak_fraction":   detect_mep_onset_peak_fraction,
     "bootstrap":       detect_mep_onset_bootstrap,
@@ -119,7 +131,8 @@ _METHOD_REGISTRY = {
     "bigoni_walkback": detect_mep_onset_bigoni_walkback,
     "rms_envelope":    detect_mep_onset_rms_envelope,
     "cusum":           detect_mep_onset_cusum,
-    "consensus":       detect_mep_onset_consensus,
+    "boyles":          detect_mep_onset_boyles,
+    "methods_median":       detect_mep_onset_methods_median,
 }
 
 # Human-readable labels for the preferences UI
@@ -131,7 +144,23 @@ ONSET_METHOD_LABELS = {
     "bigoni_walkback": "Derivative-based + Walkback (Modified Bigoni)",
     "rms_envelope":    "RMS Envelope + SD Threshold",
     "cusum":           "CUSUM Change-point",
-    "consensus":       "Consensus (median of several methods)",
+    "boyles":          "Derivative Ratio (Boyles et al. 2026)",
+    "methods_median":  "Median across methods",
+}
+
+# Short names for figures and plot axes. The full labels are too long for an
+# axis tick or a legend entry, and the registry keys are not written for a
+# reader. The CSV Method column keeps the KEY, which is stable for scripting;
+# only figures use these.
+ONSET_METHOD_SHORT_LABELS = {
+    "peak_fraction":   "Peak fraction",
+    "bootstrap":       "Bootstrap (legacy)",
+    "bigoni":          "Bigoni",
+    "bigoni_walkback": "Bigoni + walkback",
+    "rms_envelope":    "RMS envelope",
+    "cusum":           "CUSUM",
+    "boyles":          "Derivative ratio",
+    "methods_median":  "Median across methods",
 }
 
 # Shown beneath the method selector in Preferences. Kept next to the labels so
@@ -157,10 +186,20 @@ ONSET_METHOD_HINTS = {
     "cusum":
         "Detects the change in mean rather than the crossing of a level, so "
         "latency is intrinsically unbiased. Tolerant of raised background EMG.",
-    "consensus":
-        "Runs several detectors and takes the median. Slower, but the spread "
-        "between members is reported as Onset_Disagreement(ms), which flags "
-        "the trials worth reviewing by hand.",
+    "boyles":
+        "Compares the slope just after each candidate with the slope just "
+        "before it, working back from the first peak. Methodologically "
+        "independent of the others, which makes it a useful member method. "
+        "It has the most parameters of any method here, two of them scaled by "
+        "the trial's own peak-to-trough interval, and it cannot return an onset "
+        "earlier than the first peak. Needs a condition average, which the "
+        "pipeline supplies.",
+    "methods_median":
+        "Runs several detectors and reports the median of those that find an "
+        "onset. The median is not a verdict on which method is right \u2014 it is "
+        "the middle value, chosen because it resists one stray member. Its "
+        "value is mostly that the spread between members is reported as "
+        "Onset_Disagreement(ms), which flags the trials worth reviewing.",
 }
 
 
@@ -188,5 +227,6 @@ def detect_mep_onset(signal, fs, method=None, **kwargs):
         except Exception:
             method = DEFAULT_ONSET_METHOD
 
+    method = _METHOD_ALIASES.get(method, method)
     fn = _METHOD_REGISTRY.get(method, _METHOD_REGISTRY[DEFAULT_ONSET_METHOD])
     return fn(signal, fs, **kwargs)

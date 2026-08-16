@@ -13,10 +13,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from mep_cmap.detection.onset_consensus import OnsetAgreement
+from mep_cmap.detection.onset_methods_median import OnsetAgreement
 from mep_cmap.onset_methods_report import (CAVEAT, FIGURE_SUBDIR_SUFFIX,
                                            METHOD_COLS, SUMMARY_COLS,
-                                           _loo_consensus,
+                                           _loo_methods_median,
                                            figures_subdir,
                                            build_method_summary,
                                            collect_agreement_rows,
@@ -77,10 +77,10 @@ def test_undetected_trials_are_recorded_not_dropped():
 def test_delta_from_consensus_is_signed_and_omitted_when_undefined():
     rows = collect_agreement_rows(_fixture(n=6), "f.smr")
     big = [r for r in rows if r["Method"] == "bigoni"]
-    assert all(r["Delta_From_Consensus(ms)"] is not None for r in big)
-    assert any(r["Delta_From_Consensus(ms)"] < 0 for r in big)
+    assert all(r["Delta_From_MethodsMedian(ms)"] is not None for r in big)
+    assert any(r["Delta_From_MethodsMedian(ms)"] < 0 for r in big)
     missing = [r for r in rows if not r["Detected"]]
-    assert all(r["Delta_From_Consensus(ms)"] is None for r in missing)
+    assert all(r["Delta_From_MethodsMedian(ms)"] is None for r in missing)
 
 
 def test_segment_numbers_are_one_based_to_match_the_trials_table():
@@ -113,7 +113,7 @@ def test_summary_reports_detection_rate_per_method():
 def test_limits_of_agreement_bracket_the_mean_difference():
     summ = build_method_summary(collect_agreement_rows(_fixture(n=12), "f.smr"))
     row = summ[summ["Method"] == "bigoni"].iloc[0]
-    assert row["LoA_Lower(ms)"] <= row["Mean_Delta_From_Consensus(ms)"] \
+    assert row["LoA_Lower(ms)"] <= row["Mean_Delta_From_MethodsMedian(ms)"] \
         <= row["LoA_Upper(ms)"]
 
 
@@ -209,16 +209,16 @@ def test_every_figure_carries_the_accuracy_caveat():
 
 # ── Bland-Altman and the leave-one-out reference ─────────────────────────────
 
-def test_loo_consensus_excludes_the_method_under_test():
+def test_loo_methods_median_excludes_the_method_under_test():
     per = {"a": 10.0, "b": 20.0, "c": 30.0}
-    assert _loo_consensus(per, "a") == 25.0
-    assert _loo_consensus(per, "c") == 15.0
+    assert _loo_methods_median(per, "a") == 25.0
+    assert _loo_methods_median(per, "c") == 15.0
 
 
-def test_loo_consensus_needs_at_least_two_other_members():
+def test_loo_methods_median_needs_at_least_two_other_members():
     """One remaining value is not a consensus."""
-    assert _loo_consensus({"a": 10.0, "b": 20.0}, "a") is None
-    assert _loo_consensus({"a": 10.0, "b": None, "c": 30.0}, "a") is None
+    assert _loo_methods_median({"a": 10.0, "b": 20.0}, "a") is None
+    assert _loo_methods_median({"a": 10.0, "b": None, "c": 30.0}, "a") is None
 
 
 def _independent_fixture(n=40, n_methods=5, seed=0):
@@ -267,9 +267,9 @@ def test_loo_bias_is_larger_in_magnitude_than_the_part_whole_bias():
     """The same shrinkage applies to the bias, not only to the limits."""
     summ = build_method_summary(
         collect_agreement_rows(_independent_fixture(seed=3), "f.smr"))
-    ok = summ.dropna(subset=["Mean_Delta_From_Consensus(ms)", "Bias_vs_LOO(ms)"])
+    ok = summ.dropna(subset=["Mean_Delta_From_MethodsMedian(ms)", "Bias_vs_LOO(ms)"])
     assert ok["Bias_vs_LOO(ms)"].abs().mean() >= \
-        ok["Mean_Delta_From_Consensus(ms)"].abs().mean()
+        ok["Mean_Delta_From_MethodsMedian(ms)"].abs().mean()
 
 
 def test_bland_altman_figure_is_written(tmp_path):
@@ -292,14 +292,14 @@ def test_bland_altman_defaults_to_the_leave_one_out_reference(tmp_path):
 def test_bland_altman_excludes_consensus_as_its_own_panel():
     """Consensus compared with itself would be a panel of zeros."""
     ag = {("B", i): OnsetAgreement(
-              {"bigoni": 20.0 + i * .1, "cusum": 21.0, "consensus": 20.5},
+              {"bigoni": 20.0 + i * .1, "cusum": 21.0, "methods_median": 20.5},
               20.5, 1.0, 0.5, 3, 3) for i in range(8)}
     rows = collect_agreement_rows(ag, "f.smr")
-    assert any(r["Method"] == "consensus" for r in rows)
+    assert any(r["Method"] == "methods_median" for r in rows)
     import inspect
 
     from mep_cmap import onset_methods_report as r_
-    assert 'if m != "consensus"' in inspect.getsource(r_.plot_bland_altman)
+    assert 'if m != "methods_median"' in inspect.getsource(r_.plot_bland_altman)
 
 
 def test_bland_altman_returns_none_without_usable_differences(tmp_path):
@@ -371,31 +371,31 @@ def test_consensus_appears_as_its_own_row():
     every method except the one whose value gets reported -- the single line an
     analyst most wants to locate on the waveform.
     """
-    from mep_cmap.onset_methods_report import CONSENSUS_KEY
+    from mep_cmap.onset_methods_report import METHODS_MEDIAN_KEY
 
     rows = collect_agreement_rows(_fixture(n=6), "f.smr")
-    assert CONSENSUS_KEY in {r["Method"] for r in rows}
-    cons = [r for r in rows if r["Method"] == CONSENSUS_KEY]
+    assert METHODS_MEDIAN_KEY in {r["Method"] for r in rows}
+    cons = [r for r in rows if r["Method"] == METHODS_MEDIAN_KEY]
     assert len(cons) == 6 * 2                       # every trial
-    assert all(r["Delta_From_Consensus(ms)"] == 0 for r in cons
+    assert all(r["Delta_From_MethodsMedian(ms)"] == 0 for r in cons
                if r["Detected"])
 
 
 def test_consensus_row_has_no_leave_one_out_reference():
     """Its LOO reference would be the median of all members, i.e. itself."""
-    from mep_cmap.onset_methods_report import CONSENSUS_KEY
+    from mep_cmap.onset_methods_report import METHODS_MEDIAN_KEY
 
     rows = collect_agreement_rows(_fixture(n=6), "f.smr")
-    cons = [r for r in rows if r["Method"] == CONSENSUS_KEY]
-    assert all(r["Delta_From_LOO_Consensus(ms)"] is None for r in cons)
+    cons = [r for r in rows if r["Method"] == METHODS_MEDIAN_KEY]
+    assert all(r["Delta_From_LOO_MethodsMedian(ms)"] is None for r in cons)
 
 
 def test_consensus_row_matches_the_agreement_object():
-    from mep_cmap.onset_methods_report import CONSENSUS_KEY
+    from mep_cmap.onset_methods_report import METHODS_MEDIAN_KEY
 
     ag = {("B", 0): _agreement({"a": 10.0, "b": 20.0, "c": 30.0})}
     rows = collect_agreement_rows(ag, "f.smr")
-    cons = [r for r in rows if r["Method"] == CONSENSUS_KEY][0]
+    cons = [r for r in rows if r["Method"] == METHODS_MEDIAN_KEY][0]
     assert cons["Latency(ms)"] == 20.0
 
 
@@ -435,3 +435,68 @@ def test_trace_figure_accepts_a_selected_method(tmp_path):
     assert any("stim-B_onset_methods" in p for p in paths)
     for p in paths:
         assert os.path.getsize(p) > 5000
+
+
+def test_strip_labels_are_not_clipped_by_the_left_margin():
+    """
+    The y-tick labels are method names plus a detection count. With a
+    hard-coded left margin the longest ("Median across methods  (20/20)") was
+    drawn outside the axes and clipped. The margin is now sized from the labels
+    that will actually be drawn, so adding a method with a longer name cannot
+    silently truncate the axis again.
+    """
+    import inspect
+
+    from mep_cmap import onset_methods_report as r
+
+    src = inspect.getsource(r.plot_onset_methods_on_trace)
+    assert "left_margin" in src
+    assert "left=left_margin" in src
+    assert "left=0.16" not in src, "the margin is hard-coded again"
+
+
+def test_computed_left_margin_grows_with_the_longest_label(tmp_path):
+    """Rendered width must respond to label length, not stay fixed."""
+    import os
+
+    ag = _fixture(n=8, stims=("B",))
+    rows = collect_agreement_rows(ag, "f.smr")
+    long_rows = [dict(r, Method=r["Method"] + "_with_a_much_longer_name")
+                 for r in rows]
+    rng = np.random.default_rng(11)
+    segs = {"B": rng.normal(0, 0.01, (8, 2100))}
+
+    a = write_onset_method_figures(rows, ag, segs, 5000.0, 20,
+                                   str(tmp_path / "short"), "s",
+                                   log_callback=lambda *x: None)
+    b = write_onset_method_figures(long_rows, ag, segs, 5000.0, 20,
+                                   str(tmp_path / "long"), "s",
+                                   log_callback=lambda *x: None)
+    assert a and b
+    # Both render; the long-name figure must not error or produce a stub.
+    for pth in a + b:
+        assert os.path.getsize(pth) > 5000
+
+
+def test_no_registry_key_appears_in_figure_text():
+    """
+    Figure titles and labels are read by people; registry keys are not names.
+    `methods_median` leaked into the Bland-Altman title when a text-cleanup
+    pass converted the prose back into identifier form.
+    """
+    import inspect
+
+    from mep_cmap import onset_methods_report as r
+
+    for fn in (r.plot_bland_altman, r.plot_onset_methods_on_trace,
+               r.plot_method_agreement, r.plot_disagreement_distribution):
+        src = inspect.getsource(fn)
+        for line in src.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            if any(t in line for t in ("suptitle", "set_title", "fig.text",
+                                       "ref_name", "tag =")):
+                assert "methods_median" not in line, (
+                    f"a registry key appears in figure text: {stripped}"
+                )

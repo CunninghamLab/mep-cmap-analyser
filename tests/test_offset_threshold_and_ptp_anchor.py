@@ -76,10 +76,14 @@ def plain_trial(seed, onset_ms, dur_ms, amp, noise=0.006):
 OFFSET_KW = dict(onset_ms=22.0, pre_ms=PRE_MS, search_end_ms=300, n_boot=200)
 
 
-def _offset_rate(amp, peak_frac, max_duration_ms, n=15):
+def _offset_rate(amp, peak_frac, max_duration_ms, n=15, **over):
+    """`over` lets a caller widen search_end_ms, which otherwise caps the
+    duration regardless of what max_duration_ms asks for."""
+    kw = dict(OFFSET_KW)
+    kw.update(over)
     got = [detect_mep_offset(trial_with_tail(s, amp=amp), FS,
                              peak_frac=peak_frac,
-                             max_duration_ms=max_duration_ms, **OFFSET_KW)
+                             max_duration_ms=max_duration_ms, **kw)
            for s in range(n)]
     return [v for v in got if v is not None], n
 
@@ -410,3 +414,357 @@ def test_a_missing_preferences_file_does_not_break_startup(tmp_path):
     p, _ = _prefs_with_stored(tmp_path, {})
     assert p.migration_notes == []
     assert p.mep_offset_max_duration_ms > 0
+
+
+# ── The refinement must not report its own search boundary ───────────────────
+
+def test_offset_does_not_track_the_envelope_window_width():
+    """
+    The offset refinement used to scan a fixed neighbourhood for the first
+    sustained sub-threshold run. When the fine envelope was already quiet at
+    the start of that neighbourhood -- the normal case, since a centred coarse
+    window smears the crossing late -- it returned the neighbourhood's own
+    lower bound. The reported offset was then exactly
+    ``coarse_anchor - env_window_ms`` on every trial: a function of a smoothing
+    setting rather than of the signal, and visibly parked at an arbitrary point
+    on the trace.
+
+    The observable signature is that changing the envelope window shifts the
+    offset by the same amount. Asserted here because it is what an analyst
+    would notice, and it does not depend on the internals staying put.
+    """
+    offsets = {}
+    for win in (3.0, 5.0, 8.0):
+        vals = []
+        for s in range(12):
+            v = detect_mep_offset(trial_with_tail(s, amp=1.0), FS,
+                                  peak_frac=0.12, env_window_ms=win,
+                                  max_duration_ms=150.0, **OFFSET_KW)
+            if v is not None:
+                vals.append(v)
+        assert vals, f"nothing detected at a {win} ms window"
+        offsets[win] = float(np.mean(vals))
+
+    spread = max(offsets.values()) - min(offsets.values())
+    window_spread = 8.0 - 3.0
+    assert spread < window_spread * 0.5, (
+        f"offset moved {spread:.1f} ms when the envelope window moved "
+        f"{window_spread:.1f} ms; it is tracking the setting, not the signal "
+        f"({offsets})"
+    )
+
+
+def test_offset_refinement_returns_none_rather_than_a_boundary():
+    """
+    Where the fine envelope is quiet all the way back to the response peak,
+    the coarse crossing was not late and there is nothing to refine. Returning
+    the search floor in that case invents a landmark; returning None keeps the
+    coarse value, which at least came from a threshold crossing.
+    """
+    from mep_cmap.detection.offset_detection import _refine_offset_anchor
+
+    # The threshold is derived from the pre-stimulus baseline, so "quiet" has
+    # to mean quiet RELATIVE TO IT: a noisy baseline with a genuinely silent
+    # tail. Uniform low-level noise is not quiet by its own standard — around
+    # 12% of its samples exceed a mean + 1 SD threshold built from itself.
+    rng = np.random.default_rng(3)
+    n = int((PRE_MS + POST_MS) * FS / 1000)
+    stim = int(PRE_MS * FS / 1000)
+    sig = np.empty(n)
+    sig[:stim] = rng.normal(0, 0.01, stim)          # noisy baseline
+    sig[stim:] = rng.normal(0, 1e-6, n - stim)      # silent afterwards
+
+    got = _refine_offset_anchor(
+        sig, FS, anchor_idx=stim + int(60 * FS / 1000),
+        floor_idx=stim + int(30 * FS / 1000),
+        ceiling_idx=n - 1, stim_idx=stim,
+        search_radius=int(5 * FS / 1000), refine_window_ms=1.0,
+        refine_sd_mult=1.0, refine_sustain_ms=1.0, floor_level=0.0)
+    assert got is None
+
+
+def test_offset_still_lands_where_the_response_ends():
+    """The fix must not cost accuracy on the ordinary case."""
+    errs = []
+    for s in range(20):
+        v = detect_mep_offset(trial_with_tail(s, amp=1.0), FS, peak_frac=0.12,
+                              max_duration_ms=150.0, **OFFSET_KW)
+        if v is not None:
+            errs.append(v - 40.0)
+    assert len(errs) >= 16
+    assert abs(float(np.mean(errs))) < 4.0
+
+
+def test_the_baseline_threshold_alone_detects_once_the_cap_is_adequate():
+    """
+    Records why the peak-fraction floor is small rather than large.
+
+    The floor was introduced to fix a case where offset detection failed on 80
+    of 81 real trials. The real cause was a 60 ms duration cap: once that was
+    raised, the baseline threshold alone detected every trial. What the floor
+    does is SHORTEN the answer, and at 0.12 it discarded genuinely time-locked
+    activity — on a real M-wave it cut the offset at 42.6 ms where the trace
+    plainly settled near 70.
+
+    If this ever fails, the floor is doing detection work again and its value
+    needs revisiting rather than nudging.
+
+    The cap here is 350 ms rather than the 150 ms the real recording needed.
+    This fixture's tail decays with a 60 ms time constant and is still above
+    the noise floor long after the real responses had settled; the robust
+    baseline estimator also puts the threshold slightly lower than the mean did
+    (the median of a right-skewed envelope is below its mean), which extends it
+    further. The point being tested is that the FLOOR is not required for
+    detection, not that any particular cap suffices for any signal.
+    """
+    found, n = _offset_rate(1.0, peak_frac=0.0, max_duration_ms=350.0,
+                            search_end_ms=395)
+    assert len(found) >= n - 1, (
+        f"baseline threshold alone detected only {len(found)}/{n}; the "
+        f"peak-fraction floor may be compensating for something else"
+    )
+
+
+def test_the_floor_is_off_by_default():
+    """
+    Measured against an independent settle reference on a real M-wave
+    recording, the floor truncated the offset by 45 to 97 ms depending on its
+    value, because it scales with response size and so cuts hardest on the
+    largest responses. At zero the same reference gave errors of -5.9 and
+    +2.3 ms. On a resting MEP recording 0.04 and 0.0 are identical, so removing
+    it costs nothing there.
+    """
+    from mep_cmap.detection.defaults import DETECTION_DEFAULTS
+
+    assert DETECTION_DEFAULTS["mep_offset_peak_frac"] == 0.0
+
+
+def test_a_smaller_floor_gives_a_later_offset():
+    """The floor's only effect is to shorten; that must stay monotone."""
+    high, _ = _offset_rate(1.0, peak_frac=0.12, max_duration_ms=150.0)
+    low, _ = _offset_rate(1.0, peak_frac=0.04, max_duration_ms=150.0)
+    assert high and low
+    assert float(np.mean(low)) >= float(np.mean(high))
+
+
+def test_defaults_match_what_the_real_recording_needed():
+    from mep_cmap.detection.defaults import DETECTION_DEFAULTS
+
+    assert DETECTION_DEFAULTS["mep_offset_peak_frac"] == 0.0
+    assert DETECTION_DEFAULTS["mep_offset_max_duration_ms"] == 150.0
+
+
+def test_anchor_fallback_uses_the_latency_profile_not_the_file_wide_window():
+    """
+    When a stimulus type has too few detected onsets to anchor, the fallback
+    used to be the file-wide amplitude window -- which is the very thing
+    anchoring exists to replace. The condition already in trouble was therefore
+    also the one whose amplitude got truncated, while its neighbours anchored
+    correctly and measured fine.
+
+    Measured on a real M-wave recording: the first phase of a 3.8 mV response
+    fell outside the 10-50 ms file-wide window entirely, and peak-to-peak was
+    read from a 2.1 mV shoulder instead, giving 6.84 mV where the true value
+    was 8.5 mV.
+    """
+    from mep_cmap.pipeline import PipelineConfig, ptp_window_for_stim_type
+
+    fs, sb = 5000.0, 100
+    cfg = PipelineConfig(pre_ms=20, post_ms=400, ptp_start=10, ptp_end=50,
+                         ptp_anchor=True, ptp_anchor_min_trials=4,
+                         ptp_anchor_pre_ms=2.0, ptp_anchor_duration_ms=40.0,
+                         latency_map={"C": (1.0, 12.0)})
+    start, end, anchored = ptp_window_for_stim_type(
+        "C", {0: 4.5}, fs, cfg, sb + 50, sb + 250, sb,
+        log_callback=lambda *a: None)
+
+    start_ms = (start - sb) * 1000.0 / fs
+    assert start_ms < 10.0, "the fallback is still the file-wide window"
+    assert start_ms >= 2.0, "the fallback must respect the artefact floor"
+    assert anchored is None, "this is a fallback, not an anchored window"
+
+
+def test_the_fallback_never_widens_past_the_file_wide_start():
+    """A profile that begins later than the configured start must not move it."""
+    from mep_cmap.pipeline import PipelineConfig, ptp_window_for_stim_type
+
+    fs, sb = 5000.0, 100
+    cfg = PipelineConfig(pre_ms=20, post_ms=400, ptp_start=10, ptp_end=50,
+                         ptp_anchor=True, ptp_anchor_min_trials=4,
+                         ptp_anchor_pre_ms=2.0, ptp_anchor_duration_ms=40.0,
+                         latency_map={"B": (20.0, 40.0)})
+    start, _, _ = ptp_window_for_stim_type(
+        "B", {0: 25.0}, fs, cfg, sb + 50, sb + 250, sb,
+        log_callback=lambda *a: None)
+    assert start == sb + 50, "a later profile must not push the window out"
+
+
+def test_the_fallback_is_unaffected_when_anchoring_is_off():
+    from mep_cmap.pipeline import PipelineConfig, ptp_window_for_stim_type
+
+    fs, sb = 5000.0, 100
+    cfg = PipelineConfig(pre_ms=20, post_ms=400, ptp_start=10, ptp_end=50,
+                         ptp_anchor=False, latency_map={"C": (1.0, 12.0)})
+    start, end, _ = ptp_window_for_stim_type(
+        "C", {}, fs, cfg, sb + 50, sb + 250, sb, log_callback=lambda *a: None)
+    assert (start, end) == (sb + 50, sb + 250)
+
+
+# ── The baseline must survive an artefact that lands before the marker ───────
+
+def test_envelope_baseline_is_robust_to_a_contaminated_tail():
+    """
+    The RMS envelope uses a CENTRED window, so a stimulus artefact smears
+    backwards by half that window. The caller's guard covers an artefact at
+    t=0; one landing even slightly earlier reaches past it, and a handful of
+    contaminated samples then dominate the mean and SD.
+
+    Measured on a real recording whose markers for one condition were ~2 ms
+    late: the threshold went from 0.027 mV on a neighbouring condition to
+    1.99 mV -- 73x -- and the offset was reported while the response was still
+    at 26% of its peak, i.e. part-way down a deflection. The median and MAD are
+    unmoved by a short contaminated tail.
+    """
+    from mep_cmap.detection.envelope_stats import compute_envelope_baseline
+
+    rng = np.random.default_rng(0)
+    quiet = np.abs(rng.normal(0.01, 0.002, 100))
+    contaminated = quiet.copy()
+    contaminated[-12:] = 2.4                      # smeared artefact
+
+    clean = compute_envelope_baseline(quiet, 2.5, robust=True)
+    dirty_mean = compute_envelope_baseline(contaminated, 2.5, robust=False)
+    dirty_robust = compute_envelope_baseline(contaminated, 2.5, robust=True)
+
+    # The mean-based estimate is wrecked; the robust one is barely moved.
+    assert dirty_mean.threshold > 10 * clean.threshold
+    assert dirty_robust.threshold < 2 * clean.threshold
+
+
+def test_the_offset_detector_uses_the_robust_baseline():
+    import inspect
+
+    from mep_cmap.detection import offset_detection as od
+
+    src = inspect.getsource(od)
+    calls = [ln for ln in src.splitlines()
+             if "compute_envelope_baseline(" in ln and not ln.strip().startswith("#")]
+    assert calls, "no baseline call found"
+    joined = "\n".join(calls) + src
+    for ln in calls:
+        # every call site, including its continuation line, must ask for robust
+        idx = src.index(ln)
+        window = src[idx:idx + 200]
+        assert "robust=True" in window, f"not robust: {ln.strip()}"
+
+
+def test_offset_lands_at_a_settled_point_not_mid_excursion():
+    """
+    The acceptance test that matters: |signal| at the reported offset, as a
+    fraction of that trial's peak. Near zero means the response has settled;
+    a large value means the marker is part-way down a deflection.
+
+    On the real recording that motivated this, the failing condition measured
+    0.263 before the fix and 0.002 after.
+    """
+    fracs = []
+    for s in range(16):
+        sig = trial_with_tail(s, amp=1.0)
+        v = detect_mep_offset(sig, FS, peak_frac=0.0, max_duration_ms=200.0,
+                              **OFFSET_KW)
+        if v is None:
+            continue
+        stim = int(PRE_MS * FS / 1000)
+        j = stim + int(v * FS / 1000)
+        pk = float(np.max(np.abs(sig[stim:stim + int(60 * FS / 1000)])))
+        if pk > 0:
+            fracs.append(abs(sig[j]) / pk)
+    assert fracs
+    assert float(np.median(fracs)) < 0.10, (
+        f"offset is landing mid-excursion (median |v|/peak = "
+        f"{np.median(fracs):.3f})"
+    )
+
+
+# ── The return threshold must know where the signal actually settles ─────────
+
+def test_the_settled_level_is_used_when_it_sits_above_the_pre_stimulus_one():
+    """
+    The return threshold was derived from the pre-stimulus baseline alone,
+    which assumes the signal comes back to where it started. On real
+    recordings it often does not: measured across every condition of one
+    session, the envelope floor late in the epoch sat 1.3 to 2.0 times the
+    pre-stimulus floor.
+
+    "Return to the pre-stimulus level" is then a target the signal never
+    reaches, and the offset lands wherever the envelope happens to dip -- 50 to
+    90 ms after the trace has visibly flattened, dragging the area-under-curve
+    window with it.
+    """
+    rng = np.random.default_rng(0)
+    n = int((PRE_MS + POST_MS) * FS / 1000)
+    stim = int(PRE_MS * FS / 1000)
+
+    sig = np.empty(n)
+    sig[:stim] = rng.normal(0, 0.004, stim)        # quiet before
+    sig[stim:] = rng.normal(0, 0.020, n - stim)    # noisier after: 5x
+    i0 = stim + int(22 * FS / 1000)
+    i1 = stim + int(40 * FS / 1000)
+    k = np.arange(i1 - i0) / float(i1 - i0)
+    sig[i0:i1] += np.sin(2 * np.pi * k) * np.sin(np.pi * k) ** 0.5
+
+    strict = detect_mep_offset(sig, FS, onset_ms=22.0, pre_ms=PRE_MS,
+                               search_end_ms=300, max_duration_ms=150,
+                               peak_frac=0.0, settle_frac=0.0, n_boot=200)
+    adaptive = detect_mep_offset(sig, FS, onset_ms=22.0, pre_ms=PRE_MS,
+                                 search_end_ms=300, max_duration_ms=150,
+                                 peak_frac=0.0, settle_frac=1.0, n_boot=200)
+    assert adaptive is not None, (
+        "with a floor set where the signal settles, an offset must be found"
+    )
+    if strict is not None:
+        assert adaptive <= strict + 1.0
+
+
+def test_the_settled_floor_is_ignored_when_the_signal_returns_to_baseline():
+    """
+    Where the two floors agree -- an ordinary recording that really does come
+    back to where it started -- the change must do nothing. Otherwise it would
+    move every offset on data that never had the problem.
+
+    This builds its own trial rather than using trial_with_tail: that fixture
+    decays with a 60 ms time constant, so its "settled" region still contains
+    signal and the two floors legitimately differ. Testing the no-op case needs
+    a trial that is genuinely quiet by the end.
+    """
+    rng = np.random.default_rng(4)
+    n = int((PRE_MS + POST_MS) * FS / 1000)
+    stim = int(PRE_MS * FS / 1000)
+    for seed in range(5):
+        rng = np.random.default_rng(seed)
+        sig = rng.normal(0, 0.008, n)          # same noise throughout
+        i0 = stim + int(22 * FS / 1000)
+        i1 = stim + int(40 * FS / 1000)
+        k = np.arange(i1 - i0) / float(i1 - i0)
+        sig[i0:i1] += np.sin(2 * np.pi * k) * np.sin(np.pi * k) ** 0.5
+
+        a = detect_mep_offset(sig, FS, onset_ms=22.0, pre_ms=PRE_MS,
+                              search_end_ms=300, max_duration_ms=200,
+                              peak_frac=0.0, settle_frac=0.0, n_boot=200)
+        b = detect_mep_offset(sig, FS, onset_ms=22.0, pre_ms=PRE_MS,
+                              search_end_ms=300, max_duration_ms=200,
+                              peak_frac=0.0, settle_frac=1.0, n_boot=200)
+        assert (a is None) == (b is None)
+        if a is not None:
+            assert abs(a - b) < 5.0, (
+                f"seed {seed}: the settled floor moved a trial that returns to "
+                f"baseline from {a:.1f} to {b:.1f} ms"
+            )
+
+
+def test_an_optional_duration_cap_does_not_crash_the_settled_estimate():
+    """max_duration_ms is optional; the tail window has to cope without it."""
+    sig = trial_with_tail(0, amp=1.0)
+    kw = dict(OFFSET_KW)
+    detect_mep_offset(sig, FS, peak_frac=0.0, settle_frac=1.0,
+                      max_duration_ms=None, **kw)

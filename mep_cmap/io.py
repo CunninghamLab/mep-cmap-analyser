@@ -126,6 +126,18 @@ def _resolve_path(file_path: str) -> str:
 # Format detection
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Extensions any reader in this package can open.
+#
+# Kept here rather than restated at each call site: the filter preview carried
+# its own list of (".txt", ".smr", ".adibin"), which had not been updated when
+# EDF, BrainVision, MATLAB, AcqKnowledge and CSV support was added. A file
+# outside that stale list silently failed to load there, the sampling rate was
+# never set, and the preview asked the analyst to type in a rate the file had
+# already declared.
+SUPPORTED_EXTENSIONS = (".txt", ".smr", ".adibin", ".edf", ".bdf",
+                        ".vhdr", ".acq", ".mat", ".csv")
+
+
 def detect_format(file_path: str) -> str:
     """
     Inspect the file header and return a format identifier string.
@@ -497,3 +509,26 @@ def extract_stim_times(file_path: str, marker_name: str, stim_channel: str = Non
     if fmt == 'generic_tsv':
         return _generic_tsv.extract_stim_times(file_path, marker_name)
     return _spike2.extract_stim_times(file_path, marker_name)
+
+
+def probe_fs_and_unit(file_path: str, channel_idx: int = 0):
+    """Sampling rate and amplitude unit, without keeping the waveform.
+
+    Every reader already returns both from
+    ``extract_emg_waveform_and_fs``, but nothing surfaced them until the
+    analysis ran. Opening a file gave no way to confirm what had been
+    detected, which is indistinguishable from nothing having been detected --
+    and these are the two values most worth checking first, since a wrong rate
+    silently rescales every latency and a wrong unit every amplitude.
+
+    The array is discarded immediately; only the two scalars are kept, so this
+    costs the read but not the memory. Readers that cannot answer without a
+    channel assignment raise, and the caller reports that rather than guessing.
+
+    Returns
+    -------
+    (fs, unit) : (int or None, str or None)
+    """
+    wave, fs, unit = extract_emg_waveform_and_fs(file_path, channel_idx)
+    del wave
+    return (int(fs) if fs else None), unit

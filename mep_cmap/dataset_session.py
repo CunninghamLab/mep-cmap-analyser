@@ -112,6 +112,11 @@ class FileEntry:
     status:           str   = STATUS_NOT_STARTED
     last_processed:   str   = ""          # ISO timestamp
     derivatives_json: str   = ""          # path to per-file autosave JSON
+    # Fingerprint of the settings this file was last processed under. Empty for
+    # entries written before delays existed, which check_stale treats as
+    # "unknown" rather than "changed" so an upgrade does not mark a whole queue
+    # stale.
+    settings_fingerprint: str = ""
     crop_range:       Optional[list] = None   # [t_start, t_end] or None = full file
     stim_letters:     list  = field(default_factory=list)
     stim_label_map:   dict  = field(default_factory=dict)  # {letter: label}
@@ -169,12 +174,29 @@ class FileEntry:
         self.status = STATUS_COMPLETE
         self.last_processed = datetime.now().isoformat(timespec="seconds")
 
+    def record_settings(self, settings_fingerprint: str):
+        """Store the fingerprint of the settings a result was produced under."""
+        self.settings_fingerprint = settings_fingerprint
+
     def mark_in_progress(self):
         self.status = STATUS_IN_PROGRESS
         self.last_processed = datetime.now().isoformat(timespec="seconds")
 
-    def check_stale(self) -> bool:
-        """Mark as stale if source file modified after last processing."""
+    def check_stale(self, settings_fingerprint: str = None) -> bool:
+        """Mark as stale if the source file OR the settings have changed.
+
+        The mtime check alone was not enough once event delays existed. A delay
+        shifts every latency in a file, so a result computed under one delay
+        and displayed as complete under another is exactly the silently-wrong
+        number the feature exists to prevent -- and the source file has not
+        changed, so nothing would have flagged it.
+
+        ``settings_fingerprint`` is an opaque string from the caller covering
+        the settings that invalidate a result. It is compared with the one
+        stored when the file was processed; a file processed before
+        fingerprints existed has none stored and is left alone rather than
+        being marked stale on upgrade.
+        """
         if self.status != STATUS_COMPLETE or not self.last_processed:
             return False
         try:
@@ -185,6 +207,11 @@ class FileEntry:
                 return True
         except Exception:
             pass
+
+        stored = getattr(self, "settings_fingerprint", None)
+        if settings_fingerprint and stored and stored != settings_fingerprint:
+            self.status = STATUS_STALE
+            return True
         return False
 
 

@@ -71,7 +71,8 @@ from .dataset_session import (DatasetSession, FileEntry,
                                STATUS_STALE, STATUS_LABELS, STATUS_COLOURS)
 from .io import (list_waveform_channels, extract_emg_waveform_and_fs,
                  extract_stim_times, detect_format, needs_wizard,
-                 list_event_channels)
+                 list_event_channels, probe_fs_and_unit,
+                 SUPPORTED_EXTENSIONS)
 from .format_wizard import FormatWizard
 from .filters import adaptive_mains_cancel
 from .detection import detect_mep_onset_peak_fraction
@@ -190,6 +191,10 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         self.crop_end          = None
         self.crop_ranges       = None
         self.gap_ms_map        = {}
+        # stim_type -> ms correction between marker and stimulus
+        self.delay_ms_map      = {}
+        # stim_type -> 'detected' | 'manual', for the sidecar
+        self.delay_source_map  = {}
         self.reference_map     = {}
         self._reference_display = {}
         self.latency_map        = {}
@@ -218,7 +223,24 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         # month/year written here goes stale silently and did so across several
         # releases. TOOL_VERSION is the single source of truth for a build.
         self.root.title(f"MEP-CMAP Analyser, Version {TOOL_VERSION}")
-        self.root.after(0, self._make_window_adaptive)
+
+        # Pending Tk `after` callbacks, so they can be cancelled on exit.
+        #
+        # Several callbacks reschedule themselves indefinitely -- the message
+        # queue poller every 75 ms, the file-load progress poller every 80 ms.
+        # Nothing cancelled them and nothing marked the window as closing, so
+        # quitting left callbacks queued against an interpreter that was being
+        # torn down, and Tk reported them on stderr:
+        #
+        #     invalid command name "12995804736_poll_queue"
+        #         while executing "12995804736_poll_queue" ("after" script)
+        #
+        # Harmless in itself, but it is noise that would hide a real error
+        # printed at the same moment.
+        self._closing = False
+        self._after_ids = set()
+        self.root.protocol("WM_DELETE_WINDOW", self._shutdown)
+        self._schedule(0, self._make_window_adaptive)
         # ─── BIDS / derivatives ──────────────────────────────────────────────
         self.study_metadata   = StudyMetadata()
         self._remembered_meta = None          # persists across files if user ticked "remember"
@@ -227,6 +249,21 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         self._last_outlier_result = None
         self._poll_queue()
         self.segments_metadata = {}
+        # Inspector edits are per CHANNEL as well as per (stim type, trial).
+        #
+        # A marker position is an index into one channel's waveform. Applied to
+        # another channel it means nothing: on a real recording, EMG 1's
+        # peak-to-peak marker indices landed on EMG 2's trace and produced
+        # NEGATIVE peak-to-peak values, because the stored "max" sample was
+        # lower than the stored "min" one. Every offset also came back marked
+        # "manual" when nothing had been set by hand.
+        #
+        # self.segments_metadata stays as the CURRENT channel's edits, so
+        # everything that reads it is unchanged; this holds the rest.
+        self._chan_segment_meta = {}
+        # Channels whose 1a setup has been confirmed. Confirmation
+        # is per channel because the setup is.
+        self._chan_confirmed = set()
         
     # ───────────────────────────────────────────────────────────────────────────
     def _poll_queue(self):
@@ -259,7 +296,23 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                     self._last_outlier_result = res
 
                 elif msg == "show-inspector":
-                    self._open_inspector_gui(*payload)
+                    # If this raises, the worker thread waits forever on
+                    # _last_outlier_result and the whole analysis hangs with no
+                    # message -- the window simply never appears. Report the
+                    # failure and release the worker so the run finishes with
+                    # automatic values instead of stopping dead.
+                    try:
+                        self._open_inspector_gui(*payload)
+                    except Exception as _exc:
+                        import sys as _sys
+                        import traceback as _traceback
+                        print(_traceback.format_exc(), file=_sys.stderr)
+                        self._log_gui(
+                            f"❌ Data Inspector failed to open "
+                            f"({type(_exc).__name__}: {_exc}). The analysis "
+                            f"continued with automatic markers; see the "
+                            f"console for details.")
+                        self._last_outlier_result = {}
 
                 elif msg == "bidsify-convert-done":
                     self._bidsify_convert_done(payload[0])
@@ -280,7 +333,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             pass
 
         # poll again in 75 ms
-        self.root.after(75, self._poll_queue)
+        self._schedule(75, self._poll_queue)
 
     # ───────────────────────────────────────────────────────────────────────────
     def _toggle_humbug_fields(self):
@@ -494,6 +547,89 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         y = mon_y + (sh - final_h) // 4
         win.geometry(f"{final_w}x{final_h}+{x}+{y}")
 
+    def _schedule(self, ms, fn):
+        """`root.after` that records the id so it can be cancelled on exit."""
+        if getattr(self, "_closing", False):
+            return None
+        token = {}
+
+        def _run():
+            self._after_ids.discard(token.get("id"))
+            if getattr(self, "_closing", False):
+                return
+            fn()
+
+        try:
+            token["id"] = self.root.after(ms, _run)
+        except tk.TclError:
+            return None
+        self._after_ids.add(token["id"])
+        return token["id"]
+
+    def _reassign_channels(self):
+        """Discard the saved channel assignment and ask again.
+
+        The assignment dialogue appears only when no sidecar exists, so a file
+        set up before multi-channel support keeps its single channel with no
+        way to add more. Without this the only route is finding and deleting a
+        JSON by hand, which is the sort of thing that gets done wrong.
+        """
+        fpath = self.file_path.get()
+        if not fpath or not os.path.isfile(fpath):
+            messagebox.showinfo("No file", "Load a file first.",
+                                parent=self.root)
+            return
+        try:
+            from .formats.spike2_smr import _sidecar_path
+            side = _sidecar_path(fpath)
+        except Exception:
+            side = None
+        if side is None or not os.path.isfile(str(side)):
+            messagebox.showinfo(
+                "Nothing to reassign",
+                "This file has no saved channel assignment. Only Spike2 SMR "
+                "recordings use one; other formats choose their channels when "
+                "the file is read.",
+                parent=self.root)
+            return
+        if not messagebox.askyesno(
+                "Reassign channels",
+                f"Discard the saved channel assignment for\n\n"
+                f"{os.path.basename(fpath)}\n\n"
+                f"and choose again? The file will be reloaded.\n\n"
+                f"Analysis settings on tab 1a are not affected.",
+                parent=self.root):
+            return
+        try:
+            os.remove(str(side))
+        except Exception as exc:
+            messagebox.showerror(
+                "Could not reassign",
+                f"The saved assignment could not be removed "
+                f"({type(exc).__name__}: {exc}).", parent=self.root)
+            return
+        self.log("🔁 Channel assignment cleared — choose again.")
+        self._browse_file_path(fpath)
+
+    def _shutdown(self):
+        """Cancel pending callbacks, then leave the main loop.
+
+        Without the cancellation, a self-rescheduling poller fires once more
+        after the interpreter has started tearing down and Tk complains about
+        an invalid command name.
+        """
+        self._closing = True
+        for _id in list(self._after_ids):
+            try:
+                self.root.after_cancel(_id)
+            except Exception:
+                pass
+        self._after_ids.clear()
+        try:
+            self.root.quit()
+        except Exception:
+            pass
+
     def _make_window_adaptive(self):
         """Maximise on startup — eliminates font/size complaints across all screens.
 
@@ -676,6 +812,41 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         self.available_markers = []
         self.channel_choice = tk.StringVar()
         self.channel_idx    = 0
+
+        # ── Per-channel setup (tab 1a) ────────────────────────────────────────
+        # Everything in 1a is a property of a (channel, stimulus type) pair,
+        # not of the stimulus type alone: an iSP recorded on one channel and a
+        # contralateral MEP on another are different muscles, so they need
+        # different latency profiles even though the marker is the same.
+        #
+        # The PIPELINE is unaffected. It still receives one flat map per run;
+        # the analysis loops over channels and hands it that channel's settings.
+        # Widening the pipeline's own maps would have reached the summary
+        # builder, the group merge, every add-on and the Inspector at once.
+        #
+        # Switching channel carries the current settings across as a starting
+        # point rather than beginning blank, because most of the table is
+        # usually identical and only the muscle-dependent rows differ.
+        self._chan_settings   = {}
+        # EVERY per-stimulus map tab 1a writes must be here.
+        #
+        # latency_map holds the numbers; latency_stim_map and
+        # latency_muscle_map hold the dropdown choices those numbers are
+        # derived from. Storing one without the others let them drift apart on
+        # a channel switch: the dropdown read "Peripheral nerve" while the
+        # window was still the TMS 13-30 ms one it had been given earlier, so
+        # onsets for those stimulus types pinned at 13 ms while the tab
+        # insisted it was configured for an M-wave.
+        #
+        # test_per_channel_setup checks this list against what
+        # _harvest_labels_tab actually assigns, so a map added to the tab
+        # cannot be left out of here.
+        self._chan_settings_keys = (
+            "label_map", "color_map", "plot_included", "gap_ms_map",
+            "delay_ms_map", "delay_source_map", "csp_types", "reference_map",
+            "latency_map", "latency_stim_map", "latency_muscle_map",
+            "_reference_display",
+        )
     
     # ──────────────────────────────────────────────────────────────
     def run_analysis_start(self):
@@ -690,6 +861,46 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                 "Use File → Set Derivatives Folder, or click the red bar at the top.",
                 parent=self.root)
             self.browse_derivatives_folder()
+            return
+
+        # Guard: every channel being analysed must have its own setup.
+        #
+        # Without this, a channel never opened on tab 1a would silently inherit
+        # whichever channel's table happened to be on screen. For a different
+        # muscle that means the wrong latency profile, and nothing in the
+        # output would record that it had happened -- the analysis would simply
+        # be wrong in a way that looks like a result.
+        _unset = self._unconfigured_analysis_channels()
+        if _unset:
+            messagebox.showwarning(
+                "Channels not set up",
+                "These channels are selected for analysis but have no setup "
+                "of their own:\n\n    " + "\n    ".join(_unset) +
+                "\n\nSelect each on the Channel dropdown, configure tab 1a "
+                "and click ✔ Confirm Setup. 'Copy this setup to all channels' "
+                "applies the current table to every channel if they share it.",
+                parent=self.root)
+            self.notebook.select(self.stage1_outer)
+            return
+
+        # Guard: EVERY selected channel must be confirmed, not just the one on
+        # screen. Confirmation is per channel because the setup is, and
+        # confirming the last channel visited says nothing about the others.
+        _unconfirmed = [c for c in self._analysis_channel_indices()
+                        if c not in getattr(self, "_chan_confirmed", set())]
+        if getattr(self, "_labels_tab_built", False) and _unconfirmed:
+            _nm = list(self.channel_dd["values"]) if hasattr(self, "channel_dd") else []
+            messagebox.showwarning(
+                "Setup not confirmed",
+                "These channels are selected for analysis but their setup has "
+                "not been confirmed:\n\n    "
+                + "\n    ".join(_nm[c] if c < len(_nm) else f"channel {c}"
+                                for c in _unconfirmed)
+                + "\n\nClick ✔ Confirm Setup on each. The button moves you to "
+                  "the next one that needs it.",
+                parent=self.root)
+            self.notebook.select(self.stage1_outer)
+            self.nb_stage1.select(self.tab1b_frame)
             return
 
         # Guard: Tab 1b must be confirmed before running
@@ -780,6 +991,14 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             enable_inspector  = self.enable_inspector.get(),
             average_mode      = self.average_mode.get(),
             channel_idx       = self.channel_idx,
+            # Which channels to analyse, their display names, and each one's
+            # tab 1a setup. The worker loops over these; the pipeline itself
+            # still sees one channel at a time.
+            analysis_channels = self._analysis_channel_indices(),
+            channel_names     = (list(self.channel_dd["values"])
+                                 if hasattr(self, "channel_dd") else []),
+            chan_settings     = copy.deepcopy(self._chan_settings),
+            chan_segment_meta = copy.deepcopy(self._chan_segment_meta),
             label_map         = self.label_map.copy(),
             color_map         = self.color_map.copy(),
             plot_included     = self.plot_included.copy(),
@@ -787,6 +1006,8 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             crop_end          = self.crop_end,
             crop_ranges       = getattr(self, "crop_ranges", None),
             gap_ms_map        = self.gap_ms_map,
+            delay_ms_map      = self.delay_ms_map,
+            delay_source_map  = self.delay_source_map,
             # BIDS
             study_metadata    = copy.deepcopy(self.study_metadata),
             limb              = getattr(self.study_metadata, "limb", ""),
@@ -867,7 +1088,8 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
 
     def _open_inspector_gui(self, segments_dict, fs, pre_ms, post_ms,
                             unit, label_map, color_map, analysis_pre_ms=None,
-                            extra_segs=None, wide_window_s=3.0, auto_meta=None, underlays=None):
+                            extra_segs=None, wide_window_s=3.0, auto_meta=None,
+                            underlays=None, ptp_windows_by_type=None):
         """GUI thread – open the Inspector, block until closed.
         pre_ms here is the analysis/extraction pre-stim (prestim_ms, e.g. 100ms).
         visible_pre_ms is the display window (pre_time, e.g. 20ms).
@@ -881,7 +1103,26 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         # final result (manual edits win per field). A fresh start (empty saved
         # metadata) therefore shows the pure auto onsets.
         _seed = {k: dict(v) for k, v in (auto_meta or {}).items()}
-        for _k, _m in getattr(self, 'segments_metadata', {}).items():
+        # Overlay only THIS channel's saved edits.
+        #
+        # self.segments_metadata holds whichever channel was reviewed last, so
+        # in a multi-channel run the second Inspector opened showing the
+        # first's marker positions -- indices into a different waveform. The
+        # analysis had already been given the right per-channel edits; this
+        # display path had not, so the review disagreed with the numbers being
+        # computed and any marker left untouched was saved back as the wrong
+        # channel's.
+        _ch_now = getattr(self, "_review_channel_idx", self.channel_idx)
+        _saved = getattr(self, "_chan_segment_meta", {}).get(_ch_now)
+        if _saved is None:
+            # No per-channel record. The flat map may be used only when a
+            # single channel is being analysed: then it unambiguously belongs
+            # to the channel on screen. In a multi-channel run there is no way
+            # to tell which channel produced it, and applying it to the wrong
+            # one puts marker indices on a waveform they do not describe.
+            _saved = ({} if getattr(self, "_multi_channel_run", False)
+                      else getattr(self, 'segments_metadata', {}))
+        for _k, _m in (_saved or {}).items():
             _seed.setdefault(_k, {}).update(_m)
         # Detection settings the analysis ran with, forwarded so that
         # re-detection inside the inspector uses the same algorithm AND the
@@ -901,6 +1142,10 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             label_map=label_map, color_map=color_map, emg_unit=unit,
             ptp_start_ms        = self.ptp_start.get(),
             ptp_end_ms          = self.ptp_end.get(),
+            # Per-stimulus-type amplitude windows from the analysis, so review
+            # measures the same interval. Falls back to the two values above
+            # for any type not present.
+            ptp_windows_by_type = ptp_windows_by_type,
             analysis_pre_ms     = _analysis_pre,
             visible_pre_ms      = _visible_pre,
             extra_segs          = extra_segs or {},
@@ -929,6 +1174,11 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         )
         self.root.wait_window(inspector.top)
         self.segments_metadata = dict(inspector.meta)
+        # Keep them against the channel that was on screen, so a later pass
+        # over a different channel does not inherit these marker positions.
+        self._chan_segment_meta[getattr(self, "_review_channel_idx",
+                                        self.channel_idx)] = \
+            dict(inspector.meta)
         self._last_outlier_result = inspector.meta
         # Auto-save the session immediately so inspector edits
         # are never lost if the user forgets Save Session.
@@ -937,15 +1187,24 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
 
     def _show_inspector_cb(self, segments_dict, fs, pre_ms, post_ms,
                         unit, label_map, color_map, analysis_pre_ms=None,
-                        extra_segs=None, wide_window_s=3.0, auto_meta=None, underlays=None):
+                        extra_segs=None, wide_window_s=3.0, auto_meta=None,
+                        underlays=None, ptp_windows_by_type=None):
         """
         Called by the worker thread.  Sends a message to the GUI thread and waits.
         Returns the inspector's metadata dict.
+
+        This sits BETWEEN the pipeline and _open_inspector_gui, and the payload
+        below is unpacked positionally. A new argument therefore has to be
+        added in three places -- the pipeline's call, this signature and tuple,
+        and the GUI method -- and missing the middle one raises only when an
+        analysis actually reaches the inspector, long after import. See
+        tests/test_inspector_payload_chain.py.
         """
         self.msg_q.put(("show-inspector",
                         segments_dict, fs, pre_ms, post_ms,
                         unit, label_map, color_map, analysis_pre_ms,
-                        extra_segs, wide_window_s, auto_meta, underlays))
+                        extra_segs, wide_window_s, auto_meta, underlays,
+                        ptp_windows_by_type))
         while self._last_outlier_result is None:
             time.sleep(0.05)
         meta = self._last_outlier_result
@@ -979,89 +1238,130 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
 
                 marker = self._marker_choice_result
 
-            # -------- run the heavy pipeline ------------------------
-            run_pipeline(
-                input_path           = params["input_path"],
-                marker_name          = marker,
-                log_callback         = lambda txt: self.msg_q.put(("log", txt)),
-                progress_callback    = lambda p: self.msg_q.put(("progress", p)),
-                review_outliers_cb   = self._review_outliers_cb,
-                show_inspector_cb    = self._show_inspector_cb,
+            # -------- run the heavy pipeline, once per channel ------
+            #
+            # Each pass is independent and uses that channel's own tab 1a
+            # settings, so an iSP on one channel and a contralateral MEP on
+            # another are measured with their own latency profiles. The
+            # pipeline itself is unchanged: it still receives one flat set of
+            # maps and knows nothing about there being other channels.
+            #
+            # Sequential rather than concurrent, and the Data Inspector opens
+            # in turn for each: it also means an analyst cannot select a
+            # channel and then forget to review it.
+            _chan_list = params.get("analysis_channels") or [params["channel_idx"]]
+            _chan_names = params.get("channel_names") or []
+            _chan_setups = params.get("chan_settings") or {}
 
-                # every other option comes straight from params
-                pre_ms               = params["pre_ms"],
-                post_ms              = params["post_ms"],
-                ptp_start            = params["ptp_start"],
-                ptp_end              = params["ptp_end"],
-                prestim_ms           = params["prestim_ms"],
+            for _pass, _ch in enumerate(_chan_list, start=1):
+                _nm = _chan_names[_ch] if _ch < len(_chan_names) else f"channel {_ch}"
+                # The Inspector callback runs on the GUI thread and needs to
+                # know which channel it is reviewing, so its edits are stored
+                # against the right one.
+                self._review_channel_idx = _ch
+                self._multi_channel_run = len(_chan_list) > 1
+                if len(_chan_list) > 1:
+                    self.msg_q.put(("log",
+                        f"\n\U0001F50C Channel {_pass} of {len(_chan_list)}: "
+                        f"{_nm}"))
 
-                apply_humbug         = params["apply_humbug"],
-                humbug_harmonics     = params['humbug_harmonics'],
-                apply_filter         = params["apply_filter"],
-                apply_bandpass       = params["apply_bandpass"],
-                apply_notch          = params["apply_notch"],
-                highpass             = params["highpass"],
-                lowpass              = params["lowpass"],
-                notch_freq           = params["notch_freq"],
-                notch_q              = params["notch_q"],
-                filter_order         = params["filter_order"],
-                filter_family        = params["filter_family"],
-                cheby_ripple         = params["cheby_ripple"],
-                flexible_bandpass    = params["flexible_bandpass"],
-                hp_order             = params["hp_order"],
-                lp_order             = params["lp_order"],
-                filter_harmonics     = params["filter_harmonics"],
+                # That channel's tab 1a setup. Falls back to the top-level
+                # values, which is what a single-channel run has always used.
+                _setup = _chan_setups.get(_ch, {})
 
-                enable_outlier_review= params["enable_out_review"],
-                outlier_threshold    = params["outlier_threshold"],
-                peak_fraction        = params["peak_fraction"],
-                min_peak_amplitude   = params["min_amp"],
-                slope_threshold      = params["slope_threshold"],
-                onset_method         = params["onset_method"],
-                onset_bootstrap_crit = params["onset_bootstrap_crit"],
-                onset_bootstrap_n    = params["onset_bootstrap_n"],
-                onset_bigoni_smooth_ms   = params.get("onset_bigoni_smooth_ms",   0.5),
-                onset_bigoni_min_run_ms  = params.get("onset_bigoni_min_run_ms",  0.5),
-                onset_bigoni_walkback_sd = params.get("onset_bigoni_walkback_sd", 1.0),
-                # Envelope / CUSUM / consensus / offset settings. Passed as a
-                # single mapping so a new detector parameter needs no edit
-                # here, in run_pipeline's signature, or in its PipelineConfig
-                # construction.
-                detection_params     = _detection_config_kwargs(params),
-                latency_map          = params.get("latency_map", {}),
-                onset_anchor         = params.get("onset_anchor", False),
-                onset_anchor_halfwidth_ms = params.get("onset_anchor_halfwidth_ms", 8.0),
-                csp_types            = params.get("csp_types", set()),
-                csp_min_silence_ms   = params.get("csp_min_silence_ms", 25.0),
-                csp_min_return_ms    = params.get("csp_min_return_ms", 40.0),
-                csp_criterion        = params.get("csp_criterion", 1.96),
-                csp_significance     = params.get("csp_significance", 0.99),
-                csp_n_boot           = params.get("csp_n_boot", 1000),
-                csp_search_end_ms    = params.get("csp_search_end_ms", 400.0),
-                csp_max_mep_offset_ms= params.get("csp_max_mep_offset_ms", 100.0),
-                existing_segments_metadata = dict(self.segments_metadata),
+                def _own(key, default=None):
+                    return _setup.get(key, params.get(key, default))
 
-                enable_inspector     = params["enable_inspector"],
-                average_mode         = params["average_mode"],
-                channel_idx          = params["channel_idx"],
-                custom_labels        = params["label_map"],
-                color_map            = params["color_map"],
-                plot_included        = params["plot_included"],
-                crop_start           = params["crop_start"],
-                crop_end             = params["crop_end"],
-                crop_ranges          = params["crop_ranges"],
-                gap_ms_map           = params["gap_ms_map"],
-                # BIDS
-                study_metadata       = params["study_metadata"],
-                limb                 = params.get("limb", ""),
-                measure              = params.get("measure", ""),
-                reference_map         = params.get("reference_map", {}),
-                mmax_file             = params.get("mmax_file", ""),
-                plateau_tolerance     = params.get("plateau_tolerance", 0.10),
-                extra_channel_indices = params.get("extra_channel_indices", []),
-                wide_window_s         = params.get("wide_window_s", 3.0),
-                derivatives_root     = params["derivatives_root"],
-            )
+                run_pipeline(
+                    input_path           = params["input_path"],
+                    marker_name          = marker,
+                    log_callback         = lambda txt: self.msg_q.put(("log", txt)),
+                    progress_callback    = lambda p: self.msg_q.put(("progress", p)),
+                    review_outliers_cb   = self._review_outliers_cb,
+                    show_inspector_cb    = self._show_inspector_cb,
+
+                    # every other option comes straight from params
+                    pre_ms               = params["pre_ms"],
+                    post_ms              = params["post_ms"],
+                    ptp_start            = params["ptp_start"],
+                    ptp_end              = params["ptp_end"],
+                    prestim_ms           = params["prestim_ms"],
+
+                    apply_humbug         = params["apply_humbug"],
+                    humbug_harmonics     = params['humbug_harmonics'],
+                    apply_filter         = params["apply_filter"],
+                    apply_bandpass       = params["apply_bandpass"],
+                    apply_notch          = params["apply_notch"],
+                    highpass             = params["highpass"],
+                    lowpass              = params["lowpass"],
+                    notch_freq           = params["notch_freq"],
+                    notch_q              = params["notch_q"],
+                    filter_order         = params["filter_order"],
+                    filter_family        = params["filter_family"],
+                    cheby_ripple         = params["cheby_ripple"],
+                    flexible_bandpass    = params["flexible_bandpass"],
+                    hp_order             = params["hp_order"],
+                    lp_order             = params["lp_order"],
+                    filter_harmonics     = params["filter_harmonics"],
+
+                    enable_outlier_review= params["enable_out_review"],
+                    outlier_threshold    = params["outlier_threshold"],
+                    peak_fraction        = params["peak_fraction"],
+                    min_peak_amplitude   = params["min_amp"],
+                    slope_threshold      = params["slope_threshold"],
+                    onset_method         = params["onset_method"],
+                    onset_bootstrap_crit = params["onset_bootstrap_crit"],
+                    onset_bootstrap_n    = params["onset_bootstrap_n"],
+                    onset_bigoni_smooth_ms   = params.get("onset_bigoni_smooth_ms",   0.5),
+                    onset_bigoni_min_run_ms  = params.get("onset_bigoni_min_run_ms",  0.5),
+                    onset_bigoni_walkback_sd = params.get("onset_bigoni_walkback_sd", 1.0),
+                    # Envelope / CUSUM / consensus / offset settings. Passed as a
+                    # single mapping so a new detector parameter needs no edit
+                    # here, in run_pipeline's signature, or in its PipelineConfig
+                    # construction.
+                    detection_params     = _detection_config_kwargs(params),
+                    latency_map          = _own("latency_map", {}),
+                    onset_anchor         = params.get("onset_anchor", False),
+                    onset_anchor_halfwidth_ms = params.get("onset_anchor_halfwidth_ms", 8.0),
+                    csp_types            = _own("csp_types", set()),
+                    csp_min_silence_ms   = params.get("csp_min_silence_ms", 25.0),
+                    csp_min_return_ms    = params.get("csp_min_return_ms", 40.0),
+                    csp_criterion        = params.get("csp_criterion", 1.96),
+                    csp_significance     = params.get("csp_significance", 0.99),
+                    csp_n_boot           = params.get("csp_n_boot", 1000),
+                    csp_search_end_ms    = params.get("csp_search_end_ms", 400.0),
+                    csp_max_mep_offset_ms= params.get("csp_max_mep_offset_ms", 100.0),
+                    # Only this channel's saved edits. Marker indices are
+                    # positions in one channel's waveform and are meaningless
+                    # applied to another -- that produced negative
+                    # peak-to-peak values on a real recording.
+                    existing_segments_metadata = dict(
+                        params.get("chan_segment_meta", {}).get(_ch, {})),
+
+                    enable_inspector     = params["enable_inspector"],
+                    average_mode         = params["average_mode"],
+                    channel_idx          = _ch,
+                    channel_label        = _nm,
+                    multi_channel        = len(_chan_list) > 1,
+                    custom_labels        = _own("label_map", {}),
+                    color_map            = _own("color_map", {}),
+                    plot_included        = _own("plot_included", {}),
+                    crop_start           = params["crop_start"],
+                    crop_end             = params["crop_end"],
+                    crop_ranges          = params["crop_ranges"],
+                    gap_ms_map           = _own("gap_ms_map", {}),
+                    delay_ms_map         = _own("delay_ms_map", {}),
+                    # BIDS
+                    study_metadata       = params["study_metadata"],
+                    limb                 = params.get("limb", ""),
+                    measure              = params.get("measure", ""),
+                    reference_map         = _own("reference_map", {}),
+                    mmax_file             = params.get("mmax_file", ""),
+                    plateau_tolerance     = params.get("plateau_tolerance", 0.10),
+                    extra_channel_indices = params.get("extra_channel_indices", []),
+                    wide_window_s         = params.get("wide_window_s", 3.0),
+                    derivatives_root     = params["derivatives_root"],
+                )
 
             self.msg_q.put(("log", "✅ Analysis complete!"))
             self.msg_q.put(("progress", 100))
@@ -1103,7 +1403,10 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         file_menu.add_command(label="Save Session",  command=lambda: self.save_session())
         file_menu.add_command(label="Load Session",  command=lambda: self.load_session())
         file_menu.add_separator()
-        file_menu.add_command(label="Exit",          command=self.root.quit)
+        file_menu.add_command(label="Reassign channels…",
+                              command=self._reassign_channels)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit",          command=self._shutdown)
 
         settings_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Settings", menu=settings_menu)
@@ -1173,6 +1476,16 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                                          state="disabled", width=14)
         self.channel_dd.pack(side='left', padx=(4, 0))
         self.channel_dd.bind("<<ComboboxSelected>>", self._on_channel_selected)
+
+        # Which channels the analysis runs over. Separate from the combobox
+        # above, which chooses the channel being CONFIGURED and previewed --
+        # one control cannot mean both without becoming ambiguous the moment
+        # you configure one channel while analysing four.
+        self.analyse_channels = set()          # indices; empty = the current one
+        self._analyse_btn_var = tk.StringVar(value="Analyse: 1")
+        tk.Button(file_row, textvariable=self._analyse_btn_var,
+                  command=self._choose_analysis_channels)\
+            .pack(side='left', padx=(6, 0))
 
         # Event marker dropdown — only enabled when >1 marker type available
         tk.Label(file_row, text="  Event marker:").pack(side='left')
@@ -1540,7 +1853,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         # Onset search-window anchoring (median-waveform seed)
         tk.Checkbutton(
             time_frame,
-            text="Anchor onset search window to sample-median onset",
+            text="Anchor the ONSET SEARCH window to the sample-median onset",
             variable=self.onset_anchor
         ).grid(row=6, column=0, columnspan=3, sticky='w', padx=6, pady=(0, 4))
         tk.Label(time_frame, text="Window ± (ms):").grid(
@@ -1777,6 +2090,12 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                 "marker_choice":    self.marker_choice.get(),
                 "channel_idx":      self.channel_idx,
                 "channel_choice":   self.channel_choice.get(),
+                # Per-channel 1a setup. Sets are serialised as lists, since
+                # JSON has no set type; _restore_chan_settings converts back.
+                "chan_settings":    {
+                    str(k): {kk: (sorted(vv) if isinstance(vv, set) else vv)
+                             for kk, vv in v.items()}
+                    for k, v in self._chan_settings.items()},
                 "crop_ranges":      self.crop_ranges,
                 "crop_start":       self.crop_start,
                 "crop_end":         self.crop_end,
@@ -1798,6 +2117,12 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                 "study_metadata":   sm,
                 "settings":         s,
                 "segments_metadata": meta_s,
+                # Per-channel marker edits. The flat map above is kept for
+                # readers that predate this and holds the current channel's.
+                "chan_segment_meta": {
+                    str(_c): {f"{st}:{i}": {k: _j(v) for k, v in m.items()}
+                              for (st, i), m in _mm.items()}
+                    for _c, _mm in self._chan_segment_meta.items()},
             }
 
             with open(save_path, "w", encoding="utf-8") as f:
@@ -1922,10 +2247,25 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             self.file_path.set(fp)
         self.marker_choice.set(sess.get("marker_choice",""))
         self.channel_idx=sess.get("channel_idx",0); self.channel_choice.set(sess.get("channel_choice",""))
+        _cs = sess.get("chan_settings") or {}
+        self._chan_settings = {}
+        for _k, _v in _cs.items():
+            try:
+                _snap = dict(_v)
+                if "csp_types" in _snap:
+                    _snap["csp_types"] = set(_snap["csp_types"] or [])
+                if "latency_map" in _snap and _snap["latency_map"]:
+                    _snap["latency_map"] = {kk: tuple(vv) for kk, vv
+                                            in _snap["latency_map"].items()}
+                self._chan_settings[int(_k)] = _snap
+            except Exception:
+                pass
         cr=sess.get("crop_ranges"); self.crop_ranges=[tuple(r) for r in cr] if cr else None
         self.crop_start=sess.get("crop_start"); self.crop_end=sess.get("crop_end")
         self.label_map=sess.get("label_map",{}); self.color_map=sess.get("color_map",{})
         self.plot_included=sess.get("plot_included",{}); self.gap_ms_map=sess.get("gap_ms_map",{})
+        self.delay_ms_map=sess.get("delay_ms_map",{})
+        self.delay_source_map=sess.get("delay_source_map",{})
         self.reference_map=sess.get("reference_map",{})
         self._reference_display=sess.get("reference_display",{})
         _lm = sess.get("latency_map", {})
@@ -2006,12 +2346,41 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                     self.latency_muscle_map = s.get("latency_muscle_map", {})
             except Exception:
                 pass  # old session format — skip unrecognised settings
-        restored={}
-        for ks,m in sess.get("segments_metadata",{}).items():
-            try:
-                st,i_s=ks.rsplit(":",1); restored[(st,int(i_s))]=m
-            except ValueError: continue
-        self.segments_metadata=restored
+        def _unpack_meta(d):
+            out = {}
+            for ks, m in (d or {}).items():
+                try:
+                    st, i_s = ks.rsplit(":", 1)
+                    out[(st, int(i_s))] = m
+                except ValueError:
+                    continue
+            return out
+
+        # Marker edits are per channel. Sessions written before that carry a
+        # single flat map; those belong to whichever channel was analysed at
+        # the time, so they are restored as the current channel's and left out
+        # of every other one -- applying them to a second channel is what
+        # produced negative peak-to-peak values.
+        _per_chan = sess.get("chan_segment_meta")
+        self._chan_segment_meta = {}
+        if _per_chan:
+            for _k, _v in _per_chan.items():
+                try:
+                    self._chan_segment_meta[int(_k)] = _unpack_meta(_v)
+                except Exception:
+                    continue
+            self.segments_metadata = dict(
+                self._chan_segment_meta.get(self.channel_idx, {}))
+        else:
+            # An old-format flat map is NOT attributed to a channel.
+            #
+            # It carries no record of which channel produced it, and guessing
+            # -- "whatever is selected now" -- is how one channel's marker
+            # indices end up applied to another's waveform. It stays available
+            # for single-channel review through the fallback in the Inspector
+            # seed, and a multi-channel run simply starts from automatic
+            # detection, which is correct rather than plausibly wrong.
+            self.segments_metadata = _unpack_meta(sess.get("segments_metadata"))
         try: self.toggle_bandpass_fields(); self.toggle_bp_order_fields(); self.toggle_notch_fields(); self._toggle_humbug_fields()
         except Exception: pass
 
@@ -2070,7 +2439,11 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         list_lbl = tk.StringVar()
         footer = tk.Frame(top)
         footer.pack(side="bottom", fill="x")
-        info = tk.Label(footer, textvariable=list_lbl, anchor="w")
+        # justify="left" so the second line (what the selection contains) is
+        # left-aligned rather than centred under the first; a default Label
+        # centres every line independently and the two would not line up.
+        info = tk.Label(footer, textvariable=list_lbl, anchor="w",
+                        justify="left")
         info.pack(fill="x", padx=10, pady=(4, 2))
         btn_frm = tk.Frame(footer)
         btn_frm.pack(pady=(0, 8))
@@ -2145,12 +2518,26 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         patches = []
 
         def _update_list_label():
+            # Two lines: the ranges in seconds, and what they CONTAIN.
+            #
+            # Times alone do not answer the question an analyst is actually
+            # asking. A recruitment curve, a block of 120% aMT trials and an
+            # iSP block can sit in one recording with no visible boundary, and
+            # the choice being made is a set of trials, not an interval. So the
+            # second line counts events per stimulus type and gives their
+            # position in the file's own numbering.
+            from .selection_summary import format_selection
+
             if spans:
                 txt = "Selected ranges (s):  " + ",  ".join(
                     f"[{s[0]:.2f} \u2013 {s[1]:.2f}]" for s in spans)
             else:
                 txt = "No ranges yet \u2013 drag on the plot."
-            list_lbl.set(txt)
+            try:
+                summary = format_selection(stim_dict, spans)
+            except Exception:
+                summary = ""      # never let the summary break the dialogue
+            list_lbl.set(txt + ("\n" + summary if summary else ""))
         _update_list_label()
 
         # ── SpanSelector ───────────────────────────────────────────────────────────
@@ -2230,6 +2617,23 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         │                             │ outlier settings                  │
         └─────────────────────────────────────────────────────────────────┘
         """
+        # ── 0. Per-channel 1a setup is FILE-level, not session-level ──────────
+        #
+        # The store is keyed by channel INDEX, and an index means nothing
+        # across files: channel 0 of a LabChart export is not channel 0 of a
+        # Spike2 recording, and may not even be the same muscle. Carrying the
+        # store over restored a Vastus lateralis TMS profile (13-30 ms) onto an
+        # M-wave recording that needed 1-12 ms, and every onset was then pinned
+        # at the 13 ms floor -- a plausible-looking latency that was simply the
+        # bottom of the wrong profile.
+        #
+        # The flat maps below keep their existing session-level persistence, so
+        # the first channel of a new file still inherits the previous setup as
+        # a starting point. What is discarded is the per-channel override.
+        self._chan_settings = {}
+        self._chan_confirmed = set()
+        self.analyse_channels = set()
+
         # ── 1. Clear file-level raw data caches ────────────────────────────────
         for attr in ('raw_emg', 'prev_fs', 'last_times', 'last_stim'):
             if hasattr(self, attr):
@@ -3325,7 +3729,10 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         """Browse for an external M-wave reference file."""
         path = filedialog.askopenfilename(
             title="Select M-wave reference file",
-            filetypes=[("Data files", "*.txt *.smr *.adibin *.edf *.bdf"),
+            # Built from io.SUPPORTED_EXTENSIONS so this dialogue cannot fall
+            # behind the readers, as the filter preview's own list did.
+            filetypes=[("Data files",
+                        " ".join("*" + e for e in SUPPORTED_EXTENSIONS)),
                        ("All files", "*.*")],
             parent=self.root)
         if path:
@@ -4158,6 +4565,10 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         """Load a FileEntry into the Stage 1 processing pipeline."""
         self._reset_state_for_new_file()
         self.segments_metadata = {}   # clear before restore
+        # The per-channel store must go with it, or edits made for a
+        # channel index in the previous file are applied to whatever
+        # channel happens to share that index in this one.
+        self._chan_segment_meta = {}
         self.file_path.set(fe.path)
         self._current_file_entry = fe
         self.log(f"📄 Loading: {fe.basename}")
@@ -4218,16 +4629,31 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             if pct == 100:
                 self._load_prog_label.config(text=f"✅ Loaded  {_size_str}")
             if not _result:
-                self.root.after(80, _poll)
+                self._schedule(80, _poll)
                 return
             _ready[0] = True
 
         threading.Thread(target=_worker, daemon=True).start()
-        self.root.after(80, _poll)
+        self._schedule(80, _poll)
+
+        # The loop can now end for reasons other than the worker finishing --
+        # the window closing, or the timeout below -- and in those cases
+        # _result is still empty. Reading _result[0] unguarded raised
+        # IndexError and took the double-click handler down with it.
+        _deadline = time.time() + 300.0
         while not _ready[0]:
+            if getattr(self, "_closing", False) or time.time() > _deadline:
+                break
             self.root.update()
 
         self._load_prog_frame.pack_forget()
+
+        if not _result:
+            if not getattr(self, "_closing", False):
+                self.log("⚠️  File load did not finish — the reader is still "
+                         "running or was interrupted. Try again, or open the "
+                         "file directly with File → Open.")
+            return
 
         if _result[0][0] == "err":
             messagebox.showerror("Load error", str(_result[0][1]), parent=self.root)
@@ -4421,6 +4847,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         target = first_new or ds.get_by_path(fpaths[0])
         if target:
             self.segments_metadata = {}   # fresh file — clear any stale edits
+            self._chan_segment_meta = {}  # and the per-channel copies
             self._load_file_entry(target)
 
     def _browse_file_path(self, fpath: str, auto_run: bool = False):
@@ -4455,6 +4882,26 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
 
         # ── Detect file format and scan accordingly ───────────────────────────
         _fmt = detect_format(fpath)
+
+        # Report the sampling rate and amplitude unit as soon as the file is
+        # opened.
+        #
+        # Both are read automatically by every format reader, but neither was
+        # shown until the analysis ran and printed "(fs=... Hz, ...)". Opening a
+        # file therefore gave no way to confirm what had been detected, which
+        # looks indistinguishable from nothing having been detected. They are
+        # also the two values most worth checking before committing to an
+        # analysis: a wrong rate silently rescales every latency, and a wrong
+        # unit every amplitude.
+        try:
+            _probe_fs, _probe_unit = probe_fs_and_unit(fpath)
+            if _probe_fs:
+                _u = f", amplitude in {_probe_unit}" if _probe_unit else ""
+                self.log(f"   Sampling rate {_probe_fs:g} Hz (from the file){_u}")
+        except Exception as _e:
+            self.log(f"   ⚠️  Could not read the sampling rate from this file "
+                     f"({type(_e).__name__}). It will be read again when the "
+                     f"analysis runs.")
 
         # ── Generic TSV: launch Format Wizard if no sidecar config yet ────────
         if _fmt == 'generic_tsv' and needs_wizard(fpath):
@@ -4650,14 +5097,48 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                         frm = tk.Frame(dlg, padx=16)
                         frm.pack(fill="x", pady=4)
 
-                        # EMG channel
-                        tk.Label(frm, text="EMG channel:", anchor="w", width=22) \
-                            .grid(row=0, column=0, sticky="w", pady=6)
+                        # EMG channels — a tick list, not a single choice.
+                        #
+                        # This is where the recording's channels are already
+                        # being declared, so it is the natural place to say
+                        # which of them matter. The alternative was a button
+                        # beside the channel dropdown that most people would
+                        # never find.
+                        #
+                        # There is deliberately no "primary" selector. Every
+                        # ticked channel is analysed identically with its own
+                        # setup, so a primary would imply a hierarchy that does
+                        # not exist. The first ticked is simply where
+                        # configuration starts, and the dropdown moves you
+                        # afterwards.
+                        tk.Label(frm, text="EMG channels:", anchor="nw",
+                                 width=22).grid(row=0, column=0, sticky="nw",
+                                                pady=6)
+                        _chan_holder = tk.Frame(frm)
+                        _chan_holder.grid(row=0, column=1, sticky="w")
+                        # Past about ten channels the dialogue outgrows the
+                        # screen, so the list scrolls rather than the window.
+                        if len(_analogue) > 10:
+                            _cv = tk.Canvas(_chan_holder, height=220,
+                                            highlightthickness=0, width=280)
+                            _sb = ttk.Scrollbar(_chan_holder, orient="vertical",
+                                                command=_cv.yview)
+                            _inner = tk.Frame(_cv)
+                            _inner.bind("<Configure>", lambda e: _cv.configure(
+                                scrollregion=_cv.bbox("all")))
+                            _cv.create_window((0, 0), window=_inner, anchor="nw")
+                            _cv.configure(yscrollcommand=_sb.set)
+                            _cv.pack(side="left", fill="both", expand=True)
+                            _sb.pack(side="right", fill="y")
+                        else:
+                            _inner = _chan_holder
+                        _chan_vars = {}
+                        for _ci, _cn in enumerate(_analogue):
+                            _v = tk.BooleanVar(value=(_ci == 0))
+                            tk.Checkbutton(_inner, text=_cn, variable=_v,
+                                           anchor="w").pack(fill="x")
+                            _chan_vars[_cn] = _v
                         emg_var = tk.StringVar(value=_analogue[0])
-                        ttk.Combobox(
-                            frm, textvariable=emg_var,
-                            values=_analogue, state="readonly", width=30,
-                        ).grid(row=0, column=1, sticky="w")
 
                         # Stim/trigger channel
                         tk.Label(
@@ -4678,18 +5159,32 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                         note = (
                             "Tip: Event channels (DigMark, Keyboard) use\n"
                             "     timestamps directly.  Analogue channels\n"
-                            "     use threshold-crossing detection."
+                            "     use threshold-crossing detection.\n"
+                            "     Each ticked channel is analysed in turn and\n"
+                            "     keeps its own setup on tab 1a. Configuration\n"
+                            "     starts with the first."
                         )
                         tk.Label(dlg, text=note, justify="left",
                                  fg="grey", padx=16).pack(anchor="w", pady=(0, 4))
 
                         def _ok():
+                            picked = [c for c in _analogue
+                                      if _chan_vars[c].get()]
+                            if not picked:
+                                messagebox.showwarning(
+                                    "No channel selected",
+                                    "Tick at least one EMG channel to analyse.",
+                                    parent=dlg)
+                                return
                             raw_stim = stim_var.get()
                             # Strip the [Type] prefix to get the bare channel name
                             if "] " in raw_stim:
                                 raw_stim = raw_stim.split("] ", 1)[1]
-                            _chosen["emg"]  = emg_var.get()
-                            _chosen["stim"] = raw_stim
+                            # First ticked is where configuration starts; the
+                            # rest are analysed after it, in list order.
+                            _chosen["emg"]      = picked[0]
+                            _chosen["channels"] = picked
+                            _chosen["stim"]     = raw_stim
                             dlg.destroy()
 
                         def _cancel():
@@ -4716,9 +5211,15 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                         self.log("⚠️  SMR channel assignment cancelled.")
                         return
 
-                    _smr_save_cfg(fpath, _chosen["emg"], _chosen["stim"])
+                    _picked = _chosen.get("channels") or [_chosen["emg"]]
+                    _smr_save_cfg(fpath, _chosen["emg"], _chosen["stim"],
+                                  analysis_channels=_picked)
+                    # Seed the analysis selection from the dialogue. The
+                    # Analyse button remains editable: this sets the initial
+                    # answer, it does not become the only way to change it.
+                    self._pending_analysis_channel_names = list(_picked)
                     self.log(
-                        f"   EMG: {_chosen['emg']} | "
+                        f"   EMG: {', '.join(_picked)} | "
                         f"Stim: {_chosen['stim']} — saved to sidecar"
                     )
                     # Set marker_choice to the full prefixed option so
@@ -4758,8 +5259,19 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                     )
                     self.marker_choice.set(_matched)
                     self.available_markers = stim_options
+                    # Channels to analyse, from the sidecar. A file assigned
+                    # before multi-channel support has no list and loads as the
+                    # single channel it names.
+                    from .formats.spike2_smr import analysis_channels_from_config
+                    _names, _gone = analysis_channels_from_config(cfg, _analogue)
+                    if _gone:
+                        self.log(
+                            f"   ⚠️  Saved channel(s) not in this file, so they "
+                            f"are not being analysed: {', '.join(_gone)}. Use "
+                            f"File → Reassign channels… to set them again.")
+                    self._pending_analysis_channel_names = list(_names)
                     self.log(
-                        f"   EMG: {cfg.get('emg_channel')} | "
+                        f"   EMG: {', '.join(_names) or cfg.get('emg_channel')} | "
                         f"Stim channel: {stim_ch} — loaded from sidecar"
                     )
 
@@ -4837,6 +5349,26 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             self.channel_idx = chan_list.index(_saved_ch)
             self.channel_choice.set(_saved_ch)
         self._restored_channel_choice = None  # clear after use
+
+        # Turn the channel NAMES from the assignment dialogue or its sidecar
+        # into the indices the analysis loop uses. Deferred to here because the
+        # dropdown's list is what defines an index, and it does not exist until
+        # now. Names rather than indices are stored precisely so that a
+        # re-exported file with a different channel order cannot silently shift
+        # the selection onto a neighbour.
+        _pending = getattr(self, "_pending_analysis_channel_names", None)
+        if _pending:
+            _idx = {i for i, n in enumerate(chan_list) if n in _pending}
+            if _idx:
+                self.analyse_channels = _idx
+                if len(_idx) > 1:
+                    self.log(f"   Channels to analyse: "
+                             f"{', '.join(chan_list[i] for i in sorted(_idx))}")
+            self._pending_analysis_channel_names = None
+        try:
+            self._refresh_analyse_button()
+        except Exception:
+            pass
         self._update_marker_dropdown()
 
         # ── Unified channel + event marker assignment dialog (Spike2 text exports only)
@@ -5497,13 +6029,185 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         self.channel_idx   = 0
         self.channel_choice.set(channel_names[0])
 
+    def _analysis_channel_indices(self):
+        """Channels the analysis will run over, in order.
+
+        Defaults to the channel currently selected, so a single-channel
+        workflow behaves exactly as before without anyone having to opt in.
+        """
+        if self.analyse_channels:
+            return sorted(self.analyse_channels)
+        return [self.channel_idx]
+
+    def _refresh_analyse_button(self):
+        names = list(self.channel_dd["values"]) if hasattr(self, "channel_dd") else []
+        n = len(self._analysis_channel_indices())
+        total = len(names)
+        self._analyse_btn_var.set(
+            f"Analyse: {n}" + (f" of {total}" if total else ""))
+
+    def _choose_analysis_channels(self):
+        """Tick which channels to analyse."""
+        names = list(self.channel_dd["values"]) if hasattr(self, "channel_dd") else []
+        if not names:
+            messagebox.showinfo("No channels",
+                                "Load a file first.", parent=self.root)
+            return
+
+        top = tk.Toplevel(self.root)
+        top.title("Channels to analyse")
+        top.transient(self.root)
+        tk.Label(top, text="The analysis runs once per ticked channel, in "
+                           "order.\nEach channel keeps its own setup on tab 1a.",
+                 justify="left", fg="grey").pack(anchor="w", padx=12, pady=(10, 6))
+
+        current = set(self._analysis_channel_indices())
+        vars_ = {}
+        body = tk.Frame(top)
+        body.pack(fill="both", expand=True, padx=12)
+        for i, nm in enumerate(names):
+            v = tk.BooleanVar(value=(i in current))
+            configured = "" if i in self._chan_settings else "   (not set up yet)"
+            tk.Checkbutton(body, text=f"{nm}{configured}", variable=v,
+                           anchor="w").pack(fill="x")
+            vars_[i] = v
+
+        def _ok():
+            picked = {i for i, v in vars_.items() if v.get()}
+            if not picked:
+                messagebox.showwarning(
+                    "Nothing selected",
+                    "Tick at least one channel.", parent=top)
+                return
+            self.analyse_channels = picked
+            self._refresh_analyse_button()
+            self.log("   Channels to analyse: "
+                     + ", ".join(names[i] for i in sorted(picked)))
+            top.destroy()
+
+        btns = tk.Frame(top)
+        btns.pack(pady=10)
+        tk.Button(btns, text="OK", width=10, command=_ok).pack(side="left", padx=6)
+        tk.Button(btns, text="Cancel", width=10,
+                  command=top.destroy).pack(side="left", padx=6)
+
+    def _unconfigured_analysis_channels(self):
+        """Selected channels with no stored 1a setup.
+
+        Running these would silently apply whichever channel happened to be on
+        screen, which for a different muscle means the wrong latency profile --
+        and nothing in the output would show it had happened.
+        """
+        names = list(self.channel_dd["values"]) if hasattr(self, "channel_dd") else []
+        out = []
+        for i in self._analysis_channel_indices():
+            if i not in self._chan_settings:
+                out.append(names[i] if i < len(names) else f"channel {i}")
+        return out
+
+    def _snapshot_chan_settings(self, channel_idx=None):
+        """Store the current 1a settings against a channel."""
+        ch = self.channel_idx if channel_idx is None else channel_idx
+        snap = {}
+        for key in self._chan_settings_keys:
+            val = getattr(self, key, None)
+            snap[key] = (set(val) if isinstance(val, set)
+                         else dict(val) if isinstance(val, dict) else val)
+        self._chan_settings[ch] = snap
+
+    def _reset_chan_settings_to_defaults(self):
+        """Empty every per-stimulus map, so tab 1a rebuilds from its defaults.
+
+        An empty map is how the tab signals "no choice made": labels fall back
+        to the stimulus code, colours to the palette, gap and delay to zero,
+        and the latency window to the profile for the default stimulus type and
+        muscle group in Preferences. Clearing is therefore the same as choosing
+        defaults, without this method needing to know what any of them are.
+        """
+        for key in self._chan_settings_keys:
+            current = getattr(self, key, None)
+            if isinstance(current, set):
+                setattr(self, key, set())
+            elif isinstance(current, dict):
+                setattr(self, key, {})
+
+    def _restore_chan_settings(self, channel_idx):
+        """Load a channel's 1a settings, or start it from defaults.
+
+        A channel never configured before starts CLEAN, not from whatever was
+        on screen. Carrying settings across was convenient in the abstract and
+        wrong in practice: it is a way to inherit another muscle's latency
+        profile without noticing, and the only symptom is onsets pinning at the
+        bottom of a window the analyst never chose for that channel.
+
+        Copying is now something the analyst asks for, with "Copy this setup to
+        all channels", rather than something that happens by moving between
+        them.
+
+        The channel selected when the file was opened is unaffected: its
+        settings are whatever the session carried in, which is the existing
+        cross-file behaviour and saves retyping the table for every file.
+        """
+        stored = self._chan_settings.get(channel_idx)
+        if stored is None:
+            self._reset_chan_settings_to_defaults()
+            self._snapshot_chan_settings(channel_idx)
+            return False
+        for key, val in stored.items():
+            setattr(self, key, (set(val) if isinstance(val, set)
+                                else dict(val) if isinstance(val, dict)
+                                else val))
+        return True
+
     def _on_channel_selected(self, _event=None):
-        """Called when the user changes the channel combobox."""
+        """Called when the user changes the channel combobox.
+
+        Saves the outgoing channel's 1a settings and loads the incoming one's,
+        so a table configured for one muscle is not silently applied to
+        another.
+        """
         name = self.channel_var.get()
         names = list(self.channel_dd["values"])
-        if name in names:
-            self.channel_idx   = names.index(name)
-            self.channel_choice.set(name)
+        if name not in names:
+            return
+        new_idx = names.index(name)
+        if new_idx == self.channel_idx:
+            return
+
+        # Read the table back before switching, or edits made since the last
+        # Confirm Setup would be lost.
+        try:
+            if getattr(self, "_labels_tab_built", False):
+                self._harvest_labels_tab()
+        except Exception:
+            pass
+        self._snapshot_chan_settings(self.channel_idx)
+
+        self.channel_idx = new_idx
+        self.channel_choice.set(name)
+        known = self._restore_chan_settings(new_idx)
+        self._refresh_analyse_button()
+
+        # Reflect the INCOMING channel's own confirmation state: one already
+        # set up and confirmed must not read as unconfirmed just because it was
+        # navigated away from and back.
+        _was = new_idx in self._chan_confirmed
+        self._labels_tab_confirmed = _was
+        try:
+            self._set_confirm_state(_was)
+        except Exception:
+            pass
+        # _build_labels_tab records the list it was given; there is no separate
+        # "discovered types" attribute on the app. Rebuilding from anything
+        # else would show a different set of rows than the tab was built with.
+        _types = getattr(self, "_current_stim_types", None)
+        if getattr(self, "_labels_tab_built", False) and _types:
+            self._build_labels_tab(_types)
+        self.log(f"   Channel → {name}: "
+                 + ("restored this channel's setup"
+                    if known else
+                    "no setup yet — starting from defaults. Use 'Copy this "
+                    "setup to all channels' if they should share one."))
 
     # ──────────────────────────────────────────────────────────────────────
     def _build_labels_tab(self, stim_types):
@@ -5525,6 +6229,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
 
         # ── store stim types for validation ──────────────────────────────────
         self._current_stim_types = list(sorted(stim_types))
+        self._lat_mismatch = []
 
         colour_choices = [
             "darkgreen","deeppink","brown","black","deepskyblue","maroon",
@@ -5553,16 +6258,35 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         tk.Label(inner,
             text="Configure labels, colours, and analysis options for each "
                  "stimulus type found in the loaded file.\n"
-                 "Click  ✔  Confirm Setup  when ready — Run Analysis will "
-                 "not proceed until this is confirmed.\n"
-                 "Gap (ms): time blanked immediately before each stimulus pulse. "
-                 "Use this to exclude signal that would contaminate the pre-stimulus baseline. "
-                 "Example: in paired-pulse protocols (e.g., SICI, ICF) a conditioning pulse precedes "
-                 "the test pulse by a fixed interstimulus interval — setting the gap to just "
-                 "longer than that interval prevents the conditioning artefact from being included "
-                 "in the background EMG measurement. Leave at 0 if unused.",
+                 "Click  \u2714  Confirm Setup  when ready \u2014 Run Analysis will "
+                 "not proceed until this is confirmed.\n\n"
+                 "Gap (ms): time blanked immediately before each stimulus pulse, "
+                 "so that signal which would contaminate the pre-stimulus baseline "
+                 "is excluded. The background window keeps its full length and is "
+                 "moved back: with a 10 ms gap and a 100 ms pre-stimulus window it "
+                 "runs from \u2212110 to \u221210 ms, giving 100 ms of data rather than 90. "
+                 "The larger of this and the RMS guard in Preferences is used. "
+                 "Example: in paired-pulse protocols (SICI, ICF) a conditioning pulse "
+                 "precedes the test pulse by a fixed interval \u2014 setting the gap just "
+                 "longer than that interval keeps the conditioning artefact out of the "
+                 "background EMG measurement. Leave at 0 if unused.\n\n"
+                 "Delay (ms): correction between the file's event marker and the "
+                 "instant the stimulus actually fired, when the two differ. Negative "
+                 "means the pulse came BEFORE the marker. Everything measured from "
+                 "t = 0 moves with it, including reported latencies. Press "
+                 "Detect delays to measure it from the stimulus artefact.",
             fg="grey", justify="left", wraplength=900
-        ).grid(row=0, column=0, columnspan=9, sticky="w", padx=10, pady=(10,6))
+        ).grid(row=0, column=0, columnspan=13, sticky="w", padx=10, pady=(10,6))
+
+        # Which channel this table belongs to. The selector lives in the file
+        # row at the top of the window, far from here, and these settings apply
+        # to that channel alone.
+        self._labels_chan_lbl = tk.StringVar(value="")
+        tk.Label(inner, textvariable=self._labels_chan_lbl,
+                 fg="#1F3864", font=("TkDefaultFont", 10, "bold"))\
+            .grid(row=1, column=0, columnspan=13, sticky="w",
+                  padx=10, pady=(0, 6))
+        self._refresh_labels_chan_banner()
 
         # ── Latency lookup table — read from user preferences ─────────────────
         # Users can edit these in Settings → Preferences → Latency Profiles.
@@ -5573,18 +6297,19 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
 
         # ── column headers ────────────────────────────────────────────────────
         headers = ["Stim", "Label", "Colour", "In combined",
-                   "Gap (ms)", "Detect CSP", "Normalise to (internal)",
-                   "Plateau (%)",
+                   "Gap (ms)", "Delay (ms)", "Detect CSP",
+                   "Normalise to (internal)", "Plateau (%)",
                    "Stim type", "Muscle group", "Min lat (ms)", "Max lat (ms)"]
         for c, h in enumerate(headers):
             tk.Label(inner, text=h)\
-                .grid(row=1, column=c, padx=6, pady=(0,4), sticky="w")
+                .grid(row=2, column=c, padx=6, pady=(0,4), sticky="w")
 
         # ── per-stim rows ─────────────────────────────────────────────────────
         self._lab_entry_label   = {}
         self._lab_entry_colour  = {}
         self._lab_entry_include = {}
         self._lab_entry_gap     = {}
+        self._lab_entry_delay   = {}
         self._lab_entry_csp     = {}
         self._lab_entry_ref     = {}
         self._lab_entry_plateau = {}
@@ -5593,7 +6318,9 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         self._lat_stype_vars    = {}
         self._lat_muscle_vars   = {}
 
-        for r, stim in enumerate(sorted(stim_types), start=2):
+        # start=3: row 0 is the guidance note, row 1 the channel banner,
+        # row 2 the column headers.
+        for r, stim in enumerate(sorted(stim_types), start=3):
             tk.Label(inner, text=f"{stim}:")\
                 .grid(row=r, column=0, sticky="e", padx=(8,2))
 
@@ -5623,10 +6350,19 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                 .grid(row=r, column=4, padx=4, sticky="w")
             self._lab_entry_gap[stim] = v_gap
 
+            # Event delay: correction between the file's marker and the actual
+            # stimulus. Negative means the pulse fired BEFORE the marker.
+            # Sits beside Gap because both concern timing around the pulse and
+            # neither is interpretable without the other in view.
+            v_delay = tk.DoubleVar(value=self.delay_ms_map.get(stim, 0.0))
+            tk.Entry(inner, textvariable=v_delay, width=6)\
+                .grid(row=r, column=5, padx=4, sticky="w")
+            self._lab_entry_delay[stim] = v_delay
+
             # Detect CSP
             v_csp = tk.BooleanVar(value=(stim in self.csp_types))
             tk.Checkbutton(inner, variable=v_csp)\
-                .grid(row=r, column=5, padx=10, sticky="w")
+                .grid(row=r, column=6, padx=10, sticky="w")
             self._lab_entry_csp[stim] = v_csp
 
             # Internal normalisation reference
@@ -5634,14 +6370,14 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             v_ref = tk.StringVar(value=_ref_display)
             ref_cb = ttk.Combobox(inner, textvariable=v_ref,
                                    width=26, state="readonly")
-            ref_cb.grid(row=r, column=6, padx=6, sticky="w")
+            ref_cb.grid(row=r, column=7, padx=6, sticky="w")
             self._lab_entry_ref[stim] = (v_ref, ref_cb)
 
             # Plateau tolerance (per-stim, default from global)
             v_plat = tk.DoubleVar(value=self.plateau_tolerance.get())
             tk.Spinbox(inner, from_=1, to=30, increment=1, width=5,
                        textvariable=v_plat)\
-                .grid(row=r, column=7, padx=4, sticky="w")
+                .grid(row=r, column=8, padx=4, sticky="w")
             self._lab_entry_plateau[stim] = v_plat
 
             # Stim type dropdown
@@ -5653,7 +6389,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             stype_cb = ttk.Combobox(inner, textvariable=v_stype,
                                     values=list(MUSCLE_OPTIONS.keys()),
                                     state="readonly", width=14)
-            stype_cb.grid(row=r, column=8, padx=4, sticky="w")
+            stype_cb.grid(row=r, column=9, padx=4, sticky="w")
 
             # Muscle group — restore saved value, ensuring it's valid for stim type
             _muscle_opts = MUSCLE_OPTIONS.get(_prev_stype, ["Hand / FDI"])
@@ -5663,7 +6399,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             muscle_cb = ttk.Combobox(inner, textvariable=v_muscle,
                                      values=_muscle_opts,
                                      state="readonly", width=22)
-            muscle_cb.grid(row=r, column=9, padx=4, sticky="w")
+            muscle_cb.grid(row=r, column=10, padx=4, sticky="w")
 
             self._lat_stype_vars[stim]  = v_stype
             self._lat_muscle_vars[stim] = v_muscle
@@ -5680,9 +6416,9 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             v_min = tk.DoubleVar(value=_def_min)
             v_max = tk.DoubleVar(value=_def_max)
             tk.Entry(inner, textvariable=v_min, width=5)\
-                .grid(row=r, column=10, padx=4, sticky="w")
-            tk.Entry(inner, textvariable=v_max, width=5)\
                 .grid(row=r, column=11, padx=4, sticky="w")
+            tk.Entry(inner, textvariable=v_max, width=5)\
+                .grid(row=r, column=12, padx=4, sticky="w")
 
             self._lat_min_vars[stim] = v_min
             self._lat_max_vars[stim] = v_max
@@ -5706,6 +6442,30 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                     _on_muscle()  # set defaults only if no saved value
             _make_lat_callbacks(v_stype, v_muscle, v_min, v_max, muscle_cb,
                                 has_saved=bool(_prev_lat))
+
+            # A saved latency window wins over the profile, because a typed
+            # value must not be overwritten. But it can then contradict the
+            # dropdowns above it -- "Peripheral nerve / Upper limb (M-wave)"
+            # sitting over a 13-30 ms TMS window -- and the only visible
+            # symptom is onsets pinning at the bottom of a profile the tab is
+            # no longer showing. Say so rather than leaving it to be inferred.
+            _profile = LATENCY_PROFILES.get((_prev_stype, _prev_muscle))
+            if _prev_lat and _profile and (
+                    abs(float(_prev_lat[0]) - float(_profile[0])) > 0.05 or
+                    abs(float(_prev_lat[1]) - float(_profile[1])) > 0.05):
+                self._lat_mismatch.append(
+                    f"{stim}: {_prev_lat[0]:g}\u2013{_prev_lat[1]:g} ms set, but "
+                    f"{_prev_stype} / {_prev_muscle} is "
+                    f"{_profile[0]:g}\u2013{_profile[1]:g} ms")
+
+        if self._lat_mismatch:
+            self.log("⚠️  Latency window does not match the muscle group "
+                     "selected, for:")
+            for _m in self._lat_mismatch:
+                self.log(f"      {_m}")
+            self.log("      The values shown are being used. Re-pick the "
+                     "muscle group to reset them to the profile, or edit the "
+                     "numbers if they are deliberate.")
 
         # ── populate reference dropdowns ──────────────────────────────────────
         def _build_ref_options():
@@ -5737,6 +6497,27 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             command=self._confirm_labels_tab)
         confirm_btn.pack(side="left", padx=12, pady=6, ipadx=10)
         self._confirm_btn_widget = confirm_btn
+
+        # Measuring the delay is optional and costs a pass over the recording,
+        # so it is a button rather than something that happens on load. Most
+        # files need no correction and should not pay for the scan.
+        tk.Button(footer, text="🔎 Detect delays",
+                  command=self._detect_event_delays)\
+            .pack(side="left", padx=(12, 4), pady=6)
+        # Settings below are per channel, and the channel selector is at the
+        # top of the window rather than on this tab, so which channel is being
+        # configured has to be stated here or an analyst can edit the wrong
+        # table without noticing.
+        tk.Button(footer, text="Copy this setup to all channels",
+                  command=self._copy_setup_to_all_channels)\
+            .pack(side="left", padx=(12, 4), pady=6)
+        # A scan that correctly finds nothing changes nothing on this tab, and
+        # is then indistinguishable from a button that does not work. The log
+        # carries the detail but lives on tab 1c, so the outcome has to be
+        # visible here too.
+        self._delay_scan_status = tk.StringVar(value="")
+        tk.Label(footer, textvariable=self._delay_scan_status,
+                 fg="#1F3864").pack(side="left", padx=(2, 8))
         tk.Label(footer,
             text="Confirm when you have finished configuring each stimulus type.",
             fg="grey").pack(side="left", padx=6)
@@ -5877,8 +6658,118 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                  + (f" | t=[{crop_start:.1f},{crop_end:.1f}]s"
                     if crop_start is not None else " | full file"))
 
-    def _confirm_labels_tab(self):
-        """Read Tab 1b widgets into self.* dicts and mark setup as confirmed."""
+    def _detect_event_delays(self):
+        """Measure the marker-to-stimulus offset for every stimulus type.
+
+        Fills the Delay column with what it finds, but only where a single
+        delay is a good model of the data: the spread of the artefact time
+        across trials decides that, and where it is wide the scan reports the
+        spread and proposes nothing. See mep_cmap/event_delay.py.
+
+        Nothing is applied silently -- proposed values land in the column and
+        the analyst confirms them with the rest of the tab.
+        """
+        from .event_delay import scan_event_delays, format_scan_report
+
+        fpath = self.file_path.get()
+        if not fpath or not os.path.isfile(fpath):
+            self.log("⚠️  Load a file before detecting event delays.")
+            self._delay_scan_status.set("Load a file first")
+            return
+        try:
+            emg, fs, _unit = extract_emg_waveform_and_fs(
+                fpath, channel_idx=getattr(self, "channel_idx", 0))
+            stim_times = extract_stim_times(fpath, "")
+        except Exception as exc:
+            self.log(f"❌ Could not read the recording for the delay scan "
+                     f"({type(exc).__name__}: {exc})")
+            self._delay_scan_status.set("Could not read the recording")
+            return
+
+        if not stim_times:
+            self.log("⚠️  No stimulus events found, so there is nothing to "
+                     "measure the delay against.")
+            self._delay_scan_status.set("No stimulus events to measure against")
+            return
+
+        results = scan_event_delays(emg, float(fs), stim_times)
+        for line in format_scan_report(results):
+            self.log(line)
+
+        applied = 0
+        for stim, r in results.items():
+            var = self._lab_entry_delay.get(stim)
+            if var is None or not r.proposed:
+                continue
+            var.set(round(r.delay_ms, 2))
+            self.delay_source_map[stim] = "detected"
+            applied += 1
+
+        n_types = len(results)
+        if applied:
+            msg = (f"{applied} delay(s) filled in — review, then Confirm Setup")
+            self.log(f"   {applied} delay(s) filled in \u2014 review them, then "
+                     f"Confirm Setup. Latencies will shift by the amounts "
+                     f"shown.")
+        else:
+            aligned = sum(1 for r in results.values()
+                          if not r.proposed and "no delay needed" in r.reason)
+            if aligned == n_types:
+                msg = (f"Scanned {n_types} type(s): markers already line up "
+                       f"with the stimulus — no delay needed")
+            else:
+                msg = (f"Scanned {n_types} type(s): no delay proposed — "
+                       f"see the log on tab 1c for why")
+            self.log("   No delays proposed; the markers line up with the "
+                     "stimulus artefact, or the timing is too variable for a "
+                     "single correction.")
+        # Shown beside the button, so the outcome is legible without changing
+        # tabs. The log keeps the per-type detail.
+        self._delay_scan_status.set(msg)
+
+    def _refresh_labels_chan_banner(self):
+        """Name the channel whose setup is on screen."""
+        if not hasattr(self, "_labels_chan_lbl"):
+            return
+        name = self.channel_var.get() if hasattr(self, "channel_var") else ""
+        n_known = len(self._chan_settings)
+        extra = (f"   \u00b7  {n_known} channel(s) configured"
+                 if n_known > 1 else "")
+        self._labels_chan_lbl.set(
+            f"Setup below applies to:  {name or 'the selected channel'}{extra}")
+
+    def _copy_setup_to_all_channels(self):
+        """Apply the current table to every channel in the file.
+
+        Most of 1a is usually identical across channels -- labels, colours,
+        gaps, inclusion -- and only the muscle-dependent rows differ. Copying
+        then adjusting is quicker than configuring each from scratch, and
+        safer than leaving channels half-configured.
+        """
+        try:
+            self._harvest_labels_tab()
+        except Exception as exc:
+            self.log(f"⚠️  Could not read the setup ({type(exc).__name__}: "
+                     f"{exc})")
+            return
+        names = list(self.channel_dd["values"]) if hasattr(self, "channel_dd") else []
+        if not names:
+            self.log("⚠️  No channel list available to copy to.")
+            return
+        for idx in range(len(names)):
+            self._snapshot_chan_settings(idx)
+        self._refresh_labels_chan_banner()
+        self._refresh_analyse_button()
+        self.log(f"   Setup copied to all {len(names)} channel(s). Each can "
+                 f"still be adjusted individually.")
+
+    def _harvest_labels_tab(self):
+        """Read the 1a widgets into self.* without confirming anything.
+
+        Split out of _confirm_labels_tab because switching channel has to
+        capture edits made since the last confirmation -- otherwise they are
+        lost -- but must not mark the new channel's setup as confirmed.
+        """
         self.label_map     = {k: (v.get().strip() or k)
                               for k, v in self._lab_entry_label.items()}
         self.color_map     = {k: v.get()
@@ -5887,6 +6778,18 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                               for k, v in self._lab_entry_include.items()}
         self.gap_ms_map    = {k: float(v.get() or 0.)
                               for k, v in self._lab_entry_gap.items()}
+        _prev_delay = dict(self.delay_ms_map)
+        self.delay_ms_map  = {k: float(v.get() or 0.)
+                              for k, v in self._lab_entry_delay.items()}
+        # A value the analyst typed or edited is 'manual'; one left exactly as
+        # the scan proposed keeps whatever source the scan recorded. The
+        # distinction goes in the sidecar, because a measured correction and a
+        # typed one carry different weight when someone reads the derivative.
+        for _k, _v in self.delay_ms_map.items():
+            if _prev_delay.get(_k) != _v:
+                self.delay_source_map[_k] = "manual"
+            elif _v == 0.0:
+                self.delay_source_map.pop(_k, None)
         self.csp_types     = {k for k, v in self._lab_entry_csp.items()
                               if v.get()}
         self.reference_map = {}
@@ -5911,10 +6814,66 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             k: v.get() for k, v in self._lat_muscle_vars.items()
         }
 
+    def _set_confirm_state(self, confirmed):
+        """Reflect confirmation in the button, without touching the settings."""
+        self._labels_tab_confirmed = bool(confirmed)
+        # Keep the per-channel record in step, or a channel edited after
+        # confirmation would still count as confirmed at the run gate.
+        try:
+            if confirmed:
+                self._chan_confirmed.add(self.channel_idx)
+            else:
+                self._chan_confirmed.discard(self.channel_idx)
+        except Exception:
+            pass
+        try:
+            if confirmed:
+                self._confirm_btn_var.set("\u2714  Setup confirmed")
+                self._confirm_btn_widget.config(**accent_button_kw("green"))
+            else:
+                self._confirm_btn_var.set(
+                    "\u26a0  Setup not confirmed — click to confirm")
+                self._confirm_btn_widget.config(**accent_button_kw("red"))
+        except Exception:
+            pass
+
+    def _confirm_labels_tab(self):
+        """Read the 1a widgets and mark the setup confirmed."""
+        self._harvest_labels_tab()
+        # Keep this channel's settings, so switching away and back returns to
+        # what was confirmed rather than to the previous channel's table.
+        self._snapshot_chan_settings(self.channel_idx)
+
         self._labels_tab_confirmed = True
+        self._chan_confirmed.add(self.channel_idx)
         self._confirm_btn_var.set("✔  Setup confirmed")
         self._confirm_btn_widget.config(**accent_button_kw("green"))
-        self.log("✔ Label & analysis setup confirmed — ready to run.\n")
+
+        # Walk to the next selected channel that still needs configuring,
+        # rather than leaving 1a while others are unset.
+        #
+        # Each channel has its own table, so confirming one says nothing about
+        # the rest -- and the previous behaviour, jumping straight to filtering,
+        # made it easy to select four channels and configure one. The button
+        # goes red again on arrival, so the state of the tab always reflects the
+        # channel being shown.
+        _names = (list(self.channel_dd["values"])
+                  if hasattr(self, "channel_dd") else [])
+        _pending = [c for c in self._analysis_channel_indices()
+                    if c not in self._chan_confirmed]
+        if _pending:
+            _nxt = _pending[0]
+            self.log(f"✔ {_names[self.channel_idx] if self.channel_idx < len(_names) else 'Channel'}"
+                     f" confirmed — {len(_pending)} channel(s) still to set up.")
+            self.channel_var.set(_names[_nxt] if _nxt < len(_names) else str(_nxt))
+            self._on_channel_selected()
+            self.notebook.select(self.stage1_outer)
+            # tab1b_frame is, confusingly, the 1a tab.
+            self.nb_stage1.select(self.tab1b_frame)
+            return
+
+        self.log("✔ Label & analysis setup confirmed for every selected "
+                 "channel — ready to run.\n")
         # Switch back to Stage 1a so user can hit Run Analysis
         self.notebook.select(self.stage1_outer)
         self.nb_stage1.select(self.tab_filter)

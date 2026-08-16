@@ -17,7 +17,9 @@ from tkinter import ttk, scrolledtext
 
 from .compat import _np_trapz, _np_ptp
 from .detection import (dispatch_onset,
-                        detect_csp_bootstrap)
+                        detect_csp_bootstrap,
+                        detect_mep_offset,
+                        offset_marker_field)
 from .detection.defaults import DETECTION_DEFAULTS
 
 class DraggablePoint:
@@ -183,12 +185,14 @@ class DataInspectorWindow:
         "onset_idx":        "#009E73",
         "silent_start_idx": "#F0E442",
         "silent_end_idx":   "#CC79A7",
+        "mep_offset_idx":   "#0072B2",
     }
 
     # ──────────────────────────────────────────────────────────────────────
     def __init__(self, master, segments_dict, time_axis, metadata_dict,
                  label_map=None, color_map=None, emg_unit=None,
                  ptp_start_ms=10, ptp_end_ms=50,
+                 ptp_windows_by_type=None,
                  visible_pre_ms=None,
                  onset_method="peak_fraction",
                  onset_bootstrap_crit=1.96, onset_bootstrap_n=500,
@@ -213,6 +217,10 @@ class DataInspectorWindow:
         self.top.grab_set()
 
         self.segments  = segments_dict
+        # stim_type -> median waveform over retained trials; see
+        # _condition_template. Invalidated when an exclusion changes.
+        self._template_cache = {}
+        self._is_closing = False
         self.t         = time_axis
         self.meta      = metadata_dict
         self.snap_radius = 8
@@ -221,6 +229,10 @@ class DataInspectorWindow:
         self.emg_unit  = emg_unit
         self.ptp_start_ms         = ptp_start_ms
         self.ptp_end_ms           = ptp_end_ms
+        # {stim_type: (start_ms, end_ms)} from the analysis. With amplitude
+        # window anchoring the window is per stimulus type, and the file-wide
+        # pair above is only a fallback.
+        self.ptp_windows_by_type  = dict(ptp_windows_by_type or {})
         # visible_pre_ms: how much pre-stim to SHOW (xlim)
         # _analysis_pre_ms: full pre-stim used for detection (may be larger)
         self.visible_pre_ms       = visible_pre_ms
@@ -330,6 +342,10 @@ class DataInspectorWindow:
         self.enable_silent = tk.BooleanVar(value=True)
         self.enable_auc    = tk.BooleanVar(value=enable_auc)
         self.exclude_var = tk.BooleanVar(value=False)
+        # Draw this event type's median waveform behind the trial, so an odd
+        # trial can be judged against its own condition rather than from memory.
+        self.show_median_var = tk.BooleanVar(value=False)
+        self._median_line = None
         self.note_enable_var = tk.BooleanVar(value=True)
 
         tk.Checkbutton(self.btn_bar, text="Silent period",
@@ -345,12 +361,16 @@ class DataInspectorWindow:
                     variable=self.enable_auc,
                     command=_on_auc_toggle).pack(side="left")
         self.link_onset_auc = tk.BooleanVar(value=True)
-        tk.Checkbutton(self.btn_bar, text="🔗 Link onset → AUC",
-                    variable=self.link_onset_auc).pack(side="left", padx=(8, 0))
+        tk.Checkbutton(self.btn_bar, text="Link AUC to onset & offset",
+                    variable=self.link_onset_auc,
+                    command=lambda: self._plot()).pack(side="left", padx=(8, 0))
 
         tk.Checkbutton(self.btn_bar, text="Exclude this segment",
                     variable=self.exclude_var,
                     command=lambda: self._set_exclude()).pack(side="left", padx=12) 
+        tk.Checkbutton(self.btn_bar, text="Show event-type median",
+                    variable=self.show_median_var,
+                    command=lambda: self._plot()).pack(side="left", padx=12)
 
         tk.Checkbutton(self.btn_bar, text="Make a note",
                     variable=self.note_enable_var,
@@ -441,6 +461,9 @@ class DataInspectorWindow:
             m.pop('csp_detection_failed', None)
             m.pop('silent_start_idx',    None)
             m.pop('silent_end_idx',      None)
+            # Turning cSP off or on changes WHICH marker carries the offset, so
+            # a value stored under the other rule no longer applies.
+            m.pop('mep_offset_idx',      None)
         self._plot()
 
     def _first(self):
@@ -450,11 +473,15 @@ class DataInspectorWindow:
         self._plot()
 
     def _next(self):
+        if self._closed():
+            return
         self._save_note_from_widget()                    
         self.cur_idx = (self.cur_idx + 1) % len(self.segments[self.cur_type])
         self._plot()
 
     def _prev(self):
+        if self._closed():
+            return
         self._save_note_from_widget()                       
         self.cur_idx = (self.cur_idx - 1) % len(self.segments[self.cur_type])
         self._plot()
@@ -464,14 +491,31 @@ class DataInspectorWindow:
         key = (self.cur_type, self.cur_idx)
         m   = self.meta.setdefault(key, {})
         m[field] = new_idx
+        if field == "onset_idx":
+            # A placed marker is a measurement, whatever the detector managed.
+            m.pop("onset_auto_failed", None)
+        _linked = (getattr(self, "link_onset_auc", None)
+                   and self.link_onset_auc.get()
+                   and self.enable_auc.get())
+
         # When onset moves and link is active, sync AUC start line to match
-        if field == "onset_idx" \
-                and getattr(self, "link_onset_auc", None) \
-                and self.link_onset_auc.get() \
-                and self.enable_auc.get():
+        if field == "onset_idx" and _linked:
             m["auc_start_idx"] = new_idx
             if self._auc_lines:
                 self._auc_lines[0].set_idx(new_idx)
+                self._redraw_auc_fill(m)
+
+        # The same for the other end. Area under the curve is integrated from
+        # onset to the end of the response, so whichever marker carries the
+        # offset must move the AUC end with it -- otherwise the window shown in
+        # this review and the window the pipeline integrated differ, and the
+        # AUC in the results file is not the one on screen.
+        elif _linked and field == offset_marker_field(
+                self.enable_silent.get(),
+                'silent_start_idx' in m and 'silent_end_idx' in m):
+            m["auc_end_idx"] = new_idx
+            if len(self._auc_lines) >= 2:
+                self._auc_lines[1].set_idx(new_idx)
                 self._redraw_auc_fill(m)
         self._refresh_status()
     
@@ -504,7 +548,99 @@ class DataInspectorWindow:
         key = (self.cur_type, self.cur_idx)
         self.meta.setdefault(key, {})
         self.meta[key]['exclude'] = self.exclude_var.get()
+        # The condition template is built from the retained trials, so an
+        # exclusion change invalidates it.
+        self._template_cache.pop(self.cur_type, None)
         self._refresh_status()
+
+    def _ptp_window_ms(self, stim_type=None):
+        """Amplitude window for a stimulus type, in ms relative to the stimulus.
+
+        Returns the window the analysis measured with when one was supplied,
+        otherwise the file-wide pair from tab 1c. Anchoring makes the window
+        per type, so using the file-wide values during review would measure a
+        different interval from the one that produced the results.
+        """
+        stim_type = self.cur_type if stim_type is None else stim_type
+        win = self.ptp_windows_by_type.get(stim_type)
+        if win:
+            try:
+                a, b = float(win[0]), float(win[1])
+                if b > a:
+                    return a, b
+            except Exception:
+                pass
+        return self.ptp_start_ms, self.ptp_end_ms
+
+    def _condition_template(self, stim_type=None):
+        """Median waveform across the retained trials of one stimulus type.
+
+        The derivative-ratio detector uses this to reject a trial whose peak
+        sits implausibly far from where the condition's peak normally falls.
+        It is the only detector that consults it, and it is the only gate the
+        template feeds -- it plays no part in locating the onset.
+
+        Excluded trials are left out, matching pipeline_detect_onsets. If the
+        two used different trial sets the analysis and this window would judge
+        the same trial against different landmarks, so a trial rejected during
+        analysis could be accepted on review, or the reverse -- the divergence
+        between the two detection paths that sharing one dispatch was meant to
+        end.
+
+        Returns None when fewer than two trials remain, since a median over one
+        trial is that trial.
+        """
+        stim_type = self.cur_type if stim_type is None else stim_type
+        if stim_type in self._template_cache:
+            return self._template_cache[stim_type]
+
+        segs = self.segments.get(stim_type)
+        template = None
+        try:
+            if segs is not None and len(segs) >= 2:
+                keep = [np.asarray(segs[i], dtype=float)
+                        for i in range(len(segs))
+                        if not self.meta.get((stim_type, i), {}).get("exclude", False)]
+                if len(keep) >= 2:
+                    template = np.median(np.vstack(keep), axis=0)
+        except Exception:
+            template = None
+        self._template_cache[stim_type] = template
+        return template
+
+    def _seed_offset_idx(self, emg, m, stim_idx, dt_ms):
+        """Initial MEP-offset index from the envelope detector, or None.
+
+        Only ever used to place the marker the first time a trial is viewed.
+        Once the analyst has moved it, the stored value is authoritative and
+        this is not consulted again -- re-seeding would silently undo a manual
+        decision on the next redraw.
+        """
+        try:
+            onset_ms = (m['onset_idx'] - stim_idx) * dt_ms
+            pre_ms = -float(self.t[0])
+            off_ms = detect_mep_offset(
+                np.asarray(emg, dtype=float), 1000.0 / dt_ms,
+                onset_ms=onset_ms, pre_ms=pre_ms,
+                search_end_ms=float(self.t[-1]),
+                max_duration_ms=float(self.detection_params.get(
+                    "mep_offset_max_duration_ms", 100.0)),
+                min_duration_ms=float(self.detection_params.get(
+                    "mep_offset_min_duration_ms", 5.0)),
+                min_return_ms=float(self.detection_params.get(
+                    "mep_offset_min_return_ms", 10.0)),
+                env_window_ms=float(self.detection_params.get(
+                    "mep_offset_env_window_ms", 5.0)),
+                criterion=float(self.detection_params.get(
+                    "mep_offset_criterion", 2.5)),
+                peak_frac=float(self.detection_params.get(
+                    "mep_offset_peak_frac", 0.12)))
+            if off_ms is None:
+                return None
+            idx = int(round(stim_idx + off_ms / dt_ms))
+            return idx if 0 <= idx < len(emg) else None
+        except Exception:
+            return None
 
     def _toggle_note_box(self):                                            
         # show/hide the note box widget
@@ -522,6 +658,8 @@ class DataInspectorWindow:
                 self._resize_window()
 
     def _save_note_from_widget(self):
+        if self._closed():
+            return
         """Save the note box content to metadata for the current segment."""
         key = (self.cur_type, self.cur_idx)
         # Only save if the note box is currently shown — if hidden, the widget
@@ -563,6 +701,8 @@ class DataInspectorWindow:
 
     # ---------------------------------------------------------------- plot
     def _plot(self):
+        if self._closed():
+            return
         """Redraw the inspector for the currently‑selected segment."""
         # Ensure the Toplevel and canvas have settled to their correct geometry
         # before drawing.  The very first call (from __init__) runs before the
@@ -633,9 +773,16 @@ class DataInspectorWindow:
         p_max  = int(np.argmax(emg))
         p_min  = int(np.argmin(emg))
 
-        # … but if the user defined a PTP window, constrain the search
-        if self.ptp_start_ms is not None and self.ptp_end_ms is not None:
-            mask = (self.t >= self.ptp_start_ms) & (self.t <= self.ptp_end_ms)
+        # … but if the user defined a PTP window, constrain the search.
+        #
+        # Prefer the window the ANALYSIS used for this stimulus type. With
+        # amplitude window anchoring the window is placed per type from that
+        # type's median onset, so the file-wide pair is wrong for every type
+        # that was anchored: the review would search a different interval and
+        # place the peak markers somewhere the analysis never looked.
+        _w0, _w1 = self._ptp_window_ms()
+        if _w0 is not None and _w1 is not None:
+            mask = (self.t >= _w0) & (self.t <= _w1)
             if np.any(mask):
                 idxs = np.where(mask)[0]
                 # local max/min *within* that window
@@ -664,6 +811,7 @@ class DataInspectorWindow:
             search_end_ms=self.ptp_end_ms or 50,
             min_latency_ms=_min_lat,
             max_latency_ms=_max_lat,
+            template=self._condition_template(),
         )
         stim_idx = np.argmin(np.abs(self.t))
         onset    = stim_idx if onset_ms is None else stim_idx + int(round(onset_ms / dt_ms))
@@ -681,7 +829,8 @@ class DataInspectorWindow:
         # at a boundary the analyst never chose and reports it as a measurement.
         _seg_len = len(emg)
         _stale = [f for f in ('ptp_min_idx', 'ptp_max_idx', 'onset_idx',
-                              'silent_start_idx', 'silent_end_idx')
+                              'silent_start_idx', 'silent_end_idx',
+                              'mep_offset_idx')
                   if m.get(f) is not None
                   and not (0 <= int(m[f]) < _seg_len)]
         if _stale:
@@ -697,6 +846,20 @@ class DataInspectorWindow:
         # ---------- seed metadata defaults ----------------------------------
         m.setdefault('ptp_min_idx', p_min)
         m.setdefault('ptp_max_idx', p_max)
+        # Mark a NON-DETECTION as such rather than letting the stimulus index
+        # pass for a measurement.
+        #
+        # When dispatch_onset returns None the marker falls back to the
+        # stimulus, which reads as "Latency: 0.0 ms" -- and, worse, that index
+        # was then written into the metadata and returned by "Save edits &
+        # close". The analysis honours a stored onset_idx as a manual override,
+        # so reviewing a trial whose onset could not be found silently turned a
+        # blank latency into a measured 0.0 ms. The flag is cleared the moment
+        # the analyst drags the marker, which is a real decision.
+        if onset_ms is None and 'onset_idx' not in m:
+            m['onset_auto_failed'] = True
+        elif onset_ms is not None:
+            m.pop('onset_auto_failed', None)
         m.setdefault('onset_idx',   onset)
 
         # ---------- decide whether to run CSP detection ---------------------
@@ -781,6 +944,18 @@ class DataInspectorWindow:
             # Use stored cSP if already detected (visible or hidden)
             _csp_end_for_auc = m.get('silent_start_idx', None)
 
+            # The background cSP search below runs ONLY for stimulus types the
+            # analyst has assigned to cSP measurement. It used to run for every
+            # type, which meant a resting M-wave had its integration window
+            # ended by a cortical-silent-period detector -- a quantity that does
+            # not exist without voluntary contraction, and one the pipeline
+            # never computes for a non-cSP type. The two therefore reported
+            # different AUCs for the same trial. Everything else now ends the
+            # window at the detected MEP offset, matching the analysis.
+            if not self.enable_silent.get():
+                _csp_end_for_auc = None
+                m['_auc_csp_tried'] = True
+
             # If no visible cSP, try a silent background detection
             if _csp_end_for_auc is None and not m.get('_auc_csp_tried', False):
                 m['_auc_csp_tried'] = True   # only attempt once per segment
@@ -828,6 +1003,19 @@ class DataInspectorWindow:
                 if len(_utr) == len(self.t):
                     self.ax_raw.plot(self.t, _utr, color=colour,
                                      lw=0.4, alpha=0.20, zorder=1)
+        # Event-type median, drawn BEHIND the trial so the trial stays the
+        # figure's subject. This is the same waveform the derivative-ratio
+        # detector compares each trial against, so what is shown is what the
+        # algorithm saw rather than an approximation of it. Excluded trials are
+        # left out, so removing a bad trial visibly updates the reference.
+        self._median_line = None
+        if self.show_median_var.get():
+            _med = self._condition_template()
+            if _med is not None and len(_med) == len(self.t):
+                self._median_line = self.ax_raw.plot(
+                    self.t, _med, color="0.35", lw=2.2, alpha=0.35, zorder=1,
+                    label="event-type median")[0]
+
         self.ax_raw.plot(self.t, emg, color=colour, lw=1)
         self.ax_raw.axvline(0, color="k", ls="--")
         # Limit x-axis to the visible window even if segment has more pre-stim
@@ -870,12 +1058,30 @@ class DataInspectorWindow:
         _add(m['ptp_max_idx'], self.DOT_COLOURS["ptp_max_idx"], "ptp_max_idx", label="PTP max")
         _add(m['onset_idx'],   self.DOT_COLOURS["onset_idx"],   "onset_idx",   label="Onset")
 
-        if self.enable_silent.get() and \
-                'silent_start_idx' in m and 'silent_end_idx' in m:
+        _has_csp = ('silent_start_idx' in m and 'silent_end_idx' in m)
+        if self.enable_silent.get() and _has_csp:
+            # This marker doubles as the MEP offset: during contraction the end
+            # of the response and the start of the silent period are the same
+            # event, so there is one marker for them and dragging it moves
+            # both. offset_marker_field states that rule once, and
+            # resolve_mep_offset applies the same precedence when quantifying.
             _add(m['silent_start_idx'], self.DOT_COLOURS["silent_start_idx"],
-                 "silent_start_idx", label="cSP start")
+                 "silent_start_idx", label="cSP start / MEP offset")
             _add(m['silent_end_idx'],   self.DOT_COLOURS["silent_end_idx"],
                  "silent_end_idx",   label="cSP end")
+        elif offset_marker_field(self.enable_silent.get(), _has_csp) \
+                == "mep_offset_idx":
+            # No silent period to end the response, so the offset gets a marker
+            # of its own. Seeded from the envelope detector on first view; the
+            # pipeline already gives a stored mep_offset_idx top precedence, so
+            # a dragged value survives into the results without further work.
+            if 'mep_offset_idx' not in m:
+                _seed = self._seed_offset_idx(emg, m, stim_idx, dt_ms)
+                if _seed is not None:
+                    m['mep_offset_idx'] = _seed
+            if 'mep_offset_idx' in m:
+                _add(m['mep_offset_idx'], self.DOT_COLOURS["mep_offset_idx"],
+                     "mep_offset_idx", label="MEP offset")
 
         self.ax_raw.legend(loc="upper right", fontsize=12, frameon=False)
         self.fig._draggables = self._dpts
@@ -896,11 +1102,40 @@ class DataInspectorWindow:
             # Ensure AUC window exists — default onset → cSP or onset+50ms
             if "auc_start_idx" not in m and "onset_idx" in m:
                 a0 = int(m["onset_idx"])
-                a1 = int(m.get("silent_start_idx",
-                               min(len(self.t) - 1,
-                                   a0 + int(50 * fs / 1000))))
+                # End the integration where the response ends. The marker that
+                # carries the offset is the cSP start during contraction and a
+                # dedicated one otherwise, matching what the pipeline
+                # integrates. The old onset + 50 ms rule was a fixed width
+                # unrelated to the response, and it disagreed with the results
+                # file for exactly that reason; it survives only as a last
+                # resort when no offset could be established.
+                _f = offset_marker_field(
+                    self.enable_silent.get(),
+                    'silent_start_idx' in m and 'silent_end_idx' in m)
+                a1 = m.get(_f)
+                if a1 is None or int(a1) <= a0:
+                    a1 = min(len(self.t) - 1, a0 + int(50 * fs / 1000))
                 m["auc_start_idx"] = a0
-                m["auc_end_idx"]   = a1
+                m["auc_end_idx"]   = int(a1)
+
+            # Enforce the link on LOAD, not only while dragging.
+            #
+            # The analysis stores auc_start_idx and auc_end_idx in the segment
+            # metadata, so a reviewed file arrives with a window already set and
+            # the seeding above -- guarded on the key being absent -- never runs.
+            # The result was an AUC end inherited from the analysis sitting tens
+            # of milliseconds away from the offset marker while the box said the
+            # two were linked. "Linked" has to mean they agree whenever they are
+            # shown, not merely that they move together once touched.
+            if (getattr(self, "link_onset_auc", None)
+                    and self.link_onset_auc.get()):
+                _f = offset_marker_field(
+                    self.enable_silent.get(),
+                    'silent_start_idx' in m and 'silent_end_idx' in m)
+                if "onset_idx" in m:
+                    m["auc_start_idx"] = int(m["onset_idx"])
+                if _f in m and int(m[_f]) > int(m.get("auc_start_idx", 0)):
+                    m["auc_end_idx"] = int(m[_f])
 
             if "auc_start_idx" in m and "auc_end_idx" in m:
                 # Draw initial fill
@@ -934,6 +1169,22 @@ class DataInspectorWindow:
                     m["auc_end_idx"] = new_idx
                     if len(self._auc_lines) >= 2:
                         self._auc_lines[1].set_idx(new_idx)
+                    # Symmetric with the onset end: while linked, the AUC end
+                    # and the offset are one quantity, so dragging either moves
+                    # both. Without this the analyst can put them in two places
+                    # and the file records two answers to the same question.
+                    if getattr(self, "link_onset_auc", None) \
+                            and self.link_onset_auc.get():
+                        _f = offset_marker_field(
+                            self.enable_silent.get(),
+                            'silent_start_idx' in m and 'silent_end_idx' in m)
+                        m[_f] = new_idx
+                        for dp in self._dpts:
+                            if dp.role == _f:
+                                dp.idx = new_idx
+                                dp.point.set_offsets(
+                                    [[self.t[new_idx], emg[new_idx]]])
+                                break
                     self._redraw_auc_fill(m)
                     self._refresh_status()
 
@@ -1097,8 +1348,26 @@ class DataInspectorWindow:
         ax_ex.grid(ls=":", lw=0.4)
         self.canvas.draw_idle()
   
+    def _closed(self):
+        """True once this window is gone, or on its way out.
+
+        Tk delivers events that were already queued when a widget was
+        destroyed. A keyboard binding on the window -- Right or Left to step
+        through trials -- therefore fires once more after "Save edits & close",
+        and every widget the handler touches has been torn down. In a
+        multi-channel run two Inspectors open in succession, so the window
+        closes far more often and the race is easy to hit.
+        """
+        if getattr(self, "_is_closing", False):
+            return True
+        try:
+            return not self.top.winfo_exists()
+        except Exception:
+            return True
+
     def _close_and_save(self):
         """Save all pending edits including note, then close."""
+        self._is_closing = True
         # Always save the note box content regardless of whether it is
         # currently visible — the widget retains its text even when hidden.
         key = (self.cur_type, self.cur_idx)
@@ -1107,6 +1376,20 @@ class DataInspectorWindow:
             self.meta.setdefault(key, {})['note'] = txt
         elif key in self.meta and 'note' in self.meta[key]:
             del self.meta[key]['note']
+
+        # Strip landmarks that exist only because detection failed and the
+        # marker had to be put somewhere. The analysis treats a stored
+        # onset_idx as a manual override, so exporting the fallback would
+        # convert "no onset found" into "onset at 0.0 ms" -- and everything
+        # derived from it, offset, duration and the area window, with it.
+        # Anything the analyst actually moved has already cleared the flag.
+        for _k, _m in list(self.meta.items()):
+            if _m.get('onset_auto_failed'):
+                for _f in ('onset_idx', 'mep_offset_idx',
+                           'auc_start_idx', 'auc_end_idx'):
+                    _m.pop(_f, None)
+            _m.pop('onset_auto_failed', None)
+
         self.top.destroy()
 
     # ---------------------------------------------------------------- status-bar
@@ -1119,6 +1402,10 @@ class DataInspectorWindow:
         seg     = self.segments[self.cur_type][self.cur_idx]
         ptp_amp = seg[m['ptp_max_idx']] - seg[m['ptp_min_idx']]
         lat_ms  = (m['onset_idx'] - stim_idx) * dt_ms
+        _no_onset = bool(m.get('onset_auto_failed'))
+        # A non-detection is reported as such, not as 0.0 ms.
+        lat_txt = (f"Latency:{lat_ms:.1f} ms" if not _no_onset
+                   else "Latency: not detected")
 
 
         # cSP duration and absolute EMG return time relative to stim
@@ -1129,6 +1416,21 @@ class DataInspectorWindow:
             _csp_dur = (m["silent_end_idx"] - m["silent_start_idx"]) * dt_ms
             _csp_end = (m["silent_end_idx"] - stim_idx) * dt_ms
             silent_txt = f"    cSP:{_csp_dur:.1f} ms    cSP end:{_csp_end:.1f} ms"
+        # MEP offset and duration. Which marker supplies the offset follows the
+        # same rule the pipeline applies, so this read-out and the results file
+        # cannot disagree: the cSP-start marker during contraction, a dedicated
+        # marker otherwise.
+        offset_txt = ""
+        _fld = None if _no_onset else offset_marker_field(
+            self.enable_silent.get(),
+            'silent_start_idx' in m and 'silent_end_idx' in m)
+        if _fld is not None and _fld in m:
+            _off_ms = (m[_fld] - stim_idx) * dt_ms
+            _dur_ms = _off_ms - lat_ms
+            offset_txt = f"    Offset:{_off_ms:.1f} ms"
+            if _dur_ms > 0:
+                offset_txt += f"    Duration:{_dur_ms:.1f} ms"
+
         # existing AUC read‑out
         auc_txt = ""
         if "auc_start_idx" in m and "auc_end_idx" in m:
@@ -1138,8 +1440,8 @@ class DataInspectorWindow:
 
         self.status.config(text=(
             f"PTP:{ptp_amp:.2f} mV    "
-            f"Latency:{lat_ms:.1f} ms"
-            f"{silent_txt}{auc_txt}{csp_note}"
+            f"{lat_txt}"
+            f"{offset_txt}{silent_txt}{auc_txt}{csp_note}"
         ))
 
 

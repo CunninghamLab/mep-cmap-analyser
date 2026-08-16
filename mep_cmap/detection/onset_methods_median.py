@@ -1,11 +1,11 @@
 """
-mep_cmap.detection.onset_consensus
+mep_cmap.detection.onset_methods_median
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Multi-detector consensus onset estimate, and per-trial agreement metrics.
+Median across several onset detectors, and per-trial agreement metrics.
 
 Two separate entry points, deliberately not merged:
 
-``detect_mep_onset_consensus``
+``detect_mep_onset_methods_median``
     Returns the median of the detectors that found an onset — a single float,
     so it registers as an ordinary onset method alongside the others.
 
@@ -33,14 +33,14 @@ triage signal, not a validation.
 
 Cost
 ----
-Consensus runs every member detector on every trial. The default member set
+Median across methods runs every member detector on every trial. The default member set
 excludes ``bootstrap``, which recomputes a 500-iteration bootstrap inside each
 call and dominates the runtime; it can be added explicitly where its behaviour
 is specifically wanted.
 
-  * detect_mep_onset_consensus
+  * detect_mep_onset_methods_median
   * compute_onset_agreement
-  * CONSENSUS_DEFAULT_METHODS
+  * METHODS_MEDIAN_DEFAULT_MEMBERS
 """
 
 from collections import namedtuple
@@ -50,13 +50,14 @@ import numpy as np
 from .onset_bigoni import detect_mep_onset_bigoni
 from .onset_bigoni_walkback import detect_mep_onset_bigoni_walkback
 from .onset_bootstrap import detect_mep_onset_bootstrap
+from .onset_boyles import detect_mep_onset_boyles
 from .onset_cusum import detect_mep_onset_cusum
 from .onset_peak_fraction import detect_mep_onset_peak_fraction
 from .onset_rms_envelope import detect_mep_onset_rms_envelope
 
 # Five fast, methodologically distinct detectors. Odd count so the median is a
 # member of the set rather than an average of two.
-CONSENSUS_DEFAULT_METHODS = (
+METHODS_MEDIAN_DEFAULT_MEMBERS = (
     "bigoni",
     "bigoni_walkback",
     "rms_envelope",
@@ -171,6 +172,34 @@ def _call_rms_envelope(signal, fs, common, params):
     )
 
 
+def _call_boyles(signal, fs, common, params):
+    # The only member needing a condition average. It arrives through `common`
+    # rather than `params` because it is data, not a setting.
+    return detect_mep_onset_boyles(
+        signal, fs,
+        pre_ms=common["pre_ms"],
+        search_start_ms=common["search_start_ms"],
+        search_end_ms=common["search_end_ms"],
+        min_latency_ms=common["min_latency_ms"],
+        max_latency_ms=common["max_latency_ms"],
+        min_peak_amplitude=common["min_peak_amplitude"],
+        template=common.get("template"),
+        block_ms=params.get("onset_boyles_block_ms", 2.5),
+        baseline_start_ms=params.get("onset_boyles_baseline_start_ms", 100.0),
+        baseline_end_ms=params.get("onset_boyles_baseline_end_ms", 1.0),
+        amplitude_gate=params.get("onset_boyles_amplitude_gate", 1.1),
+        peak_jitter_ms=params.get("onset_boyles_peak_jitter_ms", 15.0),
+        peak_window_length=params.get("onset_boyles_peak_window_length", 1.75),
+        ratio_cutoff=params.get("onset_boyles_ratio_cutoff", 0.85),
+        boyles_max_latency_ms=params.get("onset_boyles_max_latency_ms", 35.0),
+        deriv_check_ms=params.get("onset_boyles_deriv_check_ms", 2.0),
+        deriv_check_duty=params.get("onset_boyles_deriv_check_duty", 0.75),
+        base_deriv_sds=params.get("onset_boyles_base_deriv_sds", 1.5),
+        deriv_check_window_length=params.get("onset_boyles_deriv_window_length", 2.0),
+        literal=params.get("onset_boyles_literal", False),
+    )
+
+
 def _call_cusum(signal, fs, common, params):
     return detect_mep_onset_cusum(
         signal, fs,
@@ -193,6 +222,7 @@ _ADAPTERS = {
     "bootstrap": _call_bootstrap,
     "rms_envelope": _call_rms_envelope,
     "cusum": _call_cusum,
+    "boyles": _call_boyles,
 }
 
 
@@ -205,7 +235,8 @@ def compute_onset_agreement(
         max_latency_ms=None,
         min_peak_amplitude=0.05,
         methods=None,
-        params=None):
+        params=None,
+        template=None):
     """
     Run several onset detectors on one trial and summarise their agreement.
 
@@ -215,7 +246,7 @@ def compute_onset_agreement(
     min_latency_ms, max_latency_ms, min_peak_amplitude
         Canonical detection arguments, translated per detector.
     methods : sequence of str or None
-        Member detectors; defaults to ``CONSENSUS_DEFAULT_METHODS``. Unknown
+        Member detectors; defaults to ``METHODS_MEDIAN_DEFAULT_MEMBERS``. Unknown
         names are ignored rather than raising, so a stale saved session cannot
         abort a run.
     params : dict or None
@@ -237,7 +268,7 @@ def compute_onset_agreement(
         n_detected   : how many members returned a latency
         n_attempted  : how many members ran
     """
-    methods = tuple(CONSENSUS_DEFAULT_METHODS if methods is None else methods)
+    methods = tuple(METHODS_MEDIAN_DEFAULT_MEMBERS if methods is None else methods)
     params = {} if params is None else dict(params)
 
     common = {
@@ -247,6 +278,7 @@ def compute_onset_agreement(
         "min_latency_ms": min_latency_ms,
         "max_latency_ms": max_latency_ms,
         "min_peak_amplitude": min_peak_amplitude,
+        "template": template,
     }
 
     per_method = {}
@@ -268,20 +300,20 @@ def compute_onset_agreement(
         return OnsetAgreement(per_method, None, None, None, 0, attempted)
 
     arr = np.asarray(vals, dtype=float)
-    consensus = round(float(np.median(arr)), 2)
+    methods_median = round(float(np.median(arr)), 2)
     if arr.size < 2:
-        return OnsetAgreement(per_method, consensus, None, None,
+        return OnsetAgreement(per_method, methods_median, None, None,
                               int(arr.size), attempted)
 
     spread = round(float(arr.max() - arr.min()), 2)
     iqr = round(float(np.percentile(arr, 75) - np.percentile(arr, 25)), 2)
-    return OnsetAgreement(per_method, consensus, spread, iqr,
+    return OnsetAgreement(per_method, methods_median, spread, iqr,
                           int(arr.size), attempted)
 
 
-def detect_mep_onset_consensus(signal, fs, **kwargs):
+def detect_mep_onset_methods_median(signal, fs, **kwargs):
     """
-    Consensus onset latency: median across member detectors.
+    Median across methods onset latency: median across member detectors.
 
     Accepts the same canonical keywords as ``compute_onset_agreement``, plus
     ``methods`` and ``params``. Returns a single float (or None) so that it

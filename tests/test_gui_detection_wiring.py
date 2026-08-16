@@ -469,3 +469,59 @@ def test_the_note_refreshes_after_preferences_are_applied():
     assert "_refresh_ptp_note()" in APP_SRC[a:b], (
         "toggling anchoring in Preferences must update the 1c label and note"
     )
+
+
+def test_every_method_has_a_short_label_for_figures():
+    """
+    Figures showed raw registry keys — `bigoni_walkback`, `rms_envelope`,
+    `methods_median`. Those are identifiers, not names a reader should have to
+    decode off an axis. The CSV keeps the key, which is what a script matches
+    on; only figures use the short label.
+    """
+    from mep_cmap.detection import (ONSET_METHOD_LABELS,
+                                    ONSET_METHOD_SHORT_LABELS)
+
+    assert set(ONSET_METHOD_SHORT_LABELS) == set(ONSET_METHOD_LABELS)
+    for key, short in ONSET_METHOD_SHORT_LABELS.items():
+        assert short and short != key, f"'{key}' has no readable short label"
+        assert len(short) <= 24, f"'{short}' is too long for an axis tick"
+
+
+def test_figures_use_short_labels_but_tables_keep_the_key():
+    import inspect
+
+    from mep_cmap import onset_methods_report as r
+
+    assert "_display(" in inspect.getsource(r.plot_onset_methods_on_trace)
+    assert "_display(" in inspect.getsource(r.plot_method_agreement)
+    assert "_display(" in inspect.getsource(r.plot_bland_altman)
+    # The long-format table must still carry the machine key.
+    assert '"Method": method' in inspect.getsource(r.collect_agreement_rows)
+
+
+def test_display_falls_through_for_an_unknown_method():
+    from mep_cmap.onset_methods_report import _display
+
+    assert _display("some_future_method") == "some_future_method"
+
+
+def test_the_two_anchor_controls_name_the_window_they_move():
+    """
+    There are two unrelated settings whose labels both said "anchor": one moves
+    the ONSET SEARCH window (tab 1c) and one moves the AMPLITUDE measurement
+    window (Preferences → Detection). Ticking the first and expecting the
+    second is an easy mistake, and its symptom -- a peak-to-peak that ignores
+    the largest peak because it falls before the amplitude window start -- does
+    not look like a settings problem.
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    app_src = (root / "mep_cmap" / "app.py").read_text(encoding="utf-8")
+    pref_src = (root / "mep_cmap" / "preferences.py").read_text(encoding="utf-8")
+
+    assert "Anchor the ONSET SEARCH window" in app_src
+    assert "Amplitude (PTP) Window Anchoring" in pref_src
+    # Neither may carry a bare "anchor" label that does not say which window.
+    assert 'text="Anchor onset search window to sample-median onset"' not in app_src
+    assert 'text="PTP Window Anchoring"' not in pref_src

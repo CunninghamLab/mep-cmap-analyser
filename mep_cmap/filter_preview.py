@@ -27,7 +27,8 @@ from scipy.signal import (
     sosfiltfilt, sos2tf, iirnotch, fftconvolve,
 )
 
-from .io import extract_emg_waveform_and_fs, extract_stim_times
+from .io import (extract_emg_waveform_and_fs, extract_stim_times,
+                 SUPPORTED_EXTENSIONS)
 from .filters import adaptive_mains_cancel
 
 
@@ -60,7 +61,8 @@ class FilterPreviewMixin:
         })
 
         # ───────────────────────────── Load / crop ─────────────────────────────
-        _SUPPORTED_EXTS = (".txt", ".smr", ".adibin")
+        # Every extension the readers handle, not a copy that goes stale.
+        _SUPPORTED_EXTS = SUPPORTED_EXTENSIONS
         if not hasattr(self, "raw_emg") or not hasattr(self, "prev_fs") \
                 or not hasattr(self, "last_stim"):
             sel = self.file_path.get()

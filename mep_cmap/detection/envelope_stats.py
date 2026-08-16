@@ -101,7 +101,7 @@ def compute_rms_envelope(x, fs, window_ms=5.0, causal=False):
     return np.sqrt(np.maximum(mean_sq, 0.0))
 
 
-def compute_envelope_baseline(env_pre, criterion=2.5):
+def compute_envelope_baseline(env_pre, criterion=2.5, robust=False):
     """
     Baseline mean, SD and detection threshold from a pre-stimulus envelope.
 
@@ -115,6 +115,21 @@ def compute_envelope_baseline(env_pre, criterion=2.5):
     ----------
     env_pre   : 1-D array_like  pre-stimulus envelope samples
     criterion : float           SD multiplier (default 2.5)
+    robust    : bool            estimate the centre and spread with the median
+                and the median absolute deviation instead of the mean and SD.
+
+                The envelope is computed with a CENTRED window, so a stimulus
+                artefact smears backwards by half that window. The guard the
+                caller applies covers an artefact at t=0; one that lands even
+                slightly before the marker reaches past it, and a handful of
+                contaminated samples then dominate the mean and SD.
+
+                Measured on a real recording whose markers were ~2 ms late,
+                this raised the threshold from 0.027 mV to 1.99 mV -- 73x --
+                and the offset was reported while the response was still at
+                26% of its peak. The median and MAD are unmoved by a short
+                contaminated tail, so the threshold stays where the quiet part
+                of the baseline puts it.
 
     Returns
     -------
@@ -125,11 +140,16 @@ def compute_envelope_baseline(env_pre, criterion=2.5):
     if env_pre.size < 5:
         return None
 
-    mu = float(env_pre.mean())
+    if robust:
+        mu = float(np.median(env_pre))
+        mad = float(np.median(np.abs(env_pre - mu)))
+        sd = 1.4826 * mad          # MAD -> SD for a normal distribution
+    else:
+        mu = float(env_pre.mean())
+        sd = float(env_pre.std(ddof=1)) if env_pre.size > 1 else 0.0
     if not np.isfinite(mu) or abs(mu) < _EPS:
         return None
 
-    sd = float(env_pre.std(ddof=1)) if env_pre.size > 1 else 0.0
     if not np.isfinite(sd):
         return None
     # A degenerate SD (constant baseline, e.g. a saturated or synthetic

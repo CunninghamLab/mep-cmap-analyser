@@ -26,10 +26,10 @@ from mep_cmap.detection.offset_detection import (
     detect_mep_offset,
     resolve_mep_offset,
 )
-from mep_cmap.detection.onset_consensus import (
-    CONSENSUS_DEFAULT_METHODS,
+from mep_cmap.detection.onset_methods_median import (
+    METHODS_MEDIAN_DEFAULT_MEMBERS,
     compute_onset_agreement,
-    detect_mep_onset_consensus,
+    detect_mep_onset_methods_median,
 )
 from mep_cmap.detection.onset_cusum import detect_mep_onset_cusum
 from mep_cmap.detection.onset_rms_envelope import detect_mep_onset_rms_envelope
@@ -277,8 +277,8 @@ def test_cusum_retains_sensitivity_to_small_responses():
 def test_consensus_runs_all_default_members_and_agrees_with_truth():
     ag = compute_onset_agreement(make_trial(seed=3), FS,
                                  params={"onset_env_n_boot": 200}, **COMMON)
-    assert ag.n_attempted == len(CONSENSUS_DEFAULT_METHODS)
-    assert set(ag.per_method) == set(CONSENSUS_DEFAULT_METHODS)
+    assert ag.n_attempted == len(METHODS_MEDIAN_DEFAULT_MEMBERS)
+    assert set(ag.per_method) == set(METHODS_MEDIAN_DEFAULT_MEMBERS)
     assert abs(ag.consensus_ms - TRUE_ONSET) < 2.0
     assert ag.spread_ms is not None and ag.iqr_ms is not None
 
@@ -286,7 +286,7 @@ def test_consensus_runs_all_default_members_and_agrees_with_truth():
 def test_consensus_scalar_wrapper_matches_agreement_median():
     kw = dict(params={"onset_env_n_boot": 200}, **COMMON)
     ag = compute_onset_agreement(make_trial(seed=4), FS, **kw)
-    assert detect_mep_onset_consensus(make_trial(seed=4), FS, **kw) \
+    assert detect_mep_onset_methods_median(make_trial(seed=4), FS, **kw) \
         == ag.consensus_ms
 
 

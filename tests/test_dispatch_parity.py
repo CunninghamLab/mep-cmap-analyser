@@ -267,3 +267,161 @@ def test_inspector_accepts_a_detection_params_dict():
     assert init is not None, "DataInspectorWindow.__init__ not found"
     names = [a.arg for a in init.args.args + init.args.kwonlyargs]
     assert "detection_params" in names
+
+
+# ── The condition template the derivative-ratio method needs ─────────────────
+
+MEP_LO, MEP_HI = 15.0, 35.0
+
+
+def _mep_trial(seed, onset_ms=22.0, dur_ms=18.0, noise=0.010, harmonic=0.5):
+    """A trial the derivative-ratio detector is specified for.
+
+    This module's own make_trial uses a smooth single-cycle burst in 0.02 mV
+    noise, which suits threshold-based detectors but sits below the
+    derivative-ratio method's working range: its gates are stated in absolute
+    derivatives, so they need the response to be spectrally richer than the
+    baseline, and on that fixture it detects nothing at all. Testing it there
+    would measure the fixture, not the parity these tests are about.
+    """
+    rng = np.random.default_rng(seed)
+    n = int((PRE_MS + POST_MS) * FS / 1000)
+    stim = int(PRE_MS * FS / 1000)
+    x = rng.normal(0.0, noise, n)
+    i0 = stim + int(onset_ms * FS / 1000)
+    i1 = stim + int((onset_ms + dur_ms) * FS / 1000)
+    k = np.arange(i1 - i0) / float(i1 - i0)
+    shape = np.sin(2 * np.pi * k) + harmonic * np.sin(8 * np.pi * k)
+    x[i0:i1] += shape * np.sin(np.pi * k) ** 0.5
+    return x
+
+
+def _mep_trials(n=12, **kw):
+    return [_mep_trial(s, **kw) for s in range(n)]
+
+
+def _template(segs):
+    return np.median(np.vstack(segs), axis=0)
+
+
+def test_boyles_agrees_between_the_two_paths_when_both_have_a_template():
+    """
+    The derivative-ratio detector is the only one that consults a condition
+    average. The analysis builds one; the Data Inspector must too, or the same
+    trial is judged against different landmarks in analysis and in review.
+    """
+    cfg = _cfg(onset_method="boyles")
+    segs = _mep_trials()
+    tpl = _template(segs)
+    detected = 0
+    for sig in segs:
+        pipeline = _detect_onset_dispatch(sig, FS, cfg, MEP_LO, MEP_HI,
+                                          template=tpl)
+        inspector = dispatch_onset(
+            sig, FS, detector_params(cfg),
+            pre_ms=cfg.pre_ms, search_start_ms=cfg.ptp_start,
+            search_end_ms=cfg.ptp_end, min_latency_ms=MEP_LO,
+            max_latency_ms=MEP_HI, template=tpl)
+        assert pipeline == inspector
+        detected += pipeline is not None
+    assert detected >= 8, "the fixture is not producing detectable responses"
+
+
+def test_a_missing_template_makes_the_detector_more_permissive_not_wrong():
+    """
+    Without a template the peak-jitter gate is skipped. That does not move an
+    onset -- the template feeds no part of locating one -- but it removes a
+    rejection criterion, so the Inspector could accept a trial the analysis
+    rejected. That asymmetry is why the Inspector supplies one.
+    """
+    cfg = _cfg(onset_method="boyles")
+    segs = _mep_trials()
+    tpl = _template(segs)
+    odd = _mep_trial(99, onset_ms=31.0)               # peak far from the condition's
+
+    strict = dict(detector_params(cfg))
+    strict["onset_boyles_peak_jitter_ms"] = 2.0
+    kw = dict(pre_ms=cfg.pre_ms, search_start_ms=cfg.ptp_start,
+              search_end_ms=cfg.ptp_end, min_latency_ms=MEP_LO,
+              max_latency_ms=45.0)
+    with_tpl = dispatch_onset(odd, FS, strict, template=tpl, **kw)
+    without = dispatch_onset(odd, FS, strict, template=None, **kw)
+    assert with_tpl is None
+    assert without is not None
+
+    # Where both accept, the latency is the same: the gate rejects, it does not
+    # relocate.
+    for sig in segs:
+        a = dispatch_onset(sig, FS, detector_params(cfg), template=tpl, **kw)
+        b = dispatch_onset(sig, FS, detector_params(cfg), template=None, **kw)
+        if a is not None and b is not None:
+            assert a == b
+
+
+def test_the_template_landmark_is_stable_to_which_trials_are_retained():
+    """
+    The analysis screens trials by outlier detection; the Inspector knows
+    manual exclusions. Those sets are not identical, so the two templates can
+    differ. Measured on real recordings, dropping trials left the median's
+    first-peak landmark unmoved to two decimal places, against a gate tolerance
+    of 15 ms -- so the difference cannot change a decision. Asserted here so
+    the claim is checked rather than assumed.
+    """
+    cfg = _cfg(onset_method="boyles")
+    segs = _mep_trials(n=16)
+    full = _template(segs)
+    dropped = _template([s for i, s in enumerate(segs) if i not in (0, 1, 2)])
+
+    stim = int(PRE_MS * FS / 1000)
+    lo = stim + int(5 * FS / 1000)
+    hi = stim + int(45 * FS / 1000)
+
+    def anchor(t):
+        w = t[lo:hi]
+        return (lo + min(int(np.argmax(w)), int(np.argmin(w))) - stim) * 1000.0 / FS
+
+    assert abs(anchor(full) - anchor(dropped)) < 1.0
+
+    kw = dict(pre_ms=cfg.pre_ms, search_start_ms=cfg.ptp_start,
+              search_end_ms=cfg.ptp_end, min_latency_ms=MEP_LO,
+              max_latency_ms=MEP_HI)
+    a = [dispatch_onset(s, FS, detector_params(cfg), template=full, **kw) for s in segs]
+    b = [dispatch_onset(s, FS, detector_params(cfg), template=dropped, **kw) for s in segs]
+    assert a == b
+
+
+# ── The Inspector actually supplies one ──────────────────────────────────────
+
+def _inspector_source():
+    import pathlib as _pl
+    root = _pl.Path(__file__).resolve().parent.parent
+    return (root / "mep_cmap" / "inspector.py").read_text(encoding="utf-8")
+
+
+def test_inspector_passes_a_template_to_the_dispatch():
+    src = _inspector_source()
+    assert "template=self._condition_template()" in src, (
+        "the Inspector must supply a condition average, or the derivative-ratio "
+        "method silently loses its peak-jitter gate during review"
+    )
+
+
+def test_inspector_template_excludes_excluded_trials():
+    src = _inspector_source()
+    a = src.index("def _condition_template")
+    b = src.index("\n    def ", a + 10)
+    body = src[a:b]
+    assert '"exclude"' in body or "'exclude'" in body, (
+        "the template must be built from retained trials only"
+    )
+    assert "np.median" in body
+
+
+def test_inspector_invalidates_its_template_when_an_exclusion_changes():
+    """A cached template built from a stale trial set is worse than none."""
+    src = _inspector_source()
+    a = src.index("def _set_exclude")
+    b = src.index("\n    def ", a + 10)
+    assert "_template_cache.pop" in src[a:b], (
+        "changing an exclusion must invalidate the cached template"
+    )

@@ -37,7 +37,7 @@ from scipy.stats import zscore
 from numpy.random import default_rng
 
 from .compat import _np_trapz, _np_ptp
-from .bids import StudyMetadata
+from .bids import _sanitise_bids_label, StudyMetadata
 from .utils import _add_time_and_digmark
 from .io import extract_emg_waveform_and_fs, extract_stim_times
 from .filters import adaptive_mains_cancel, design_notch_sos
@@ -49,7 +49,7 @@ from .detection     import (compute_ptp, compute_rms, compute_auc,
                              detect_mep_onset_bigoni_walkback,
                              detect_mep_onset_rms_envelope,
                              detect_mep_onset_cusum,
-                             detect_mep_onset_consensus,
+                             detect_mep_onset_methods_median,
                              compute_onset_agreement,
                              dispatch_onset,
                              resolve_mep_offset,
@@ -208,9 +208,23 @@ class PipelineConfig:
     onset_cusum_max_accum_ms:    float = _DD["onset_cusum_max_accum_ms"]
     onset_cusum_min_response_ms: float = _DD["onset_cusum_min_response_ms"]
     onset_cusum_tkeo:            bool  = _DD["onset_cusum_tkeo"]
+    # Derivative ratio (Boyles et al. 2026)
+    onset_boyles_block_ms:            float = _DD["onset_boyles_block_ms"]
+    onset_boyles_baseline_start_ms:   float = _DD["onset_boyles_baseline_start_ms"]
+    onset_boyles_baseline_end_ms:     float = _DD["onset_boyles_baseline_end_ms"]
+    onset_boyles_amplitude_gate:      float = _DD["onset_boyles_amplitude_gate"]
+    onset_boyles_peak_jitter_ms:      float = _DD["onset_boyles_peak_jitter_ms"]
+    onset_boyles_peak_window_length:  float = _DD["onset_boyles_peak_window_length"]
+    onset_boyles_ratio_cutoff:        float = _DD["onset_boyles_ratio_cutoff"]
+    onset_boyles_max_latency_ms:      float = _DD["onset_boyles_max_latency_ms"]
+    onset_boyles_deriv_check_ms:      float = _DD["onset_boyles_deriv_check_ms"]
+    onset_boyles_deriv_check_duty:    float = _DD["onset_boyles_deriv_check_duty"]
+    onset_boyles_base_deriv_sds:      float = _DD["onset_boyles_base_deriv_sds"]
+    onset_boyles_deriv_window_length: float = _DD["onset_boyles_deriv_window_length"]
+    onset_boyles_literal:             bool  = _DD["onset_boyles_literal"]
     # Consensus / per-trial method agreement
-    onset_consensus_methods: list = field(
-        default_factory=lambda: list(_DD["onset_consensus_methods"]))
+    onset_methods_median_members: list = field(
+        default_factory=lambda: list(_DD["onset_methods_median_members"]))
     onset_agreement:             bool  = _DD["onset_agreement"]
     # MEP offset (return of the response to baseline)
     mep_offset_enabled:          bool  = _DD["mep_offset_enabled"]
@@ -244,6 +258,10 @@ class PipelineConfig:
     color_map:       dict = field(default_factory=dict)
     plot_included:   dict = field(default_factory=dict)
     gap_ms_map:      dict = field(default_factory=dict)
+    # Per-stimulus-type correction, in ms, between the file's event marker and
+    # the actual stimulus. Negative means the pulse fired BEFORE the marker.
+    # Applied when epoching, so every measure defined from t=0 follows.
+    delay_ms_map:    dict = field(default_factory=dict)
     # Recording identifiers (from BIDS metadata)
     limb:            str  = ""
     measure:         str  = ""
@@ -411,8 +429,19 @@ def pipeline_extract_segments(time, emg, stim_times, stim_types, fs,
         # 3 ms before the pulse).
         pre_offset = max(gap_samples, guard_samples)
         segs = []
+        # Shift t=0 onto the actual stimulus. One line, but everything
+        # downstream is defined relative to this index -- the pre-stimulus
+        # window, the amplitude window, onset, offset, AUC and the Inspector's
+        # zero -- so correcting it here corrects all of them consistently.
+        # Reported latencies move with it, which is the point: a latency
+        # measured from a marker known to be late is wrong by that much.
+        delay_samples = int(round(
+            float(cfg.delay_ms_map.get(stim_type, 0.0)) * fs / 1000.0))
+
         for stim_time in valid_times:
-            idx   = int(np.argmin(np.abs(time - stim_time)))
+            idx   = int(np.argmin(np.abs(time - stim_time))) + delay_samples
+            if idx < 0 or idx >= len(emg):
+                continue          # correction pushed this trial off the record
             start = max(0, idx - samples_before)
             end   = min(len(emg), idx + samples_after)
             if (end - start) != (samples_before + samples_after):
@@ -524,7 +553,7 @@ def onset_search_window(cfg, min_lat, max_lat):
     return lo, hi
 
 
-def _detect_onset_dispatch(signal, fs, cfg, min_lat, max_lat):
+def _detect_onset_dispatch(signal, fs, cfg, min_lat, max_lat, template=None):
     """Run the configured onset detector on a single trace and return onset (ms).
 
     Thin wrapper over ``detection.dispatch_onset``, which is the single place
@@ -547,6 +576,7 @@ def _detect_onset_dispatch(signal, fs, cfg, min_lat, max_lat):
         search_end_ms=_hi,
         min_latency_ms=min_lat,
         max_latency_ms=max_lat,
+        template=template,
     )
 
 
@@ -574,19 +604,34 @@ def pipeline_detect_onsets(stim_type, segs_all, out_set,
     _min_lat0, _max_lat0 = _base_lat if _base_lat else (10.0, 50.0)
     _eff_min_lat, _eff_max_lat = _min_lat0, _max_lat0
 
+    # Condition median over outlier-screened trials. Previously computed only
+    # when onset anchoring was on; it is now always available because the
+    # derivative-ratio detector needs a condition average for its peak-jitter
+    # gate, and it is the same waveform the anchor uses. Screened trials only,
+    # for the same reason as the anchor: a single aberrant trial should not move
+    # a landmark that every trial is then judged against.
+    _clean = [segs_all[j] for j in range(len(segs_all))
+              if j not in (out_set or set())]
+    try:
+        _template = (np.median(np.vstack(_clean), axis=0)
+                     if len(_clean) >= 2 else None)
+    except Exception:
+        _template = None
+
     if getattr(cfg, "onset_anchor", False):
-        _clean = [segs_all[j] for j in range(len(segs_all))
-                  if j not in (out_set or set())]
         _min_n = int(getattr(cfg, "onset_anchor_min_trials", 8))
         if len(_clean) >= _min_n:
+            _median = _template
             try:
-                _median = np.median(np.vstack(_clean), axis=0)
-                _med_ptp = _np_ptp(_median[ptp_start_idx:ptp_end_idx])
+                _med_ptp = (_np_ptp(_median[ptp_start_idx:ptp_end_idx])
+                            if _median is not None else 0.0)
             except Exception:
                 _median, _med_ptp = None, 0.0
             if _median is not None and _med_ptp >= cfg.min_peak_amplitude:
                 try:
-                    _anchor = _detect_onset_dispatch(_median, fs, cfg, _min_lat0, _max_lat0)
+                    _anchor = _detect_onset_dispatch(
+                        _median, fs, cfg, _min_lat0, _max_lat0,
+                        template=_median)
                 except Exception:
                     _anchor = None
                 if _anchor is not None and _min_lat0 <= _anchor <= _max_lat0:
@@ -616,7 +661,8 @@ def pipeline_detect_onsets(stim_type, segs_all, out_set,
             )
 
     for idx, seg in enumerate(segs_all):
-        onsets[idx] = _detect_onset_dispatch(seg, fs, cfg, _eff_min_lat, _eff_max_lat)
+        onsets[idx] = _detect_onset_dispatch(seg, fs, cfg, _eff_min_lat,
+                                             _eff_max_lat, template=_template)
 
     _warn_if_onsets_pinned_to_a_bound(
         stim_type, onsets, fs, _eff_min_lat, _eff_max_lat, log_callback)
@@ -696,6 +742,39 @@ def ptp_window_for_stim_type(stim_type, onsets, fs, cfg,
     vals = [v for v in onsets.values() if v is not None]
     min_n = int(getattr(cfg, "ptp_anchor_min_trials", 4))
     if len(vals) < min_n:
+        # Fall back to this stimulus type's own LATENCY PROFILE, not to the
+        # file-wide window.
+        #
+        # The file-wide start is the very thing anchoring exists to replace: on
+        # a mixed or peripheral recording it is typically 10 ms, which sits
+        # after the peak of an M-wave. Using it as the fallback meant that a
+        # condition whose onsets failed to detect -- the condition already in
+        # trouble -- was also the one whose amplitude got truncated, while its
+        # neighbours measured correctly. Measured on a real recording, the
+        # first phase of a 3.8 mV M-wave fell outside the window entirely and
+        # peak-to-peak was read from a 2.1 mV shoulder instead.
+        #
+        # The profile minimum is the analyst's own statement of where a
+        # response can begin for this stimulus type, so it is a better floor
+        # than a single number shared across every type in the file. The
+        # configured end still applies as a ceiling.
+        _lat = (getattr(cfg, "latency_map", None) or {}).get(stim_type)
+        if _lat:
+            try:
+                _lo_ms = float(_lat[0]) - float(cfg.ptp_anchor_pre_ms)
+                _lo_ms = max(_lo_ms, ARTEFACT_FLOOR_MS)
+                _s = int(round(samples_before + _lo_ms * fs / 1000.0))
+                _s = max(0, min(_s, default_end_idx - 2))
+                if _s < default_start_idx:
+                    log_callback(
+                        f"   PTP anchor '{stim_type}': only {len(vals)} "
+                        f"onset(s) detected (need {min_n}) - using the latency "
+                        f"profile instead, window {_lo_ms:.1f}-"
+                        f"{(default_end_idx - samples_before) * 1000.0 / fs:.1f}"
+                        f" ms.")
+                    return _s, default_end_idx, None
+            except Exception:
+                pass
         log_callback(
             f"   PTP anchor '{stim_type}': only {len(vals)} onset(s) detected "
             f"(need {min_n}) - keeping the file-wide PTP window.")
@@ -756,6 +835,15 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
     _ag_min_lat, _ag_max_lat = _ag_lat if _ag_lat else (10.0, 50.0)
     _agreement_warned = False
     _offset_warned = False
+    # Condition median for the derivative-ratio member's peak-jitter gate.
+    # Screened trials only, matching pipeline_detect_onsets.
+    try:
+        _ag_clean = [segs_all[j] for j in range(len(segs_all))
+                     if j not in (out_set or set())]
+        _agreement_template = (np.median(np.vstack(_ag_clean), axis=0)
+                               if len(_ag_clean) >= 2 else None)
+    except Exception:
+        _agreement_template = None
 
     auto_rows, manual_rows = [], []
     latencies, silent_durs = [], []
@@ -856,8 +944,9 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
                     min_latency_ms=_ag_min_lat,
                     max_latency_ms=_ag_max_lat,
                     min_peak_amplitude=cfg.min_peak_amplitude,
-                    methods=cfg.onset_consensus_methods,
+                    methods=cfg.onset_methods_median_members,
                     params=detector_params(cfg),
+                    template=_agreement_template,
                 )
             except Exception as _exc:
                 # Reported, not swallowed. An early version of this block
@@ -1350,7 +1439,7 @@ LAT_COLS = [
     # Per-trial agreement between onset detectors.  Populated only when
     # cfg.onset_agreement is on; blank otherwise.  High disagreement flags a
     # trial for manual review; it does NOT mean the reported onset is wrong.
-    "Onset_Consensus(ms)",   # median across the consensus member detectors
+    "Onset_MethodsMedian(ms)",   # median across the member method detectors
     "Onset_Disagreement(ms)",# max - min across members
     "Onset_IQR(ms)",         # interquartile range; robust to one stray member
     "Onset_Methods_N",       # members that returned a latency
@@ -1373,7 +1462,7 @@ _C_DET_SZ  = LAT_COLS.index("PTP_Detrended_Session_Z")
 _C_OFF     = LAT_COLS.index("MEP_Offset(ms)")
 _C_DUR     = LAT_COLS.index("MEP_Duration(ms)")
 _C_OFF_SRC = LAT_COLS.index("MEP_Offset_Source")
-_C_AG_CONS = LAT_COLS.index("Onset_Consensus(ms)")
+_C_AG_CONS = LAT_COLS.index("Onset_MethodsMedian(ms)")
 _C_AG_SPRD = LAT_COLS.index("Onset_Disagreement(ms)")
 _C_AG_IQR  = LAT_COLS.index("Onset_IQR(ms)")
 _C_AG_N    = LAT_COLS.index("Onset_Methods_N")
@@ -1396,7 +1485,8 @@ def _trials_frame(rows):
     return pd.DataFrame(padded, columns=LAT_COLS)
 
 
-def pipeline_write_outputs(latency_manual, results_out, bids_prefix):
+def pipeline_write_outputs(latency_manual, results_out, bids_prefix,
+                           channel_label=None):
     """Write all result CSVs to results_out directory.
 
     Outputs
@@ -1460,6 +1550,20 @@ def pipeline_write_outputs(latency_manual, results_out, bids_prefix):
     def _p(name): return os.path.join(results_out, f"{bids_prefix}_{name}")
 
     # ── Trial-level files ─────────────────────────────────────────────────────
+    def _tag_channel(df):
+        """Name the channel every row came from.
+
+        Written whether or not several channels were analysed. A single-channel
+        file that later joins a multi-channel dataset must still be able to say
+        which channel it holds, and a column that appears only sometimes is
+        worse to work with than one that is always there.
+        """
+        if df is None or not len(df):
+            return df
+        if "Channel" not in df.columns and channel_label:
+            df.insert(min(1, len(df.columns)), "Channel", str(channel_label))
+        return df
+
     if latency_manual:
         df_all = _alpha_sort(
             _trials_frame(latency_manual),
@@ -1467,7 +1571,7 @@ def pipeline_write_outputs(latency_manual, results_out, bids_prefix):
         # trials.csv deliberately carries EVERY trial; Outlier_Decision is the
         # filter column so the analyst keeps control of trial-level modelling.
         # (_trials_with_outliers.csv was retired for this reason.)
-        df_all.to_csv(_p("trials.csv"), index=False)
+        _tag_channel(df_all).to_csv(_p("trials.csv"), index=False)
 
     # ── Summary files — build from trial-level data for consistency ───────────
     # This ensures summary and trial files always report the same variables.
@@ -1576,9 +1680,9 @@ def pipeline_write_outputs(latency_manual, results_out, bids_prefix):
         df_clean_only = df_all[~df_all["Outlier_Decision"].isin(EXCLUDED_DECISIONS)]
 
         _build_summary(df_clean_only) \
-            .to_csv(_p("summary.csv"),               index=False)
+            .pipe(_tag_channel).to_csv(_p("summary.csv"),               index=False)
         _build_summary(df_all) \
-            .to_csv(_p("summary_with_outliers.csv"), index=False)
+            .pipe(_tag_channel).to_csv(_p("summary_with_outliers.csv"), index=False)
 
 
 def pipeline_generate_plots(trace_stats, time_axis, segments_metadata,
@@ -1686,10 +1790,17 @@ def pipeline_assemble_condition_means(stats_per_type, emg, time, fs, cfg,
         stim_ts = info.get("stim_times_s", [])
         out     = info.get("outlier_set", set()) or set()
         clean   = []
+        # Same delay as the analysis and the Inspector, for the same reason:
+        # a condition average built from a differently aligned epoch is not the
+        # average of the trials being measured.
+        _mean_delay = int(round(
+            float(cfg.delay_ms_map.get(stim_type, 0.0)) * fs / 1000.0))
         for _i, _t0 in enumerate(stim_ts):
             if _i in out:
                 continue
-            _ix  = int(np.argmin(np.abs(time - _t0)))
+            _ix  = int(np.argmin(np.abs(time - _t0))) + _mean_delay
+            if _ix < 0 or _ix >= len(emg):
+                continue
             _seg = emg[max(0, _ix - _insp_sb):_ix + _insp_sa]
             if len(_seg) == _insp_sb + _insp_sa:
                 clean.append(_seg)
@@ -1735,6 +1846,16 @@ def pipeline_quantify_averaged(means, segments_metadata, fs, cfg,
         if "ptp_max_idx" in meta and "ptp_min_idx" in meta:
             ptp = float(seg[_clamp(meta["ptp_max_idx"])]
                         - seg[_clamp(meta["ptp_min_idx"])])
+            # Peak-to-peak is a magnitude and cannot be negative. A negative
+            # value means the stored "max" sample sits below the stored "min"
+            # one -- which happens when marker indices from one channel are
+            # applied to another, since an index is a position in one
+            # particular waveform. Take the magnitude rather than writing an
+            # impossible number: a wrong-but-positive value is still wrong, but
+            # a negative one propagates into normalisation and z-scores as
+            # though it were meaningful.
+            if ptp < 0:
+                ptp = abs(ptp)
         else:
             _e = min(ptp_e, L); _s = min(ptp_s, max(_e - 1, 0))
             ptp = compute_ptp(seg, _s, _e) if _e > _s else float("nan")
@@ -2002,10 +2123,18 @@ def run_pipeline(input_path,
                  ptp_end,
                  *,
                  gap_ms_map=None,
+                 delay_ms_map=None,
+                 delay_source_map=None,
                  review_outliers_cb=None,
                  show_inspector_cb=None,
                  gui_enable_inspector=False,
                  channel_idx=0,
+                 # Display name for the channel, used in logs and in the
+                 # Data Inspector's title so a multi-channel run says which
+                 # channel is being reviewed.
+                 channel_label=None,
+                 # True when this run is one of several channels.
+                 multi_channel=False,
                  prestim_ms,
                  apply_humbug,
                  humbug_harmonics=6,
@@ -2103,6 +2232,7 @@ def run_pipeline(input_path,
         color_map=color_map or {},
         plot_included=plot_included or {},
         gap_ms_map=gap_ms_map or {},
+        delay_ms_map=delay_ms_map or {},
         reference_map=reference_map or {},
         mmax_file=mmax_file or "",
         plateau_tolerance=plateau_tolerance,
@@ -2148,6 +2278,18 @@ def run_pipeline(input_path,
     # to avoid redundancy (e.g. sub-o001 appearing twice).
     _bids_prefix = _make_bids_prefix(meta.bids_prefix(), pathlib.Path(input_path).stem)
 
+    # Tag the outputs with the channel when more than one is being analysed,
+    # so the passes do not overwrite each other.
+    #
+    # Only when more than one: a single-channel analysis keeps the filenames it
+    # has always had, so existing derivatives, the group-level merge and any
+    # scripts pointing at them go on working untouched. The Channel column
+    # below is written either way, so a merged table can always say which
+    # channel a row came from.
+    if channel_label and multi_channel:
+        _chan_token = _sanitise_bids_label(str(channel_label))
+        _bids_prefix = f"{_bids_prefix}_channel-{_chan_token}"
+
     def _bids_path(suffix):
         return os.path.join(_deriv_base, f"{_bids_prefix}_{suffix}")
 
@@ -2158,7 +2300,13 @@ def run_pipeline(input_path,
                           notch_q=notch_q, apply_humbug=apply_humbug,
                           humbug_harmonics=humbug_harmonics,
                           filter_order=filter_order)
-        sidecar = meta.to_sidecar(input_path, filter_cfg)
+        # Record any marker correction. A delay shifts every latency in the
+        # file, so the derivative must carry the value and whether it was
+        # measured or typed.
+        sidecar = meta.to_sidecar(
+            input_path, filter_cfg,
+            event_delay_ms={k: v for k, v in (cfg.delay_ms_map or {}).items() if v},
+            event_delay_source=delay_source_map or {})
         if extra:
             sidecar.update(extra)
         json_path = os.path.splitext(csv_path)[0] + ".json"
@@ -2317,12 +2465,26 @@ def run_pipeline(input_path,
                 # idx must index into segs_all, not the cleaned subset.
                 segments_final[stim_type].extend(
                     stats_per_type[stim_type]["segs_all"])
-                # Build inspector segments with full prestim_ms pre-stim
+                # Build inspector segments with full prestim_ms pre-stim.
+                #
+                # The event delay MUST be applied here too. These segments are
+                # re-extracted from the raw time axis rather than reusing the
+                # analysed ones, and without the shift the Inspector displays a
+                # different epoch from the one the analysis measured. Marker
+                # indices returned from it are then offset by exactly the
+                # delay, and quantification applies them to the shifted
+                # segments -- so a corrected condition came back with its
+                # peak-to-peak read from the wrong samples while every
+                # uncorrected condition was fine.
                 _insp_sb = int(cfg.prestim_ms * fs / 1000)
                 _insp_sa = int(cfg.post_ms    * fs / 1000)
+                _insp_delay = int(round(
+                    float(cfg.delay_ms_map.get(stim_type, 0.0)) * fs / 1000.0))
                 for _t0 in [t for t in stim_times.get(stim_type, [])
                             if time.min() <= t <= time.max()]:
-                    _ix  = int(np.argmin(np.abs(time - _t0)))
+                    _ix  = int(np.argmin(np.abs(time - _t0))) + _insp_delay
+                    if _ix < 0 or _ix >= len(emg):
+                        continue
                     _seg = emg[max(0,_ix-_insp_sb):_ix+_insp_sa]
                     if len(_seg) == _insp_sb + _insp_sa:
                         segments_inspector[stim_type].append(_seg)
@@ -2487,12 +2649,33 @@ def run_pipeline(input_path,
                     for st in segments_final
                 )
                 _insp_segs = segments_inspector if _counts_match else segments_final
+                # The amplitude window the analysis actually used, per stimulus
+                # type, in ms relative to the stimulus. Without this the
+                # Inspector re-seeded its PTP markers from the file-wide 1c
+                # window, so with anchoring enabled the review measured a
+                # different interval from the analysis -- and the peak-to-peak
+                # on screen was not the one in the results file.
+                # ptp_window_for_stim_type returns THREE values --
+                # (start_idx, end_idx, ms_pair_or_None) -- so the first two are
+                # taken by index rather than by unpacking. Destructuring to a
+                # pair here raised "too many values to unpack" only once an
+                # analysis reached the inspector.
+                _ptp_ms_by_type = {}
+                for _st, _win in (ptp_window_by_type or {}).items():
+                    try:
+                        _ptp_ms_by_type[_st] = (
+                            (int(_win[0]) - samples_before) * 1000.0 / fs,
+                            (int(_win[1]) - samples_before) * 1000.0 / fs,
+                        )
+                    except Exception:
+                        pass
                 segments_metadata = show_inspector_cb(
                     _insp_segs, fs, cfg.prestim_ms, post_ms, unit,
                     custom_labels, color_map, prestim_ms,
                     extra_segs=_extra_segs,
                     wide_window_s=cfg.wide_window_s,
-                    auto_meta=auto_meta)
+                    auto_meta=auto_meta,
+                    ptp_windows_by_type=_ptp_ms_by_type)
 
             # Parse inspector metadata
             excluded_sets = defaultdict(set)
@@ -2558,7 +2741,7 @@ def run_pipeline(input_path,
                 except Exception as _exc:
                     log_callback(f"⚠️ Onset-method comparison failed "
                                  f"({type(_exc).__name__}: {_exc})")
-            elif getattr(cfg, "onset_method", "") == "consensus":
+            elif getattr(cfg, "onset_method", "") == "methods_median":
                 # Consensus reports a median but keeps no breakdown unless
                 # agreement is on. Saying so beats writing nothing silently.
                 log_callback(
@@ -2687,7 +2870,8 @@ def run_pipeline(input_path,
 
     # ── Stage 10: Write outputs ───────────────────────────────────────────────
     pipeline_write_outputs(latency_manual,
-                           results_out, _bids_prefix)
+                           results_out, _bids_prefix,
+                           channel_label=channel_label)
 
     # ── Write _trials.json sidecar ────────────────────────────────────────────
     # This is the file Stage 2 scans for. It must be written alongside

@@ -126,6 +126,19 @@ def _resolve_path(file_path: str) -> str:
 # Format detection
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Formats recognised by name but not readable, so the reason can be given
+# rather than left as a parse failure in an unrelated reader.
+UNREADABLE_FORMATS = {
+    ".adicht": ("ADInstruments LabChart native format. Export the recording "
+                "from LabChart as text (File → Export) or as an ADInstruments "
+                "binary (.adibin), both of which this tool reads."),
+    ".adidat": ("ADInstruments LabChart data file. Export as text or .adibin."),
+    ".cfs":    ("CED Signal/CFS format. Export from Signal as a Spike2 (.smr) "
+                "file or as text."),
+    ".s2r":    ("Spike2 resource file, not a recording. Open the .smr instead."),
+}
+
+
 # Extensions any reader in this package can open.
 #
 # Kept here rather than restated at each call site: the filter preview carried
@@ -196,6 +209,22 @@ def detect_format(file_path: str) -> str:
     # MNE is actually installed.
     if _mne_bridge.is_mne_readable(file_path):
         return 'mne'
+
+    # A binary file that matched no magic above is not a text export, and
+    # calling it one produces a parse error somewhere downstream that names the
+    # wrong format. Say what it is instead.
+    #
+    # ADInstruments' native .adicht falls here: the tool reads their CFWB
+    # binary (.adibin) and their text export, but not the native format, which
+    # needs a vendor library. Someone handed a .adicht previously saw a Spike2
+    # error and no indication that the format was simply not supported.
+    try:
+        with open(file_path, 'rb') as _fh:
+            _head = _fh.read(4096)
+        if b'\x00' in _head:
+            return 'unsupported_binary'
+    except Exception:
+        pass
 
     with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
         first_line = f.readline()
@@ -532,3 +561,102 @@ def probe_fs_and_unit(file_path: str, channel_idx: int = 0):
     wave, fs, unit = extract_emg_waveform_and_fs(file_path, channel_idx)
     del wave
     return (int(fs) if fs else None), unit
+
+
+# ── Event sources ────────────────────────────────────────────────────────────
+
+def list_event_sources(file_path: str) -> dict:
+    """What this file can supply events from.
+
+    Returns ``{"embedded": [names], "analogue": [names]}``.
+
+    ``embedded`` are the file's own events -- comments, markers, annotations,
+    event channels -- named as that format names them. ``analogue`` are the
+    waveform channels, any of which can carry a trigger to threshold.
+
+    Neither list is a promise that events exist, only that the file can be
+    asked. An empty embedded list on a format that has no notion of markers is
+    the normal answer, not a failure.
+    """
+    out = {"embedded": [], "analogue": []}
+    try:
+        out["analogue"] = list(list_waveform_channels(file_path) or [])
+    except Exception:
+        pass
+    try:
+        out["embedded"] = list(list_event_channels(file_path) or [])
+    except Exception:
+        pass
+    if not out["embedded"]:
+        # Formats without a channel list still name their events by the labels
+        # they return; asking costs a read but is the only way to know.
+        try:
+            out["embedded"] = sorted(extract_stim_times(file_path, "") or {})
+        except Exception:
+            pass
+    return out
+
+
+def extract_events(file_path: str, sources, channel_names=None):
+    """Stimulus times from an explicit list of sources.
+
+    Returns ``(events, warnings)`` where ``events`` is
+    ``{stim_type: [t_seconds]}``.
+
+    ``extract_stim_times`` is unchanged and is what an embedded source calls.
+    Building on it rather than replacing it means no existing path runs through
+    new code: a file configured the way every file is configured today produces
+    a byte-identical result, and the round-trip tests hold that.
+
+    Threshold and interval sources are format-independent -- they need a
+    waveform and a time base, which every reader already provides -- so the
+    detection itself lives in mep_cmap.event_sources and is written once.
+    """
+    from .event_sources import (EventSource, detect_threshold_crossings,
+                                generate_interval_events, merge_event_sources)
+
+    if not sources:
+        return dict(extract_stim_times(file_path, "") or {}), []
+
+    names = list(channel_names or [])
+    if not names:
+        try:
+            names = list(list_waveform_channels(file_path) or [])
+        except Exception:
+            names = []
+
+    def _channel_index(label):
+        if label in names:
+            return names.index(label)
+        raise ValueError(
+            f"channel {label!r} is not in this file "
+            f"({', '.join(names) if names else 'no channels listed'})")
+
+    per_source = []
+    for src in sources:
+        if not isinstance(src, EventSource):
+            src = EventSource.from_dict(src)
+
+        if src.kind == "embedded":
+            got = dict(extract_stim_times(file_path, src.channel) or {})
+            if src.codes:
+                got = {k: v for k, v in got.items() if k in src.codes}
+
+        elif src.kind == "threshold":
+            wave, fs, _unit = extract_emg_waveform_and_fs(
+                file_path, _channel_index(src.channel))
+            got = {src.label: detect_threshold_crossings(
+                wave, float(fs), src.level, src.edge, src.refractory_ms)}
+
+        else:  # interval
+            # The recording length bounds the events; the first channel is read
+            # only for its length, and the array is discarded immediately.
+            wave, fs, _unit = extract_emg_waveform_and_fs(file_path, 0)
+            duration = len(wave) / float(fs)
+            del wave
+            got = {src.label: generate_interval_events(
+                src.start_s, src.period_s, src.count, duration)}
+
+        per_source.append((src.describe(), got))
+
+    return merge_event_sources(per_source)

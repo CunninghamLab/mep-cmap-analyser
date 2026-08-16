@@ -357,3 +357,50 @@ def test_editing_after_confirmation_un_confirms_that_channel():
 def test_a_new_file_clears_confirmations():
     body = _method("_reset_state_for_new_file")
     assert "self._chan_confirmed = set()" in body
+
+
+def test_there_is_only_one_place_a_session_payload_is_built():
+    """
+    There were two, and they drifted. The manual save carried thirteen fewer
+    settings than the automatic one -- latency_map, both latency dropdowns, the
+    onset method and every onset detector parameter -- so a manually saved
+    session came back without the latency profiles and with the detector reset.
+
+    Nothing announced it: the file loaded and most settings were right.
+
+    The earlier version of this test asserted that BOTH writers carried the
+    per-channel keys, which treated the duplication as a fact to work around
+    rather than the fault itself. One builder cannot drift from itself.
+    """
+    import re
+
+    assert "def _session_payload(self" in APP
+    # The only place a session dict is assembled is inside the builder itself.
+    a = APP.index("def _session_payload(self")
+    b = APP.index("\n    def ", a + 10)
+    outside = APP[:a] + APP[b:]
+    builders = re.findall(r'^\s*session\s*=\s*\{', outside, re.M)
+    assert not builders, (
+        f"{len(builders)} session dictionary/ies are still built outside "
+        f"_session_payload; they will drift from it"
+    )
+    assert APP.count("self._session_payload(") >= 2, (
+        "both the automatic and the manual save should use the builder"
+    )
+
+
+def test_the_single_builder_carries_the_per_channel_state():
+    a = APP.index("def _session_payload(self")
+    b = APP.index("\n    def ", a + 10)
+    body = APP[a:b]
+    for key in ('"chan_settings"', '"chan_segment_meta"', '"chan_confirmed"',
+                '"analyse_channels"', '"latency_map"', '"latency_stim_map"',
+                '"latency_muscle_map"'):
+        assert key in body, f"{key} is missing from the session payload"
+
+
+def test_the_confirmation_state_and_selection_survive_a_reload():
+    assert '"chan_confirmed"' in APP
+    assert '"analyse_channels"' in APP
+    assert 'sess.get("chan_confirmed")' in APP
+    assert 'sess.get("analyse_channels")' in APP

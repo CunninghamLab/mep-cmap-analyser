@@ -72,7 +72,7 @@ from .dataset_session import (DatasetSession, FileEntry,
 from .io import (list_waveform_channels, extract_emg_waveform_and_fs,
                  extract_stim_times, detect_format, needs_wizard,
                  list_event_channels, probe_fs_and_unit,
-                 SUPPORTED_EXTENSIONS)
+                 SUPPORTED_EXTENSIONS, UNREADABLE_FORMATS)
 from .format_wizard import FormatWizard
 from .filters import adaptive_mains_cancel
 from .detection import detect_mep_onset_peak_fraction
@@ -1952,6 +1952,144 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
 
 
 
+    def _session_payload(self, fp, sm, meta_s, save_dir, _j):
+        """The complete session dictionary, built in ONE place.
+
+        There are two ways to save a session -- the automatic write after the
+        Data Inspector closes, and File -> Save session -- and each built its
+        own payload. They drifted: the manual one carried thirteen fewer
+        settings, among them latency_map and both latency dropdowns, so a
+        manually saved session came back without the latency profiles and
+        with the onset method reset to its default.
+
+        Nothing announced it. The file loaded, most settings were right, and
+        the profiles quietly reverted.
+
+        Both callers use this now, so a key added for one is present in the
+        other by construction rather than by remembering.
+
+        ``save_dir`` and ``_j`` come from the caller: paths are stored relative
+        to wherever the session is being written, and the two writers use
+        different JSON coercers.
+        """
+        s = {
+            "pre_ms":                self.pre_time.get(),
+            "post_ms":               self.post_time.get(),
+            "ptp_start":             self.ptp_start.get(),
+            "ptp_end":               self.ptp_end.get(),
+            "prestim_ms":            self.prestim_ms.get(),
+            "apply_filter":          self.apply_filter.get(),
+            "apply_bandpass":        self.apply_bandpass.get(),
+            "apply_notch":           self.apply_notch.get(),
+            "highpass":              self.highpass.get(),
+            "lowpass":               self.lowpass.get(),
+            "notch_freq":            self.notch_freq.get(),
+            "notch_q":               self.notch_q.get(),
+            "filter_order":          self.filter_order.get(),
+            "filter_family":         self.filter_family.get(),
+            "cheby_ripple":          self.cheby_ripple.get(),
+            "use_advanced_bp":       self.use_advanced_bp.get(),
+            "hp_order":              self.hp_order_var.get(),
+            "lp_order":              self.lp_order_var.get(),
+            "filter_harmonics":      self.filter_harmonics.get(),
+            "apply_humbug":          self.apply_humbug.get(),
+            "humbug_harmonics":      self.humbug_harmonics.get(),
+            "outlier_review":        self.outlier_review.get(),
+            "outlier_threshold":     self.outlier_threshold.get(),
+            "onset_peak_fraction":   self.onset_peak_fraction.get(),
+            "onset_min_amplitude":   self.onset_min_amplitude.get(),
+            "onset_slope_threshold": self.onset_slope_threshold.get(),
+            "onset_method":          self.onset_method.get(),
+            "onset_bootstrap_crit":  self.onset_bootstrap_crit.get(),
+            "onset_bootstrap_n":     self.onset_bootstrap_n.get(),
+            "onset_bigoni_smooth_ms":   self.onset_bigoni_smooth_ms.get(),
+            "onset_bigoni_min_run_ms":  self.onset_bigoni_min_run_ms.get(),
+            "onset_bigoni_walkback_sd": self.onset_bigoni_walkback_sd.get(),
+            "onset_anchor":          self.onset_anchor.get(),
+            "onset_anchor_halfwidth": self.onset_anchor_halfwidth.get(),
+            "enable_inspector":      self.enable_inspector.get(),
+            "average_mode":          self.average_mode.get(),
+            "generate_individual_plots": self.generate_individual_plots.get(),
+            "enable_auc_global":     self.enable_auc_global.get(),
+            "csp_search_start_ms":   self.csp_search_start_ms.get(),
+            "csp_search_end_ms":     self.csp_search_end_ms.get(),
+            "csp_min_silence_ms":    self.csp_min_silence_ms.get(),
+            "csp_criterion":         self.csp_criterion.get(),
+            "csp_significance":      self.csp_significance.get(),
+            "csp_min_return_ms":     self.csp_min_return_ms.get(),
+            "csp_n_boot":            self.csp_n_boot.get(),
+            "csp_max_mep_offset_ms": self.csp_max_mep_offset_ms.get(),
+            "csp_types":             list(self.csp_types),
+            "wide_window_s":         self.wide_window_s.get(),
+            "latency_map":           {k: list(v) for k, v in self.latency_map.items()},
+            "latency_stim_map":      dict(self.latency_stim_map),
+            "latency_muscle_map":    dict(self.latency_muscle_map),
+        }
+        # ── Compute study root for relative path storage ──────────────────
+        # The JSON lives at:  <study_root>/derivatives/<sub>/<ses>/<name>.json
+        # Walk up 3 levels from save_dir to get study_root.
+        # Paths stored as relative to study_root so the file is portable
+        # across computers (OneDrive, different user home folders, etc.).
+        _json_deriv_dir = save_dir
+        _study_root_for_json = os.path.dirname(
+            os.path.dirname(os.path.dirname(_json_deriv_dir)))
+
+        def _rel(p):
+            """Store p relative to study root; fall back to basename if outside."""
+            if not p:
+                return p
+            try:
+                rel = os.path.relpath(p, _study_root_for_json)
+                return rel if not rel.startswith("..") else os.path.basename(p)
+            except ValueError:
+                return os.path.basename(p)
+
+        session = {
+            "version":          "1.0",
+            "saved_at":         datetime.datetime.now().isoformat(timespec="seconds"),
+            "autosaved":        True,   # flag so user knows this wasn't a manual save
+            "file_path":        _rel(fp),
+            "marker_choice":    self.marker_choice.get(),
+            "channel_idx":      self.channel_idx,
+            "channel_choice":   self.channel_choice.get(),
+            # Per-channel 1a setup. Sets are serialised as lists, since
+            # JSON has no set type; _restore_chan_settings converts back.
+            "chan_settings":    {
+                str(k): {kk: (sorted(vv) if isinstance(vv, set) else vv)
+                         for kk, vv in v.items()}
+                for k, v in self._chan_settings.items()},
+            "crop_ranges":      self.crop_ranges,
+            "crop_start":       self.crop_start,
+            "crop_end":         self.crop_end,
+            "label_map":        self.label_map,
+            "color_map":        self.color_map,
+            "plot_included":    self.plot_included,
+            "gap_ms_map":       self.gap_ms_map,
+            "reference_map":    self.reference_map,
+            "reference_display": getattr(self, '_reference_display', {}),
+            "latency_map":      {k: list(v) for k, v in self.latency_map.items()},
+            "latency_stim_map":   dict(self.latency_stim_map),
+            "latency_muscle_map": dict(self.latency_muscle_map),
+            "mmax_file":        _rel(self.mmax_file.get()),
+            "plateau_tolerance":self.plateau_tolerance.get(),
+            "extra_channel_indices": self.extra_channel_indices,
+            "wide_window_s":    self.wide_window_s.get(),
+            "derivatives_path": _rel(self.derivatives_path.get()
+                                     if hasattr(self, "derivatives_path") else ""),
+            "study_metadata":   sm,
+            "settings":         s,
+            "segments_metadata": meta_s,
+            # Per-channel marker edits. The flat map above is kept for
+            # readers that predate this and holds the current channel's.
+            "chan_segment_meta": {
+                str(_c): {f"{st}:{i}": {k: _j(v) for k, v in m.items()}
+                          for (st, i), m in _mm.items()}
+                for _c, _mm in self._chan_segment_meta.items()},
+            "chan_confirmed": sorted(self._chan_confirmed),
+            "analyse_channels": sorted(self.analyse_channels),
+        }
+        return session
+
     def _autosave_session(self):
         """Silently save the session to the BIDS derivatives folder.
 
@@ -2010,120 +2148,8 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                 try: sm = _ad(meta)
                 except Exception: pass
 
-            s = {
-                "pre_ms":                self.pre_time.get(),
-                "post_ms":               self.post_time.get(),
-                "ptp_start":             self.ptp_start.get(),
-                "ptp_end":               self.ptp_end.get(),
-                "prestim_ms":            self.prestim_ms.get(),
-                "apply_filter":          self.apply_filter.get(),
-                "apply_bandpass":        self.apply_bandpass.get(),
-                "apply_notch":           self.apply_notch.get(),
-                "highpass":              self.highpass.get(),
-                "lowpass":               self.lowpass.get(),
-                "notch_freq":            self.notch_freq.get(),
-                "notch_q":               self.notch_q.get(),
-                "filter_order":          self.filter_order.get(),
-                "filter_family":         self.filter_family.get(),
-                "cheby_ripple":          self.cheby_ripple.get(),
-                "use_advanced_bp":       self.use_advanced_bp.get(),
-                "hp_order":              self.hp_order_var.get(),
-                "lp_order":              self.lp_order_var.get(),
-                "filter_harmonics":      self.filter_harmonics.get(),
-                "apply_humbug":          self.apply_humbug.get(),
-                "humbug_harmonics":      self.humbug_harmonics.get(),
-                "outlier_review":        self.outlier_review.get(),
-                "outlier_threshold":     self.outlier_threshold.get(),
-                "onset_peak_fraction":   self.onset_peak_fraction.get(),
-                "onset_min_amplitude":   self.onset_min_amplitude.get(),
-                "onset_slope_threshold": self.onset_slope_threshold.get(),
-                "onset_method":          self.onset_method.get(),
-                "onset_bootstrap_crit":  self.onset_bootstrap_crit.get(),
-                "onset_bootstrap_n":     self.onset_bootstrap_n.get(),
-                "onset_bigoni_smooth_ms":   self.onset_bigoni_smooth_ms.get(),
-                "onset_bigoni_min_run_ms":  self.onset_bigoni_min_run_ms.get(),
-                "onset_bigoni_walkback_sd": self.onset_bigoni_walkback_sd.get(),
-                "onset_anchor":          self.onset_anchor.get(),
-                "onset_anchor_halfwidth": self.onset_anchor_halfwidth.get(),
-                "enable_inspector":      self.enable_inspector.get(),
-                "average_mode":          self.average_mode.get(),
-                "generate_individual_plots": self.generate_individual_plots.get(),
-                "enable_auc_global":     self.enable_auc_global.get(),
-                "csp_search_start_ms":   self.csp_search_start_ms.get(),
-                "csp_search_end_ms":     self.csp_search_end_ms.get(),
-                "csp_min_silence_ms":    self.csp_min_silence_ms.get(),
-                "csp_criterion":         self.csp_criterion.get(),
-                "csp_significance":      self.csp_significance.get(),
-                "csp_min_return_ms":     self.csp_min_return_ms.get(),
-                "csp_n_boot":            self.csp_n_boot.get(),
-                "csp_max_mep_offset_ms": self.csp_max_mep_offset_ms.get(),
-                "csp_types":             list(self.csp_types),
-                "wide_window_s":         self.wide_window_s.get(),
-                "latency_map":           {k: list(v) for k, v in self.latency_map.items()},
-                "latency_stim_map":      dict(self.latency_stim_map),
-                "latency_muscle_map":    dict(self.latency_muscle_map),
-            }
-            # ── Compute study root for relative path storage ──────────────────
-            # The JSON lives at:  <study_root>/derivatives/<sub>/<ses>/<name>.json
-            # Walk up 3 levels from save_dir to get study_root.
-            # Paths stored as relative to study_root so the file is portable
-            # across computers (OneDrive, different user home folders, etc.).
-            _json_deriv_dir = save_dir
-            _study_root_for_json = os.path.dirname(
-                os.path.dirname(os.path.dirname(_json_deriv_dir)))
-
-            def _rel(p):
-                """Store p relative to study root; fall back to basename if outside."""
-                if not p:
-                    return p
-                try:
-                    rel = os.path.relpath(p, _study_root_for_json)
-                    return rel if not rel.startswith("..") else os.path.basename(p)
-                except ValueError:
-                    return os.path.basename(p)
-
-            session = {
-                "version":          "1.0",
-                "saved_at":         datetime.datetime.now().isoformat(timespec="seconds"),
-                "autosaved":        True,   # flag so user knows this wasn't a manual save
-                "file_path":        _rel(fp),
-                "marker_choice":    self.marker_choice.get(),
-                "channel_idx":      self.channel_idx,
-                "channel_choice":   self.channel_choice.get(),
-                # Per-channel 1a setup. Sets are serialised as lists, since
-                # JSON has no set type; _restore_chan_settings converts back.
-                "chan_settings":    {
-                    str(k): {kk: (sorted(vv) if isinstance(vv, set) else vv)
-                             for kk, vv in v.items()}
-                    for k, v in self._chan_settings.items()},
-                "crop_ranges":      self.crop_ranges,
-                "crop_start":       self.crop_start,
-                "crop_end":         self.crop_end,
-                "label_map":        self.label_map,
-                "color_map":        self.color_map,
-                "plot_included":    self.plot_included,
-                "gap_ms_map":       self.gap_ms_map,
-                "reference_map":    self.reference_map,
-                "reference_display": getattr(self, '_reference_display', {}),
-                "latency_map":      {k: list(v) for k, v in self.latency_map.items()},
-                "latency_stim_map":   dict(self.latency_stim_map),
-                "latency_muscle_map": dict(self.latency_muscle_map),
-                "mmax_file":        _rel(self.mmax_file.get()),
-                "plateau_tolerance":self.plateau_tolerance.get(),
-                "extra_channel_indices": self.extra_channel_indices,
-                "wide_window_s":    self.wide_window_s.get(),
-                "derivatives_path": _rel(self.derivatives_path.get()
-                                         if hasattr(self, "derivatives_path") else ""),
-                "study_metadata":   sm,
-                "settings":         s,
-                "segments_metadata": meta_s,
-                # Per-channel marker edits. The flat map above is kept for
-                # readers that predate this and holds the current channel's.
-                "chan_segment_meta": {
-                    str(_c): {f"{st}:{i}": {k: _j(v) for k, v in m.items()}
-                              for (st, i), m in _mm.items()}
-                    for _c, _mm in self._chan_segment_meta.items()},
-            }
+            session = self._session_payload(fp, sm, meta_s,
+                                            save_dir, _j)
 
             with open(save_path, "w", encoding="utf-8") as f:
                 json.dump(session, f, indent=2)
@@ -2165,39 +2191,13 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             try:
                 from dataclasses import asdict as _ad; sm=_ad(self.study_metadata)
             except Exception: pass
-        s = {"pre_ms":self.pre_time.get(),"post_ms":self.post_time.get(),
-             "ptp_start":self.ptp_start.get(),"ptp_end":self.ptp_end.get(),
-             "prestim_ms":self.prestim_ms.get(),"apply_filter":self.apply_filter.get(),
-             "apply_bandpass":self.apply_bandpass.get(),"apply_notch":self.apply_notch.get(),
-             "highpass":self.highpass.get(),"lowpass":self.lowpass.get(),
-             "notch_freq":self.notch_freq.get(),"notch_q":self.notch_q.get(),
-             "filter_order":self.filter_order.get(),"filter_family":self.filter_family.get(),
-             "cheby_ripple":self.cheby_ripple.get(),"use_advanced_bp":self.use_advanced_bp.get(),
-             "hp_order":self.hp_order_var.get(),"lp_order":self.lp_order_var.get(),
-             "filter_harmonics":self.filter_harmonics.get(),"apply_humbug":self.apply_humbug.get(),
-             "humbug_harmonics":self.humbug_harmonics.get(),"outlier_review":self.outlier_review.get(),
-             "outlier_threshold":self.outlier_threshold.get(),
-             "onset_peak_fraction":self.onset_peak_fraction.get(),
-             "onset_min_amplitude":self.onset_min_amplitude.get(),
-             "onset_slope_threshold":self.onset_slope_threshold.get(),
-             "enable_inspector":self.enable_inspector.get(),"average_mode":self.average_mode.get(),"generate_individual_plots":self.generate_individual_plots.get(),
-             "csp_search_start_ms":self.csp_search_start_ms.get(),
-             "csp_search_end_ms":self.csp_search_end_ms.get(),
-             "csp_min_silence_ms":self.csp_min_silence_ms.get(),
-             "csp_criterion":self.csp_criterion.get(),
-             "csp_significance":self.csp_significance.get(),
-             "csp_min_return_ms":self.csp_min_return_ms.get(),
-             "csp_n_boot":self.csp_n_boot.get(),
-             "csp_max_mep_offset_ms":self.csp_max_mep_offset_ms.get(),
-             "csp_types":list(self.csp_types)}
-        session={"version":"1.0","saved_at":datetime.datetime.now().isoformat(timespec="seconds"),
-                 "file_path":fp,"marker_choice":self.marker_choice.get(),
-                 "channel_idx":self.channel_idx,"channel_choice":self.channel_choice.get(),
-                 "crop_ranges":self.crop_ranges,"crop_start":self.crop_start,"crop_end":self.crop_end,
-                 "label_map":self.label_map,"color_map":self.color_map,
-                 "plot_included":self.plot_included,"gap_ms_map":self.gap_ms_map,
-                 "derivatives_path":self.derivatives_path.get() if hasattr(self,"derivatives_path") else "",
-                 "study_metadata":sm,"settings":s,"segments_metadata":meta_s}
+        # The settings dict this function used to build is gone: it was a
+        # second, shorter copy of the one in _session_payload, and keeping it
+        # is what let the two drift.
+        # Built by the same method as the automatic save. The two payloads
+        # were assembled separately and drifted, so a manually saved session
+        # lost the latency profiles and the onset method.
+        session = self._session_payload(fp, sm, meta_s, os.path.dirname(sp), _j)
         try:
             with open(sp,"w",encoding="utf-8") as f: json.dump(session,f,indent=2)
             self.log(f"\U0001f4be Session saved \u2192 {os.path.basename(sp)}")
@@ -2361,6 +2361,8 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         # the time, so they are restored as the current channel's and left out
         # of every other one -- applying them to a second channel is what
         # produced negative peak-to-peak values.
+        self._chan_confirmed = set(sess.get("chan_confirmed") or [])
+        self.analyse_channels = set(sess.get("analyse_channels") or [])
         _per_chan = sess.get("chan_segment_meta")
         self._chan_segment_meta = {}
         if _per_chan:
@@ -2617,6 +2619,16 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         │                             │ outlier settings                  │
         └─────────────────────────────────────────────────────────────────┘
         """
+        # ── 0a. Inspector edits belong to the file that was open ──────────────
+        #
+        # Cleared HERE rather than at each place a file is loaded. It used to
+        # be done in _load_file_entry and browse_file separately, so a third
+        # load path would silently inherit the previous file's marker
+        # positions -- and adding the per-channel store meant finding and
+        # updating every one of those sites.
+        self.segments_metadata = {}
+        self._chan_segment_meta = {}
+
         # ── 0. Per-channel 1a setup is FILE-level, not session-level ──────────
         #
         # The store is keyed by channel INDEX, and an index means nothing
@@ -4883,6 +4895,22 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         # ── Detect file format and scan accordingly ───────────────────────────
         _fmt = detect_format(fpath)
 
+        # A binary file no reader recognises. Naming the format and the way out
+        # is far more use than the parse error from whichever reader was tried
+        # last: until now an unsupported file was assumed to be a Spike2 text
+        # export and failed with a message about Spike2.
+        if _fmt == "unsupported_binary":
+            _ext = os.path.splitext(fpath)[1].lower()
+            _why = UNREADABLE_FORMATS.get(
+                _ext,
+                "This file is not in a format the tool can read. The readable "
+                "formats are listed in File → Open.")
+            self.log(f"❌ Cannot read {os.path.basename(fpath)} — {_why}")
+            messagebox.showerror(
+                f"Unsupported file ({_ext or 'no extension'})", _why,
+                parent=self.root)
+            return
+
         # Report the sampling rate and amplitude unit as soon as the file is
         # opened.
         #
@@ -5042,8 +5070,19 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                     load_config   as _smr_load_cfg,
                     get_channel_info as _smr_info,
                 )
-                if not _smr_has_cfg(fpath):
-                    # First open — show channel assignment dialog
+                # Always ask, pre-filled with whatever was saved.
+                #
+                # The dialogue used to appear only when no sidecar existed, so
+                # after the first open the channel and marker choices became
+                # invisible and unchangeable -- the only way back was deleting
+                # the derivatives folder and the sidecars by hand. Those are
+                # the two decisions that determine what the whole analysis
+                # measures, and they should be in front of the analyst every
+                # time rather than remembered silently.
+                #
+                # Saved choices are pre-selected, so confirming is one click
+                # and the remembering still does its job.
+                if True:
                     info = _smr_info(fpath)
                     analogue = info.get("analogue", [])
                     events   = info.get("events",   [])
@@ -5089,7 +5128,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                             text=(
                                 f"File: {os.path.basename(fpath)}\n\n"
                                 "Choose the EMG channel and the stim/trigger source.\n"
-                                "Your choices are saved and will not be asked again."
+                                "Your choices are remembered and shown again next time."
                             ),
                             justify="left", padx=16, pady=10,
                         ).pack(anchor="w")
@@ -5132,9 +5171,21 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                             _sb.pack(side="right", fill="y")
                         else:
                             _inner = _chan_holder
+                        # Pre-tick what was chosen last time, if anything.
+                        _prev_sel = []
+                        try:
+                            if _smr_has_cfg(fpath):
+                                from .formats.spike2_smr import (
+                                    analysis_channels_from_config)
+                                _prev_sel, _ = analysis_channels_from_config(
+                                    _smr_load_cfg(fpath), _analogue)
+                        except Exception:
+                            _prev_sel = []
                         _chan_vars = {}
                         for _ci, _cn in enumerate(_analogue):
-                            _v = tk.BooleanVar(value=(_ci == 0))
+                            _v = tk.BooleanVar(
+                                value=(_cn in _prev_sel) if _prev_sel
+                                else (_ci == 0))
                             tk.Checkbutton(_inner, text=_cn, variable=_v,
                                            anchor="w").pack(fill="x")
                             _chan_vars[_cn] = _v
@@ -5146,11 +5197,29 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                             text="Stim/trigger channel:",
                             anchor="w", width=22,
                         ).grid(row=1, column=0, sticky="w", pady=6)
-                        _digmark_default = next(
-                            (o for o in _stim_options if "DigMark" in o),
-                            _stim_options[0]
-                        )
-                        stim_var = tk.StringVar(value=_digmark_default)
+                        # Preselect the saved trigger source; fall back to
+                        # DigMark, then to the first option. Now that the
+                        # dialogue is shown every time, defaulting to DigMark
+                        # would quietly undo a deliberate choice of something
+                        # else on every reopen.
+                        _saved_stim = ""
+                        try:
+                            if _smr_has_cfg(fpath):
+                                _saved_stim = str(
+                                    _smr_load_cfg(fpath).get("stim_channel", ""))
+                        except Exception:
+                            _saved_stim = ""
+                        _stim_default = None
+                        if _saved_stim:
+                            _stim_default = next(
+                                (o for o in _stim_options
+                                 if o == _saved_stim or o.endswith("] " + _saved_stim)),
+                                None)
+                        if _stim_default is None:
+                            _stim_default = next(
+                                (o for o in _stim_options if "DigMark" in o),
+                                _stim_options[0])
+                        stim_var = tk.StringVar(value=_stim_default)
                         ttk.Combobox(
                             frm, textvariable=stim_var,
                             values=_stim_options, state="readonly", width=30,
@@ -5398,8 +5467,8 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                     dlg,
                     text=(
                         f"File: {os.path.basename(fpath)}\n\n"
-                        "Choose the EMG channel and the event/marker source.\n"
-                        "Your choices are saved and will not be asked again."
+                        "Choose the EMG channel(s) to analyse and the event/marker source.\n"
+                        "Your choices are remembered and shown again next time."
                     ),
                     justify="left",
                 ).pack(anchor="w", padx=16, pady=(12, 6))
@@ -5407,12 +5476,46 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                 frm = _tk.Frame(dlg, padx=16, pady=8)
                 frm.pack(fill="x")
 
-                # EMG channel row (only show if >1 channel)
+                # EMG channels — the same tick list the Spike2 dialogue uses.
+                #
+                # Multi-channel analysis is not a Spike2 feature, so the way
+                # into it must not be either. This dialogue serves LabChart
+                # MATLAB, BrainVision, EDF, AcqKnowledge, epoched MATLAB and
+                # Brainsight, and offering a single choice here made the
+                # capability reachable for one format out of ten.
                 emg_var = _tk.StringVar(value=chan_list[0] if chan_list else "")
+                _chan_vars = {}
                 if len(_chan_list) > 1:
-                    _tk.Label(frm, text="EMG channel:", anchor="w", width=22)                        .grid(row=0, column=0, sticky="w", pady=6)
-                    _ttk.Combobox(frm, textvariable=emg_var,
-                                  values=_chan_list, state="readonly", width=28)                        .grid(row=0, column=1, sticky="w")
+                    _tk.Label(frm, text="EMG channels:", anchor="nw",
+                              width=22).grid(row=0, column=0, sticky="nw",
+                                             pady=6)
+                    _holder = _tk.Frame(frm)
+                    _holder.grid(row=0, column=1, sticky="w")
+                    if len(_chan_list) > 10:
+                        _cv = _tk.Canvas(_holder, height=220, width=280,
+                                         highlightthickness=0)
+                        _sb = _ttk.Scrollbar(_holder, orient="vertical",
+                                             command=_cv.yview)
+                        _in = _tk.Frame(_cv)
+                        _in.bind("<Configure>", lambda e: _cv.configure(
+                            scrollregion=_cv.bbox("all")))
+                        _cv.create_window((0, 0), window=_in, anchor="nw")
+                        _cv.configure(yscrollcommand=_sb.set)
+                        _cv.pack(side="left", fill="both", expand=True)
+                        _sb.pack(side="right", fill="y")
+                    else:
+                        _in = _holder
+                    # Pre-tick the previous selection where there is one.
+                    _prev = {_chan_list[i] for i in
+                             (self.analyse_channels or set())
+                             if i < len(_chan_list)}
+                    for _ci, _cn in enumerate(_chan_list):
+                        _v = _tk.BooleanVar(
+                            value=(_cn in _prev) if _prev
+                            else (_ci == self.channel_idx))
+                        _tk.Checkbutton(_in, text=_cn, variable=_v,
+                                        anchor="w").pack(fill="x")
+                        _chan_vars[_cn] = _v
 
                 # Event marker row (only show if >1 marker)
                 _cur_marker = self.marker_choice.get()
@@ -5433,7 +5536,18 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                 ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
                 def _save():
-                    _chosen["emg"]  = emg_var.get()
+                    if _chan_vars:
+                        picked = [c for c in _chan_list if _chan_vars[c].get()]
+                        if not picked:
+                            messagebox.showwarning(
+                                "No channel selected",
+                                "Tick at least one EMG channel to analyse.",
+                                parent=dlg)
+                            return
+                        _chosen["emg"]      = picked[0]
+                        _chosen["channels"] = picked
+                    else:
+                        _chosen["emg"] = emg_var.get()
                     _chosen["stim"] = stim_var.get()
                     dlg.destroy()
 
@@ -5459,6 +5573,15 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             if _chosen.get("emg") and _chosen["emg"] in chan_list:
                 self.channel_var.set(_chosen["emg"])
                 self.channel_idx = chan_list.index(_chosen["emg"])
+                _picked = _chosen.get("channels") or [_chosen["emg"]]
+                self.analyse_channels = {chan_list.index(c) for c in _picked
+                                         if c in chan_list}
+                if len(self.analyse_channels) > 1:
+                    self.log(f"   Channels to analyse: {', '.join(_picked)}")
+                try:
+                    self._refresh_analyse_button()
+                except Exception:
+                    pass
             if _chosen.get("stim"):
                 self.marker_choice.set(_chosen["stim"])
                 self.available_markers = markers

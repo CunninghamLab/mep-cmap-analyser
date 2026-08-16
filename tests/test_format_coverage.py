@@ -140,9 +140,15 @@ def _load_chain_formats():
 
 # ── 1. Workflow coverage ──────────────────────────────────────────────────────
 
+# Not a format: a sentinel meaning "no reader recognises this file". It has no
+# load branch by design -- the load stops and says so, rather than continuing
+# into a reader that cannot help.
+SENTINEL_FORMATS = {"unsupported_binary"}
+
+
 def test_detect_format_returns_known_set():
     """Guard the guard: if this list changes, the tests below must be reviewed."""
-    assert _detectable_formats() == {
+    assert _detectable_formats() - SENTINEL_FORMATS == {
         "spike2", "spike2_smr", "labchart", "labchart_mat", "cfwb",
         "generic_tsv", "edf", "brainvision", "brainsight",
         "acqknowledge_acq", "acqknowledge_mat", "mne",
@@ -150,12 +156,26 @@ def test_detect_format_returns_known_set():
     }
 
 
+def test_the_unsupported_sentinel_stops_the_load():
+    """
+    It must not simply lack a branch -- that is the silent stall this file
+    exists to prevent. It needs an explicit branch that reports and returns.
+    """
+    import pathlib as _pl
+
+    src = (_pl.Path(__file__).resolve().parent.parent
+           / "mep_cmap" / "app.py").read_text(encoding="utf-8")
+    a = src.index('if _fmt == "unsupported_binary":')
+    b = src.index("if _fmt == 'generic_tsv'", a)
+    assert "return" in src[a:b]
+
+
 def test_every_format_has_load_branch():
     """
     Every format detect_format() can return must be handled explicitly in
     _browse_file_path().  A missing branch stalls the GUI silently.
     """
-    detectable = _detectable_formats()
+    detectable = _detectable_formats() - SENTINEL_FORMATS
     handled = _load_chain_formats()
     missing = detectable - handled
     assert not missing, (

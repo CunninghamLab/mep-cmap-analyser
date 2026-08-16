@@ -417,6 +417,46 @@ def test_navigation_is_guarded_against_a_destroyed_window():
         )
 
 
+def test_the_guard_checks_the_widgets_the_redraw_touches():
+    """
+    Checking the Toplevel alone was not enough. It reported itself as existing
+    while a child had already been destroyed, and the redraw then failed on the
+    child:
+
+        _tkinter.TclError: invalid command name ".!toplevel3.!frame4.!scrolledtext"
+
+    Reasoning about how a parent outlives its child during Tk teardown would
+    need the exact answer to be right and would break again if it changed.
+    Checking the widgets actually used is correct whatever the mechanism.
+    """
+    a = SRC.index("def _closed(self)")
+    b = SRC.index("\n    def ", a + 10)
+    body = SRC[a:b]
+    assert "note_box" in body, "the widget that failed is not checked"
+    assert "_widget_alive" in body
+
+
+def test_the_guard_is_not_given_a_non_tk_object():
+    """
+    self.canvas is a FigureCanvasTkAgg and has no winfo_exists. Passing one to
+    _widget_alive would raise, be caught, and report the window as dead --
+    permanently, on every redraw, disabling the Inspector entirely.
+    """
+    a = SRC.index("def _closed(self)")
+    b = SRC.index("\n    def ", a + 10)
+    assert "self.canvas" not in SRC[a:b], (
+        "a matplotlib canvas is not a Tk widget; use get_tk_widget()"
+    )
+    doc = SRC[SRC.index("def _widget_alive"):SRC.index("def _closed")]
+    assert "FigureCanvasTkAgg" in doc, "the constraint should be recorded"
+
+
+def test_the_note_box_write_is_guarded_at_the_point_of_use():
+    """Belt and braces: the specific call in the traceback."""
+    a = SRC.index('self.note_box.delete("1.0", "end")')
+    assert "_widget_alive(self.note_box)" in SRC[a - 200:a]
+
+
 def test_closing_sets_the_flag_before_anything_else():
     """
     winfo_exists() is still true while the close handler runs, so the flag has

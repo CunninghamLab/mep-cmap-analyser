@@ -162,3 +162,115 @@ def test_reassigning_explains_when_the_format_has_no_assignment():
     a = APP.index("def _reassign_channels")
     b = APP.index("\n    def ", a + 10)
     assert "Nothing to reassign" in APP[a:b]
+
+
+# ── The dialogue appears every time ──────────────────────────────────────────
+
+def test_the_dialogue_is_not_skipped_once_a_sidecar_exists():
+    """
+    It used to appear only when no sidecar existed, so after the first open the
+    channel and marker choices became invisible and unchangeable -- the only
+    way back was deleting the derivatives folder and the sidecars by hand.
+    Those two decisions determine what the whole analysis measures.
+    """
+    a = APP.index("# Always ask, pre-filled with whatever was saved.")
+    b = APP.index("info = _smr_info(fpath)", a)
+    assert "if not _smr_has_cfg(fpath):" not in APP[a:b], (
+        "the dialogue is still gated on the sidecar being absent"
+    )
+
+
+def test_saved_channels_are_preselected():
+    """Remembering still does its job; confirming is one click."""
+    a = APP.index("_prev_sel = []")
+    b = APP.index("_chan_vars = {}", a)
+    body = APP[a:b]
+    assert "analysis_channels_from_config" in body
+    assert "_smr_has_cfg(fpath)" in body
+
+
+def test_the_saved_trigger_source_is_preselected():
+    """
+    Now that the dialogue opens every time, defaulting to DigMark would quietly
+    undo a deliberate choice of something else on every reopen.
+    """
+    a = APP.index("_saved_stim = \"\"")
+    b = APP.index("stim_var = tk.StringVar(", a)
+    body = APP[a:b]
+    assert 'get("stim_channel"' in body
+    assert "DigMark" in body, "DigMark should remain the fallback"
+    assert body.index("_saved_stim") < body.index("DigMark"), (
+        "the saved value must be tried before the default"
+    )
+
+
+def test_the_wording_matches_the_behaviour():
+    assert "will not be asked again" not in APP, (
+        "the dialogue now appears every time; the note must say so"
+    )
+    assert "remembered and shown again next time" in APP
+
+
+# ── Both dialogues, not just the Spike2 one ──────────────────────────────────
+
+def _dialog_bodies():
+    """Source of each channel-assignment dialogue, by AST rather than offsets.
+
+    Both are nested functions of several hundred lines; slicing on a fixed
+    character window or a guessed end marker finds the wrong region and the
+    assertions then examine unrelated code.
+    """
+    import ast
+
+    lines = APP.splitlines(keepends=True)
+    starts = [0]
+    for ln in lines[:-1]:
+        starts.append(starts[-1] + len(ln))
+
+    out = []
+    tree = ast.parse(APP)
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.FunctionDef)
+                and node.name in ("_show_smr_dialog", "_show_assign_dlg")):
+            a = starts[node.lineno - 1]
+            b = starts[node.end_lineno - 1] + len(lines[node.end_lineno - 1])
+            out.append((node.name, APP[a:b]))
+    assert len(out) == 2, f"expected two dialogues, found {[n for n, _ in out]}"
+    return out
+
+
+def test_every_channel_dialogue_offers_a_tick_list():
+    """
+    Multi-channel analysis is not a Spike2 feature, so the way into it must not
+    be either. The generic dialogue serves LabChart MATLAB, BrainVision, EDF,
+    AcqKnowledge, epoched MATLAB and Brainsight; leaving it as a single choice
+    made the capability reachable for one format out of ten.
+    """
+    for name, body in _dialog_bodies():
+        assert "Checkbutton" in body, f"{name} still offers a single choice"
+        assert "_chan_vars" in body, f"{name} does not collect a set"
+
+
+def test_every_channel_dialogue_refuses_an_empty_selection():
+    for name, body in _dialog_bodies():
+        assert "showwarning" in body, f"{name} accepts no channels"
+
+
+def test_every_channel_dialogue_preselects_the_previous_choice():
+    """Otherwise reopening a file quietly resets it to the first channel."""
+    for name, body in _dialog_bodies():
+        assert ("_prev_sel" in body) or ("_prev" in body), \
+            f"{name} does not restore the previous selection"
+
+
+def test_the_generic_dialogue_populates_the_analysis_selection():
+    """
+    Anchored AFTER the generic dialogue: the same line appears in the Spike2
+    path, and searching from the start of the file finds that one instead.
+    """
+    a = APP.index("def _show_assign_dlg")
+    seg = APP[a:]
+    b = seg.index('_picked = _chosen.get("channels") or [_chosen["emg"]]')
+    block = seg[b:b + 600]
+    assert "self.analyse_channels = {" in block
+    assert "_refresh_analyse_button" in block

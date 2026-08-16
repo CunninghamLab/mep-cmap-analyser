@@ -760,6 +760,8 @@ class DataInspectorWindow:
             if not self.note_box_is_shown:
                 self.note_box.pack(fill="x", padx=10, pady=(4, 6))
                 self.note_box_is_shown = True
+            if not self._widget_alive(self.note_box):
+                return
             self.note_box.delete("1.0", "end")
             self.note_box.insert("1.0", note_txt)
             self.note_enable_var.set(True)
@@ -1348,22 +1350,49 @@ class DataInspectorWindow:
         ax_ex.grid(ls=":", lw=0.4)
         self.canvas.draw_idle()
   
+    def _widget_alive(self, w):
+        """Whether one Tk widget can still be used.
+
+        Only for real Tk widgets. A matplotlib FigureCanvasTkAgg has no
+        winfo_exists, so passing one here would raise, be caught, and report
+        the window as dead -- permanently, on every redraw. Use
+        canvas.get_tk_widget() if the drawing area itself ever needs checking.
+        """
+        try:
+            return bool(w is not None and w.winfo_exists())
+        except Exception:
+            return False
+
     def _closed(self):
-        """True once this window is gone, or on its way out.
+        """True once this window can no longer be drawn into.
 
         Tk delivers events that were already queued when a widget was
-        destroyed. A keyboard binding on the window -- Right or Left to step
-        through trials -- therefore fires once more after "Save edits & close",
-        and every widget the handler touches has been torn down. In a
-        multi-channel run two Inspectors open in succession, so the window
-        closes far more often and the race is easy to hit.
+        destroyed. A keyboard binding -- Left or Right to step through trials --
+        therefore fires once more after the window has gone, and every widget
+        the handler touches has been torn down. In a multi-channel run two
+        Inspectors open in succession, so this happens twice as often.
+
+        Checking the Toplevel alone was not enough. It reported itself as
+        existing while a child had already been destroyed, and the redraw then
+        failed on the child:
+
+            _tkinter.TclError: invalid command name
+            ".!toplevel3.!frame4.!scrolledtext"
+
+        Rather than reason about how a parent outlives its child in Tk's
+        teardown -- which would need the exact answer to be right, and would
+        break again if it changed -- this checks the widgets the redraw
+        actually touches. A window missing any of them cannot be drawn into,
+        whatever the reason.
         """
         if getattr(self, "_is_closing", False):
             return True
-        try:
-            return not self.top.winfo_exists()
-        except Exception:
-            return True
+        for w in (getattr(self, "top", None), getattr(self, "note_box", None)):
+            if w is None:
+                continue
+            if not self._widget_alive(w):
+                return True
+        return False
 
     def _close_and_save(self):
         """Save all pending edits including note, then close."""

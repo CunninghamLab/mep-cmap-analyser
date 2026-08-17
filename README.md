@@ -1,6 +1,6 @@
 # MEP-CMAP Analyser
 
-**Version 1.3.4 | August 2026**  
+**Version 1.4.0 | August 2026**  
 *Author:* [*Justin Andrushko PhD*](https://orcid.org/0000-0003-2258-1689)
 
 *Collaborators:* [*David Cunningham PhD*](https://fescenter.org/team/investigators/cunningham-david-phd/) *(*[*TMS Analysis ToolBox*](https://github.com/CunninghamLab/TMSAnalysisToolBox)*) ·* [*Nicholas Holmes PhD*](https://www.birmingham.ac.uk/staff/profiles/sportex/holmes-nick) *·* [*TMSMultiLab*](https://github.com/TMSMultiLab/TMSMultiLab/wiki)
@@ -31,7 +31,34 @@ The tool is not limited to any single measure or paradigm. It handles motor evok
 
 ---
 
-## What's New in 1.3.4
+## What's New in 1.4.0
+
+> **The epoch window moved.** Pre- and post-stimulus extents are now set per
+> stimulus type on tab 1a, not once for the file on tab 1c. A recording where
+> every type should share a window behaves as before; a file mixing an M-wave
+> with a cortical silent period no longer has to truncate one or carry
+> unnecessary samples through every trial of the other. Tab 1c keeps the
+> detectors' baseline, which genuinely is one setting for the recording.
+
+**Preview detection** — try the current detection settings on chosen trials
+before committing to a run. The preview reads its settings from the same
+snapshot the analysis takes and cuts trials with the same epoching and event
+delay, so what it shows is what the run will produce. The Data Inspector opens
+read-only: markers are drawn where the detector puts them but cannot be
+dragged, and nothing is saved.
+
+**CED Signal** recordings are read directly from Signal's MATLAB export. Frames
+are treated as pre-epoched trials and the frame state becomes the stimulus
+type.
+
+**Every column on tab 1a and field on tab 1c carries an explanation**, reached
+by hovering or clicking the ⓘ beside it. Hovering shows it; clicking pins it
+open.
+
+**Event sources reach the analysis.** They previously populated the labels tab
+and nothing else, so a configured threshold changed what was displayed while
+the run went on reading the file's own markers. They are held per channel and
+recorded in the derivative sidecar.
 
 > **Reprocess if you use MEP offset, duration, AUC, or any file whose event
 > markers are mistimed.** This release corrects three faults in offset detection
@@ -747,7 +774,7 @@ consensus. Note that its gates are stated in absolute derivatives, so heavily
 low-pass filtered data will defeat it, and that the search is bounded by the
 first peak so the onset can never precede it. Three details of the published
 implementation are corrected by default; see
-[What's New in 1.3.4](#whats-new-in-134) and the *Reproduce the published
+[What's New in 1.4.0](#whats-new-in-140) and the *Reproduce the published
 implementation literally* option.
 
 **Median across methods** — runs several detectors and reports the median of
@@ -1287,7 +1314,7 @@ The optional Rust extension `mep_cmap_io` provides accelerated I/O for the Spike
 
 If you use MEP-CMAP Analyser in published research, please cite:
 
-> Justin W. Andrushko. (2026). jandrushko/mep-cmap-analyser: MEP-CMAP Analyser (Version v1.3.4) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.21810844
+> Justin W. Andrushko. (2026). jandrushko/mep-cmap-analyser: MEP-CMAP Analyser (Version v1.4.0) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.21810844
 > https://github.com/jandrushko/mep-cmap-analyser
 
 ---

@@ -308,8 +308,23 @@ def _make_bids_prefix(meta_prefix, file_stem):
 
 
 def pipeline_load_file(file_path, channel_idx, marker_name,
-                       crop_ranges=None, crop_start=None, crop_end=None):
+                       crop_ranges=None, crop_start=None, crop_end=None,
+                       sources=None, channel_names=None, warn=None):
     """Load raw EMG, extract stim times, apply crop.
+
+    ``sources`` is a list of EventSource. When given, the stimuli come from
+    those rather than from the file's markers by name -- a threshold crossing
+    on a trigger channel, a filtered set of comments, or asserted timing.
+
+    They are re-derived here from the file rather than handed in already
+    resolved, for the same reason crop ranges are: a run should be reproducible
+    from the recording plus the configuration, not from whatever the interface
+    happened to be holding. Nothing is passed as timestamps that could be
+    recomputed from the file.
+
+    With no sources the marker path is untouched, so every file configured the
+    way files are configured today loads through exactly the code it always
+    did.
 
     Returns
     -------
@@ -321,7 +336,21 @@ def pipeline_load_file(file_path, channel_idx, marker_name,
     """
     emg, fs, unit = extract_emg_waveform_and_fs(file_path, channel_idx)
     time       = np.arange(len(emg)) / fs
-    stim_times = extract_stim_times(file_path, marker_name)
+    if sources:
+        from .io import extract_events
+        stim_times, _warnings = extract_events(file_path, sources,
+                                               channel_names=channel_names)
+        # merge_event_sources reports two sources claiming the same stimulus
+        # type, and events from different sources landing closer together than
+        # the near-simultaneous window. Both are misconfigurations often enough
+        # that swallowing them here would hide the reason a trial count looks
+        # wrong -- and the interface already shows them when sources are
+        # chosen, so the run must not be quieter than the dialogue.
+        for _w in (_warnings or []):
+            if warn is not None:
+                warn(_w)
+    else:
+        stim_times = extract_stim_times(file_path, marker_name)
 
     if crop_ranges:
         keep = np.zeros_like(time, dtype=bool)
@@ -2129,6 +2158,7 @@ def run_pipeline(input_path,
                  show_inspector_cb=None,
                  gui_enable_inspector=False,
                  channel_idx=0,
+                 event_sources=None, channel_names=None,
                  # Display name for the channel, used in logs and in the
                  # Data Inspector's title so a multi-channel run says which
                  # channel is being reviewed.
@@ -2306,7 +2336,10 @@ def run_pipeline(input_path,
         sidecar = meta.to_sidecar(
             input_path, filter_cfg,
             event_delay_ms={k: v for k, v in (cfg.delay_ms_map or {}).items() if v},
-            event_delay_source=delay_source_map or {})
+            event_delay_source=delay_source_map or {},
+            # How the stimuli were found, so the derivative says where its
+            # trials came from rather than only what was measured in them.
+            event_sources=[_s.to_dict() for _s in (event_sources or [])])
         if extra:
             sidecar.update(extra)
         json_path = os.path.splitext(csv_path)[0] + ".json"
@@ -2354,10 +2387,21 @@ def run_pipeline(input_path,
             emg, time, fs, unit, stim_times = pipeline_load_file(
                 raw_file, channel_idx, marker_name,
                 crop_ranges=crop_ranges,
-                crop_start=crop_start, crop_end=crop_end)
+                crop_start=crop_start, crop_end=crop_end,
+                sources=event_sources, channel_names=channel_names,
+                warn=lambda m: log_callback(f"   ⚠️  {m}"))
             stim_types = sorted(stim_times)
 
             log_callback(f"📂 Processing {name}  (fs={fs} Hz, {len(stim_types)} stim type(s))")
+            # Where the stimuli came from is part of what makes a run
+            # readable months later: the same file yields different events
+            # under a different threshold, and the log is the only place that
+            # shows which one ran.
+            for _src in (event_sources or []):
+                try:
+                    log_callback(f"   ⚡ events from {_src.describe()}")
+                except Exception:
+                    log_callback(f"   ⚡ events from {_src}")
 
             # ── Stage 2: Filter ───────────────────────────────────────────────
             emg = pipeline_apply_filters(emg, fs, cfg)

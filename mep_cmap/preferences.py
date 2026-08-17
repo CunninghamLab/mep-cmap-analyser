@@ -23,6 +23,9 @@ DEFAULTS   = {
     "addons_path":         None,   # user add-ons folder (None -> built-in only)
     "latency_profiles":    None,   # None -> use LATENCY_PROFILE_DEFAULTS
     "default_latency_key": None,   # None -> use DEFAULT_LATENCY_KEY
+    # Trials per stimulus type pre-selected in Preview detection's trial
+    # chooser. A default, not a cap -- any subset can be chosen there.
+    "preview_trials_per_type": 8,
 }
 DEFAULTS.update(_detection_pref_defaults())
 # Stamped so a superseded default can be recognised rather than shadowed
@@ -134,6 +137,19 @@ class Preferences:
 
     def reset(self):
         self._data = dict(DEFAULTS)
+        self.save()
+
+    @property
+    def preview_trials_per_type(self) -> int:
+        """How many trials per stimulus type Preview detection pre-selects.
+
+        A starting point, not a limit: the trial chooser lets any subset be
+        picked, up to every trial in the file.
+        """
+        return int(self._data.get("preview_trials_per_type", 8))
+
+    def set_preview_trials_per_type(self, value: int):
+        self._data["preview_trials_per_type"] = max(1, min(100, int(value)))
         self.save()
 
     @property

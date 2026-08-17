@@ -181,13 +181,27 @@ def test_the_analysis_selection_is_separate_from_the_configure_selection():
     assert "_analyse_btn_var" in APP[a:b], "the chooser must sit beside the combobox"
 
 
+def test_run_analysis_start_still_enforces_the_guards():
+    """The guards moved into _validate_analysis_setup; the call must remain.
+
+    Extracting them let Preview detection reuse the same rules. If the call
+    were ever dropped, every test below would still pass while an unconfigured
+    channel ran straight through.
+    """
+    body = _method("run_analysis_start")
+    assert "self._validate_analysis_setup(require_derivatives=True)" in body
+    a = body.index("_validate_analysis_setup")
+    b = body.index("threading.Thread", a)
+    assert "return" in body[a:b], "an invalid setup must stop the run"
+
+
 def test_running_is_blocked_when_a_selected_channel_has_no_setup():
     """
     Otherwise the channel silently inherits whichever table was on screen. For
     a different muscle that is the wrong latency profile, and nothing in the
     output would record it.
     """
-    body = _method("run_analysis_start")
+    body = _method("_validate_analysis_setup")
     assert "_unconfigured_analysis_channels()" in body
     guard = body.index("_unconfigured_analysis_channels()")
     confirm = body.index("_labels_tab_confirmed")
@@ -196,7 +210,7 @@ def test_running_is_blocked_when_a_selected_channel_has_no_setup():
 
 
 def test_the_warning_names_the_channels_and_the_way_out():
-    body = _method("run_analysis_start")
+    body = _method("_validate_analysis_setup")
     a = body.index("_unconfigured_analysis_channels()")
     seg = body[a:a + 1200]
     assert "Copy this setup to all channels" in seg, (
@@ -343,7 +357,7 @@ def test_filtering_is_reached_only_once_every_channel_is_confirmed():
 
 def test_running_requires_every_selected_channel_confirmed():
     """Confirming the last channel visited says nothing about the others."""
-    body = _method("run_analysis_start")
+    body = _method("_validate_analysis_setup")
     assert "_unconfirmed = [c for c in self._analysis_channel_indices()" in body
     assert "_chan_confirmed" in body
 

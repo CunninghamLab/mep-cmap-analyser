@@ -30,7 +30,13 @@ class DraggablePoint:
         • 'ptp_max_idx' → local maximum in a ±radius window  
         • anything else → nearest sample (previous behaviour)
     """
-    def __init__(self, point, time_axis, emg, idx0, update_cb, role='generic', radius=8):
+    def __init__(self, point, time_axis, emg, idx0, update_cb, role='generic',
+                 radius=8, read_only=False):
+        # read_only: draw the marker, ignore the mouse. Preview detection shows
+        # what the configured detector produced; a marker the analyst can drag
+        # there is an invitation to correct the answer by hand, and nothing in
+        # a preview is saved, so the correction would silently evaporate.
+        self.read_only = read_only
         self.point = point
         self.t = time_axis
         self.emg = emg
@@ -46,6 +52,8 @@ class DraggablePoint:
 
     # ------------------------------------------------------------------
     def _on_press(self, event):
+        if self.read_only:
+            return
         if event.inaxes is not self.point.axes:
             return
         # Do not start a drag when the matplotlib toolbar is in zoom or pan
@@ -103,7 +111,9 @@ class DraggableLine:
     On release, snaps to nearest sample and fires update_cb(new_idx).
     """
     def __init__(self, ax, time_axis, idx0, update_cb,
-                 color="tab:blue", lw=1.8, ls="--", pick_radius_ms=4.0):
+                 color="tab:blue", lw=1.8, ls="--", pick_radius_ms=4.0,
+                 read_only=False):
+        self.read_only   = read_only
         self.ax          = ax
         self.t           = time_axis
         self.idx         = idx0
@@ -133,6 +143,8 @@ class DraggableLine:
         self.line.set_xdata([self.t[new_idx], self.t[new_idx]])
 
     def _on_press(self, event):
+        if self.read_only:
+            return
         if event.inaxes is not self.ax or event.xdata is None:
             return
         try:
@@ -207,7 +219,8 @@ class DataInspectorWindow:
                  csp_max_mep_offset_ms=40,
                  latency_map=None,
                  csp_types=None, analysis_pre_ms=None,
-                 extra_segs=None, wide_window_s=3.0, underlays=None):
+                 extra_segs=None, wide_window_s=3.0, underlays=None,
+                 read_only=False):
 
         # --------- book-keeping -----------------------------------------
         self.top = tk.Toplevel(master)
@@ -216,6 +229,14 @@ class DataInspectorWindow:
         # the minimise/maximise/restore buttons from the title bar on Windows.
         self.top.grab_set()
 
+        # read_only: a viewing window. Markers are drawn but fixed, the
+        # editing controls are inert, and nothing is committed on close. Used
+        # by Preview detection, where the question is what the configured
+        # detector does -- not what the analyst would rather it had done.
+        # Everything else about the window is unchanged, deliberately: the
+        # preview is only worth trusting if it looks and measures exactly like
+        # the review that follows it.
+        self.read_only = bool(read_only)
         self.segments  = segments_dict
         # stim_type -> median waveform over retained trials; see
         # _condition_template. Invalidated when an exclusion changes.
@@ -348,8 +369,10 @@ class DataInspectorWindow:
         self._median_line = None
         self.note_enable_var = tk.BooleanVar(value=True)
 
+        _edit_state = "disabled" if self.read_only else "normal"
+
         tk.Checkbutton(self.btn_bar, text="Silent period",
-                    variable=self.enable_silent,
+                    variable=self.enable_silent, state=_edit_state,
                     command=self._on_silent_toggle).pack(side="left", padx=10)
 
         def _on_auc_toggle():
@@ -358,23 +381,27 @@ class DataInspectorWindow:
             self._plot()
         # (auc_enabled is restored in _plot from segment metadata)
         tk.Checkbutton(self.btn_bar, text="AUC selector",
-                    variable=self.enable_auc,
+                    variable=self.enable_auc, state=_edit_state,
                     command=_on_auc_toggle).pack(side="left")
         self.link_onset_auc = tk.BooleanVar(value=True)
         tk.Checkbutton(self.btn_bar, text="Link AUC to onset & offset",
-                    variable=self.link_onset_auc,
+                    variable=self.link_onset_auc, state=_edit_state,
                     command=lambda: self._plot()).pack(side="left", padx=(8, 0))
 
-        tk.Checkbutton(self.btn_bar, text="Exclude this segment",
-                    variable=self.exclude_var,
-                    command=lambda: self._set_exclude()).pack(side="left", padx=12) 
+        # Exclusion and notes exist only to write metadata, and a preview
+        # keeps none, so they are omitted rather than shown dead.
+        if not self.read_only:
+            tk.Checkbutton(self.btn_bar, text="Exclude this segment",
+                        variable=self.exclude_var,
+                        command=lambda: self._set_exclude()).pack(side="left", padx=12) 
         tk.Checkbutton(self.btn_bar, text="Show event-type median",
                     variable=self.show_median_var,
                     command=lambda: self._plot()).pack(side="left", padx=12)
 
-        tk.Checkbutton(self.btn_bar, text="Make a note",
-                    variable=self.note_enable_var,
-                    command=self._toggle_note_box).pack(side="left", padx=6)
+        if not self.read_only:
+            tk.Checkbutton(self.btn_bar, text="Make a note",
+                        variable=self.note_enable_var,
+                        command=self._toggle_note_box).pack(side="left", padx=6)
 
         # ── Extra channel controls ─────────────────────────────────────
         if self._extra_segs:
@@ -405,19 +432,31 @@ class DataInspectorWindow:
             self._wide_var      = tk.DoubleVar(value=self._wide_window_s)
             self._flip_var      = tk.BooleanVar(value=False)
         
-        # Note box — visible by default
+        # Note box — visible by default. Built either way so the methods that
+        # reference it need no read_only branch of their own; simply never
+        # shown in a preview.
         self.note_box = scrolledtext.ScrolledText(self.top, height=3)
-        self.note_box.pack(fill="x", padx=10, pady=(4, 6))
-        self.note_box_is_shown = True
+        if self.read_only:
+            self.note_enable_var.set(False)
+            self.note_box_is_shown = False
+        else:
+            self.note_box.pack(fill="x", padx=10, pady=(4, 6))
+            self.note_box_is_shown = True
 
         # --------- keyboard navigation ----------------------------------
         self.top.bind("<Right>", lambda e: self._next())
         self.top.bind("<Left>",  lambda e: self._prev())
 
         # --------- close ------------------------------------------------
-        self.btn_row = tk.Button(self.top, text="Save edits & close",
-                         width=20,
-                         command=self._close_and_save)            
+        # "Save edits & close" would be a lie in a preview: _close_and_save
+        # commits the note box on the way out, and the caller discards the
+        # metadata regardless.
+        self.btn_row = tk.Button(
+            self.top,
+            text="Close preview" if self.read_only else "Save edits & close",
+            width=20,
+            command=self._close_preview if self.read_only
+                    else self._close_and_save)            
         self.btn_row.pack(side="bottom", pady=(0, 8))    # 👈 ALWAYS at the bottom
         # --------- internal state ---------------------------------------
         self.cur_type = self.dd_event["values"][0]
@@ -1052,7 +1091,8 @@ class DataInspectorWindow:
                 DraggablePoint(
                     scat, self.t, emg, idx0,
                     lambda i, f=field: self._update_meta(f, i),
-                    role=field, radius=self.snap_radius
+                    role=field, radius=self.snap_radius,
+                    read_only=self.read_only
                 )
             )
 
@@ -1193,10 +1233,12 @@ class DataInspectorWindow:
                 self._auc_lines = [
                     DraggableLine(self.ax_raw, self.t,
                                   m["auc_start_idx"], _on_start_moved,
-                                  color="tab:blue", lw=1.8, ls="--"),
+                                  color="tab:blue", lw=1.8, ls="--",
+                                  read_only=self.read_only),
                     DraggableLine(self.ax_raw, self.t,
                                   m["auc_end_idx"],   _on_end_moved,
-                                  color="tab:cyan",  lw=1.8, ls="--"),
+                                  color="tab:cyan",  lw=1.8, ls="--",
+                                  read_only=self.read_only),
                 ]
 
         # ---------- figure geometry ------------------------------------------
@@ -1393,6 +1435,14 @@ class DataInspectorWindow:
             if not self._widget_alive(w):
                 return True
         return False
+
+    def _close_preview(self):
+        """Close a read-only window. Nothing is committed, by construction."""
+        self._is_closing = True
+        try:
+            self.top.destroy()
+        except tk.TclError:
+            pass
 
     def _close_and_save(self):
         """Save all pending edits including note, then close."""

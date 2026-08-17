@@ -67,7 +67,8 @@ class StudyMetadata:
 
     def to_sidecar(self, source_file: str, filter_settings: dict,
                    event_delay_ms: dict = None,
-                   event_delay_source: dict = None) -> dict:
+                   event_delay_source: dict = None,
+                   event_sources: list = None) -> dict:
         """Return a dict ready to be serialised as a JSON sidecar.
 
         ``event_delay_ms`` records any correction applied between the file's
@@ -80,6 +81,14 @@ class StudyMetadata:
         someone else reads the derivative and asks where the number came from.
         Both are written even when empty, so their absence in a sidecar means
         "this version did not support delays" rather than "no delay was set".
+
+        ``event_sources`` records how the stimuli were identified. A run whose
+        events came from a 2.5 V crossing on channel 5 produces different
+        trials from one that read the file's comments, and nothing in the
+        outputs shows which unless it is written here -- so the derivative
+        would not be reproducible from itself, and a methods section could not
+        be written from it. An empty list is the ordinary answer and means the
+        file's own markers were used.
         """
         d = asdict(self)
         d["source_file"]     = os.path.basename(source_file)
@@ -88,6 +97,7 @@ class StudyMetadata:
         d["filter_settings"] = filter_settings
         d["event_delay_ms"]     = dict(event_delay_ms or {})
         d["event_delay_source"] = dict(event_delay_source or {})
+        d["event_sources"]      = list(event_sources or [])
         return d
 
 

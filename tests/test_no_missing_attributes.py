@@ -31,7 +31,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 # method defined in a mixin does not read as missing.
 TARGETS = [
     ("app.py", "TMSAnalysisApp",
-     ["stage2.py", "filter_preview.py", "bidsify_tab.py"]),
+     ["stage2.py", "filter_preview.py", "bidsify_tab.py", "preview.py"]),
 ]
 
 

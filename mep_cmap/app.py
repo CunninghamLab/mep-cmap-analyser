@@ -65,6 +65,7 @@ from tkinter import ttk, filedialog, messagebox, simpledialog, scrolledtext, fon
 from .compat import _np_trapz
 from .bids import StudyMetadata, _sanitise_bids_label, TOOL_VERSION
 from .bidsify_tab import BidsifyTabMixin
+from .preview import PreviewDetectionMixin
 from .dataset_session import (DatasetSession, FileEntry,
                                STATUS_NOT_STARTED, STATUS_IN_PROGRESS,
                                STATUS_NEEDS_REVIEW, STATUS_COMPLETE,
@@ -183,7 +184,8 @@ _DETECTION_TK_ATTRS = {
 }
 
 
-class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
+class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
+                     PreviewDetectionMixin):
     def __init__(self, root):
         self.root = root
         # ── State that setup_gui() widgets depend on — must come first ────────
@@ -264,10 +266,16 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         # Channels whose 1a setup has been confirmed. Confirmation
         # is per channel because the setup is.
         self._chan_confirmed = set()
-        # Where this file's stimulus events come from. Empty means
-        # the file's own markers, which is what every file did
-        # before sources were configurable.
-        self.event_sources = []
+        # {channel_idx: [EventSource]} — where this file's stimulus events
+        # come from, per channel. Per channel because the trigger a channel is
+        # thresholded against is a property of that channel: a TTL that is
+        # clean on one electrode can sit near the noise floor on another, and
+        # a bilateral protocol has a separate stimulator per limb. Mirrors
+        # _chan_settings, which solves the same problem for tab 1a.
+        #
+        # No entry, or an empty list, means the file's own markers -- which is
+        # what every file does until someone says otherwise.
+        self.event_sources = {}
         
     # ───────────────────────────────────────────────────────────────────────────
     def _poll_queue(self):
@@ -624,6 +632,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         afterwards without reopening the file.
         """
         from .event_source_dialog import EventSourceDialog
+        from .event_sources import EventSource as _ES
         from .io import list_event_sources
 
         fpath = self.file_path.get()
@@ -647,19 +656,37 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                 fpath, _names.index(name))
             return wave, fs
 
-        dlg = EventSourceDialog(self.root, fpath, self.event_sources,
-                                available, _read, log=self.log)
+        _ch = self.channel_idx
+        _nm = _names[_ch] if _ch < len(_names) else f"channel {_ch}"
+        dlg = EventSourceDialog(self.root, fpath,
+                                self.event_sources.get(_ch, []),
+                                available, _read, log=self.log,
+                                channel_name=_nm,
+                                # So the detail view frames roughly the epoch
+                                # that will actually be cut.
+                                window_ms=(float(self.pre_time.get())
+                                           + float(self.post_time.get())))
         self.root.wait_window(dlg.top)
         if dlg.result is None:
             return
 
-        self.event_sources = dlg.result
-        if not self.event_sources:
-            self.log("   Event sources cleared — the file's own markers will "
-                     "be used.")
+        self.event_sources[_ch] = dlg.result
+        if dlg.copy_to_all:
+            # Same gesture as tab 1a's "Copy this setup to all channels": the
+            # shared case costs one tick, and a channel whose trigger sits
+            # nearer the noise floor can still be given its own level.
+            for _other in (self._analysis_channel_indices() or [_ch]):
+                if _other != _ch:
+                    self.event_sources[_other] = [
+                        _ES.from_dict(_s.to_dict()) for _s in dlg.result]
+            self.log(f"🔗 Event sources copied from {_nm} to every selected "
+                     f"channel.")
+        if not dlg.result:
+            self.log(f"   Event sources cleared for {_nm} — the file's own "
+                     f"markers will be used.")
         else:
-            self.log("🔗 Event sources:")
-            for _s in self.event_sources:
+            self.log(f"🔗 Event sources for {_nm}:")
+            for _s in dlg.result:
                 self.log(f"      {_s.describe()}")
         self._apply_event_sources()
 
@@ -669,7 +696,8 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
 
         fpath = self.file_path.get()
         try:
-            events, warnings = extract_events(fpath, self.event_sources)
+            events, warnings = extract_events(
+                fpath, self.event_sources.get(self.channel_idx, []))
         except Exception as exc:
             messagebox.showerror(
                 "Event sources",
@@ -928,15 +956,52 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         """Called by the green *Run Analysis* button (GUI thread)."""
 
 
+        if not self._validate_analysis_setup(require_derivatives=True):
+            return
+
+        # Reset any stale result left by a previous failed/interrupted run.
+        self._last_outlier_result = None
+
+        # Reset the progress bar so the UI looks fresh for each run.
+        self.progress.set(0)
+
+        self._log_gui("🔍 Running analysis…")
+        params = self._snapshot_analysis_params()
+
+        # Close any stale pyplot figures on the main thread via after(),
+        # so we never destroy Tk-embedded canvases mid-event which causes
+        # Tcl_AsyncDelete crashes on Windows.
+        def _safe_close_figs():
+            import matplotlib.pyplot as _plt
+            _plt.close('all')
+        self.root.after(50, _safe_close_figs)
+
+        # ---- START BACKGROUND THREAD ----
+        t = threading.Thread(
+            target=self._analysis_worker,
+            args=(params,),
+            daemon=True
+        )
+        t.start()
+
+    # ──────────────────────────────────────────────────────────────
+    def _validate_analysis_setup(self, require_derivatives=True) -> bool:
+        """Every precondition Run Analysis checks. True when it is safe to go.
+
+        Split out of run_analysis_start so Preview detection enforces the same
+        setup rules rather than a second copy of them that drifts. The only
+        difference is `require_derivatives`: the preview writes nothing, so
+        demanding an output folder would guard a consequence that cannot occur.
+        """
         # Guard: derivatives folder must be set before running
-        if not self.derivatives_path.get():
+        if require_derivatives and not self.derivatives_path.get():
             messagebox.showwarning(
                 "Derivatives folder not set",
                 "Please set a derivatives folder before running analysis.\n\n"
                 "Use File → Set Derivatives Folder, or click the red bar at the top.",
                 parent=self.root)
             self.browse_derivatives_folder()
-            return
+            return False
 
         # Guard: every channel being analysed must have its own setup.
         #
@@ -956,7 +1021,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                 "applies the current table to every channel if they share it.",
                 parent=self.root)
             self.notebook.select(self.stage1_outer)
-            return
+            return False
 
         # Guard: EVERY selected channel must be confirmed, not just the one on
         # screen. Confirmation is per channel because the setup is, and
@@ -976,7 +1041,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                 parent=self.root)
             self.notebook.select(self.stage1_outer)
             self.nb_stage1.select(self.tab1b_frame)
-            return
+            return False
 
         # Guard: Tab 1b must be confirmed before running
         if getattr(self, "_labels_tab_built", False) and \
@@ -988,23 +1053,32 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                 parent=self.root)
             self.notebook.select(self.stage1_outer)
             self.nb_stage1.select(self.tab1b_frame)
-            return
+            return False
         # Guard: prevent launching a second worker while one is already running.
         if getattr(self, '_analysis_running', False):
             messagebox.showwarning(
                 "Analysis in progress",
                 "An analysis is already running. Please wait for it to finish.",
                 parent=self.root)
-            return
+            return False
 
-        # Reset any stale result left by a previous failed/interrupted run.
-        self._last_outlier_result = None
+        return True
 
-        # Reset the progress bar so the UI looks fresh for each run.
-        self.progress.set(0)
+    # ──────────────────────────────────────────────────────────────
+    def _snapshot_analysis_params(self) -> dict:
+        """Freeze every GUI variable the analysis reads into one dict.
 
-        self._log_gui("🔍 Running analysis…")
+        Split out of run_analysis_start so Preview detection reads its settings
+        from exactly the same snapshot the run will use. Two copies of this
+        would diverge silently: the preview would show detection performed with
+        settings the analysis is not about to apply, which is worse than no
+        preview at all.
 
+        Includes the pre-epoched clamp, for the same reason -- an unclamped
+        window on an epoched file draws its baseline from the previous trial's
+        response, and a preview that did not clamp would look fine while
+        showing the wrong epoch.
+        """
         # ---- TAKE A SNAPSHOT OF ALL GUI VARIABLES ----
         params = dict(
             # file & marker
@@ -1093,6 +1167,15 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             extra_channel_indices  = list(self.extra_channel_indices),
             wide_window_s          = self.wide_window_s.get(),
             derivatives_root  = self.derivatives_path.get().strip() or None,
+
+            # Per-channel event sources. Without this the analysis re-reads
+            # stimuli from the file's markers by name, so a configured
+            # threshold changed what tab 1a displayed and nothing else --
+            # the interface showed one set of events and the run measured
+            # another.
+            event_sources     = {_c: [_s.to_dict() for _s in _lst]
+                                 for _c, _lst in self.event_sources.items()
+                                 if _lst},
         )
 
         # ---- CLAMP WINDOWS TO A PRE-EPOCHED FILE'S REAL EXTENT ----
@@ -1121,21 +1204,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                     "the stimulus; this file ends sooner, so cSP metrics will "
                     "be unreliable or blank.")
 
-        # Close any stale pyplot figures on the main thread via after(),
-        # so we never destroy Tk-embedded canvases mid-event which causes
-        # Tcl_AsyncDelete crashes on Windows.
-        def _safe_close_figs():
-            import matplotlib.pyplot as _plt
-            _plt.close('all')
-        self.root.after(50, _safe_close_figs)
-
-        # ---- START BACKGROUND THREAD ----
-        t = threading.Thread(
-            target=self._analysis_worker,
-            args=(params,),
-            daemon=True
-        )
-        t.start()
+        return params
 
     # ──────────────────────────────────────────────────────────────
     def _current_detection_params(self):
@@ -1246,6 +1315,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             csp_types           = self.csp_types,
             enable_auc          = self.enable_auc_global.get(),
             underlays           = underlays or {},
+            read_only           = False,
         )
         self.root.wait_window(inspector.top)
         self.segments_metadata = dict(inspector.meta)
@@ -1259,6 +1329,79 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         # are never lost if the user forgets Save Session.
         self._autosave_session()
 
+    # ──────────────────────────────────────────────────────────────
+    def _open_inspector_preview(self, segments_dict, pre_ms, post_ms, unit,
+                                label_map, color_map):
+        """Open the Inspector read-only, before any analysis has run.
+
+        A separate call site rather than a flag on _open_inspector_gui. That
+        method sits on the pipeline's three-hop payload, which is unpacked
+        POSITIONALLY -- adding a parameter there means adding it to
+        _show_inspector_cb and to the queued tuple as well, and threading a
+        preview flag through a callback the pipeline never previews with would
+        make the chain harder to reason about to save a little duplication.
+
+        The duplication is instead held in place by a test: the two call sites
+        must pass the same keyword names, so a setting added to review cannot
+        silently go missing from preview.
+
+        Nothing is written back. Metadata starts empty so every marker on
+        screen was detected by the current settings rather than restored from a
+        previous session, and it is discarded when the window closes: marker
+        drags here are a way of looking, not edits to an analysis that does not
+        yet exist.
+        """
+        n = len(next(iter(segments_dict.values()))[0])
+        time_axis = np.linspace(-pre_ms, post_ms, n, endpoint=False)
+        _det_params = self._current_detection_params()
+
+        inspector = DataInspectorWindow(
+            self.root, segments_dict, time_axis,
+            metadata_dict       = {},
+            label_map=label_map, color_map=color_map, emg_unit=unit,
+            ptp_start_ms        = self.ptp_start.get(),
+            ptp_end_ms          = self.ptp_end.get(),
+            # Anchored per-type windows are computed from a completed run, so
+            # a preview cannot have them; the file-wide pair is correct here
+            # and _preview_show says so in the log.
+            ptp_windows_by_type = None,
+            analysis_pre_ms     = pre_ms,
+            visible_pre_ms      = self.pre_time.get(),
+            extra_segs          = {},
+            wide_window_s       = self.wide_window_s.get(),
+            # Onset detection method
+            onset_method        = self.onset_method.get(),
+            onset_bootstrap_crit= self.onset_bootstrap_crit.get(),
+            onset_bootstrap_n   = self.onset_bootstrap_n.get(),
+            onset_bigoni_smooth_ms   = self.onset_bigoni_smooth_ms.get(),
+            onset_bigoni_min_run_ms  = self.onset_bigoni_min_run_ms.get(),
+            onset_bigoni_walkback_sd = self.onset_bigoni_walkback_sd.get(),
+            detection_params    = _det_params,
+            latency_map         = dict(self.latency_map),
+            # CSP detection
+            csp_search_start_ms = self.csp_search_start_ms.get(),
+            csp_search_end_ms   = self.csp_search_end_ms.get(),
+            csp_min_silence_ms  = self.csp_min_silence_ms.get(),
+            csp_min_return_ms   = self.csp_min_return_ms.get(),
+            csp_criterion       = self.csp_criterion.get(),
+            csp_significance    = self.csp_significance.get(),
+            csp_n_boot          = self.csp_n_boot.get(),
+            csp_max_mep_offset_ms = self.csp_max_mep_offset_ms.get(),
+            csp_types           = self.csp_types,
+            enable_auc          = self.enable_auc_global.get(),
+            underlays           = {},
+            read_only           = True,
+        )
+        # A window titled "review" invites the analyst to believe their marker
+        # drags counted.
+        try:
+            inspector.top.title(
+                "Preview detection – settings check, nothing is saved")
+        except tk.TclError:
+            pass
+        self.root.wait_window(inspector.top)
+        # Deliberately not stored: not segments_metadata, not the per-channel
+        # map, not _last_outlier_result, and no session autosave.
 
     def _show_inspector_cb(self, segments_dict, fs, pre_ms, post_ms,
                         unit, label_map, color_map, analysis_pre_ms=None,
@@ -1289,7 +1432,6 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
     # ──────────────────────────────────────────────────────────────
     def _analysis_worker(self, params):
         """Heavy number‑crunching (runs in a background thread).
-
         IMPORTANT: do NOT call matplotlib.use() from this thread.
         run_pipeline uses matplotlib.figure.Figure()+FigureCanvasAgg
         directly, so the global backend is irrelevant here.
@@ -1298,6 +1440,8 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         hard "Tcl_AsyncDelete" crash on Windows.
         """
         import time
+
+        from .event_sources import EventSource as _ES_worker
 
         self._analysis_running = True
         try:
@@ -1347,9 +1491,19 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                 def _own(key, default=None):
                     return _setup.get(key, params.get(key, default))
 
+                # This channel's event sources, rebuilt from the snapshot's
+                # plain dicts. The pipeline re-derives the times from the file,
+                # so what crosses this boundary is the configuration, not a
+                # list of timestamps that could no longer be checked against
+                # the recording.
+                _src_raw = (params.get("event_sources") or {}).get(_ch) or []
+                _own_sources = [_ES_worker.from_dict(_d) for _d in _src_raw]
+
                 run_pipeline(
                     input_path           = params["input_path"],
                     marker_name          = marker,
+                    event_sources        = _own_sources,
+                    channel_names        = _chan_names,
                     log_callback         = lambda txt: self.msg_q.put(("log", txt)),
                     progress_callback    = lambda p: self.msg_q.put(("progress", p)),
                     review_outliers_cb   = self._review_outliers_cb,
@@ -2011,8 +2165,13 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                   command=self.save_session).pack(side="left", padx=(6,4))
         tk.Button(footer_inner, text="📂 Load Session", width=14,
                   command=self.load_session).pack(side="left", padx=(0,4))
+        # Preview sits beside Run, not in a menu: it is a pre-run action on
+        # the same settings, and standing next to Run is what makes "same
+        # parameters, same code path" obvious without being explained.
+        tk.Button(footer_inner, text="🔎 Preview detection", width=18,
+                  command=self.preview_detection_start).pack(side="left", padx=(12,4))
         tk.Button(footer_inner, text="▶  Run Analysis", width=14,
-                  command=self.run_analysis_start).pack(side="left", padx=(12,4))
+                  command=self.run_analysis_start).pack(side="left", padx=(4,4))
         self.progress_bar = ttk.Progressbar(footer_inner, variable=self.progress,
                                             maximum=100)
         self.progress_bar.pack(side="left", fill="x", expand=True, padx=(8,6))
@@ -2161,8 +2320,12 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                           for (st, i), m in _mm.items()}
                 for _c, _mm in self._chan_segment_meta.items()},
             "chan_confirmed": sorted(self._chan_confirmed),
-            "event_sources": [_s.to_dict()
-                              for _s in self.event_sources],
+            # Keys are strings: JSON has no integer keys, and the loader
+            # converts back. A session written before sources were per channel
+            # is a flat list and still loads.
+            "event_sources": {str(_c): [_s.to_dict() for _s in _lst]
+                              for _c, _lst in self.event_sources.items()
+                              if _lst},
             "analyse_channels": sorted(self.analyse_channels),
         }
         return session
@@ -2441,10 +2604,22 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         self._chan_confirmed = set(sess.get("chan_confirmed") or [])
         try:
             from .event_sources import EventSource as _ES
-            self.event_sources = [_ES.from_dict(d)
-                                  for d in (sess.get("event_sources") or [])]
+            _raw = sess.get("event_sources") or {}
+            if isinstance(_raw, list):
+                # Sessions written before sources were per channel. Applying
+                # the flat list to every selected channel reproduces what that
+                # session actually did, which is what restoring one should mean.
+                _flat = [_ES.from_dict(d) for d in _raw]
+                self.event_sources = {
+                    _c: [_ES.from_dict(_s.to_dict()) for _s in _flat]
+                    for _c in (self._analysis_channel_indices() or [0])
+                } if _flat else {}
+            else:
+                self.event_sources = {
+                    int(_c): [_ES.from_dict(d) for d in (_lst or [])]
+                    for _c, _lst in _raw.items()}
         except Exception:
-            self.event_sources = []
+            self.event_sources = {}
         self.analyse_channels = set(sess.get("analyse_channels") or [])
         _per_chan = sess.get("chan_segment_meta")
         self._chan_segment_meta = {}
@@ -2491,6 +2666,33 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                 parent=self.root)
 
 
+    def _configured_events(self, file_path, fallback_marker=None):
+        """This file's stimulus events, honouring the configured sources.
+
+        Anything that SHOWS events to the analyst must come through here.
+        Reading extract_stim_times directly is how the range picker came to
+        draw the file's own comments after a source had been chosen: this
+        recording carries 162 'Trigger' comments and 6 'Start Task', so
+        choosing Trigger and then being shown Start Task is not a cosmetic
+        difference -- it is a different set of stimuli, presented as though it
+        were the one just configured.
+
+        Falls back to the marker path when no sources are set, which is what
+        every file does until someone says otherwise.
+        """
+        from .io import extract_events, extract_stim_times as _est
+
+        sources = (self.event_sources or {}).get(self.channel_idx) or []
+        if not sources:
+            return dict(_est(file_path, fallback_marker or "") or {}), []
+        try:
+            return extract_events(file_path, sources)
+        except Exception as exc:                # noqa: BLE001 — caller reports
+            self.log(f"   ⚠️  Configured event sources could not be read "
+                     f"({type(exc).__name__}: {exc}); showing the file's own "
+                     f"markers instead.")
+            return dict(_est(file_path, fallback_marker or "") or {}), []
+
     def _crop_selector(self, txt_file) -> bool:
         """
         Let the user pick **one or more** time‑ranges to analyse.
@@ -2502,8 +2704,10 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             emg, fs, self.emg_unit = extract_emg_waveform_and_fs(
                 txt_file, channel_idx=self.channel_idx)
             t = np.arange(emg.size) / fs
-            stim_dict = extract_stim_times(
+            stim_dict, _src_warnings = self._configured_events(
                 txt_file, self.marker_choice.get() or "Keyboard")
+            for _w in _src_warnings:
+                self.log(f"   ⚠️  {_w}")
         except Exception as e:
             messagebox.showerror("Could not preview file", str(e), parent=self.root)
             return False
@@ -2713,7 +2917,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         self._chan_segment_meta = {}
         # Event sources describe one recording's channels and markers, so they
         # cannot carry to another file any more than a channel index can.
-        self.event_sources = []
+        self.event_sources = {}
 
         # ── 0. Per-channel 1a setup is FILE-level, not session-level ──────────
         #
@@ -5352,9 +5556,25 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                         # from arises; sending the analyst to another
                         # tab to answer it makes the capability easy
                         # to miss.
+                        def _smr_to_event_sources():
+                            """Save, then configure sources for what was saved.
+
+                            Destroying the dialogue instead left _chosen empty,
+                            which this path reads as a cancellation: the file
+                            load aborted with "SMR channel assignment
+                            cancelled" and the sources were configured against
+                            whatever channel was current beforehand.
+
+                            Opening is deferred rather than immediate because
+                            the channel indices this file's selection refers to
+                            do not exist until the dropdown is populated,
+                            further down.
+                            """
+                            self._want_event_sources_after_load = True
+                            _ok()
+
                         tk.Button(btn, text="Event sources\u2026", width=16,
-                                  command=lambda: (dlg.destroy(),
-                                                   self._open_event_sources())
+                                  command=_smr_to_event_sources
                                   ).pack(side="left", padx=6)
                         tk.Button(btn, text="Save & continue",
                                   width=16, command=_ok).pack(side="left", padx=6)
@@ -5535,6 +5755,16 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             pass
         self._update_marker_dropdown()
 
+        # Deferred from the assignment dialogue: only here do the channel
+        # indices its selection refers to exist, so only here can sources be
+        # filed against the right one.
+        if getattr(self, "_want_event_sources_after_load", False):
+            self._want_event_sources_after_load = False
+            try:
+                self._open_event_sources()
+            except Exception as _e:
+                self.log(f"   ⚠️  Event sources could not be opened: {_e}")
+
         # ── Unified channel + event marker assignment dialog (Spike2 text exports only)
         # SMR files have their own dialog. Generic TSV/LabChart/CFWB use the
         # Format Wizard or have no event marker concept — exclude them here.
@@ -5652,10 +5882,31 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                 btn_r = _tk.Frame(dlg)
                 btn_r.pack(pady=(4, 12))
                 # Second entry point; see the note in the Spike2 dialogue.
+                def _to_event_sources():
+                    """Commit the channel choice, THEN configure its sources.
+
+                    This used to destroy the dialogue without saving, which is
+                    Cancel by another name: the ticked channels were discarded,
+                    channel_idx stayed on whichever channel was current before
+                    the file was opened, and the marker choice was never set.
+                    So sources ticked for Channel 3 were filed against Channel
+                    1, the range picker drew Channel 1, and the marker dropdown
+                    kept the load-time discovery -- three symptoms, one missing
+                    call.
+                    """
+                    if _chan_vars and not [c for c in _chan_list
+                                           if _chan_vars[c].get()]:
+                        messagebox.showwarning(
+                            "No channel selected",
+                            "Tick the EMG channel these sources belong to "
+                            "before configuring them.", parent=dlg)
+                        return
+                    _save()                     # closes the dialogue itself
+                    _apply_choice()
+                    self._open_event_sources()
+
                 _tk.Button(btn_r, text="Event sources\u2026", width=14,
-                           command=lambda: (dlg.destroy(),
-                                            self._open_event_sources())
-                           ).pack(side="left", padx=6)
+                           command=_to_event_sources).pack(side="left", padx=6)
                 _tk.Button(btn_r, text="Save & continue", width=14,
                            command=_save).pack(side="left", padx=6)
                 _tk.Button(btn_r, text="Cancel", width=10,
@@ -5668,23 +5919,32 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
                 dlg.geometry(f"+{x}+{y}")
                 self.root.wait_window(dlg)
 
+            def _apply_choice():
+                """Push the dialogue's answers into the application state.
+
+                Named so the Event sources button can run it before opening
+                that dialogue; otherwise sources are configured against
+                whichever channel happened to be current beforehand.
+                """
+                if _chosen.get("emg") and _chosen["emg"] in chan_list:
+                    self.channel_var.set(_chosen["emg"])
+                    self.channel_idx = chan_list.index(_chosen["emg"])
+                    _picked = _chosen.get("channels") or [_chosen["emg"]]
+                    self.analyse_channels = {chan_list.index(c) for c in _picked
+                                             if c in chan_list}
+                    if len(self.analyse_channels) > 1:
+                        self.log(f"   Channels to analyse: {', '.join(_picked)}")
+                    try:
+                        self._refresh_analyse_button()
+                    except Exception:
+                        pass
+                if _chosen.get("stim"):
+                    self.marker_choice.set(_chosen["stim"])
+                    self.available_markers = markers
+
             _show_assign_dlg()
 
-            if _chosen.get("emg") and _chosen["emg"] in chan_list:
-                self.channel_var.set(_chosen["emg"])
-                self.channel_idx = chan_list.index(_chosen["emg"])
-                _picked = _chosen.get("channels") or [_chosen["emg"]]
-                self.analyse_channels = {chan_list.index(c) for c in _picked
-                                         if c in chan_list}
-                if len(self.analyse_channels) > 1:
-                    self.log(f"   Channels to analyse: {', '.join(_picked)}")
-                try:
-                    self._refresh_analyse_button()
-                except Exception:
-                    pass
-            if _chosen.get("stim"):
-                self.marker_choice.set(_chosen["stim"])
-                self.available_markers = markers
+            _apply_choice()
 
         # All channels available in inspector extra channel dropdown
         self.extra_channel_indices = list(range(len(chan_list)))
@@ -5806,6 +6066,13 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             # annotations; BrainVision .vmrk; LabChart .mat comments; MNE
             # annotations) — read the actual labels present so the labels tab
             # matches what the pipeline will produce.
+            #
+            # Discovery, deliberately: this runs before any source can have
+            # been configured, and it is what populates the list the Event
+            # sources dialogue offers. Where sources ARE set, the block just
+            # before _build_labels_tab replaces stim_types_found with their
+            # events -- so this reading every label does not put an excluded
+            # type back on the tab.
             try:
                 _all_stim = extract_stim_times(fpath, '')
             except Exception as _e:
@@ -5841,6 +6108,48 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
             }
         else:
             stim_types_found = set(stim_events.keys())
+
+        # Configured event sources win over what the file was found to carry.
+        #
+        # The load flow discovers every marker in the recording, and this
+        # rebuild runs AFTER the assignment dialogue -- so a source chosen
+        # there had already built tab 1a from the right events, and this
+        # overwrote it with all of them. On a LabChart file carrying 162
+        # 'Trigger' comments and 6 'Start Task', choosing Trigger still left
+        # both rows on the tab, each configurable, each analysed.
+        # Choosing a specific marker source in the assignment dialogue is a
+        # narrowing too, even with no event sources configured. Without this,
+        # picking 'Trigger' there set marker_choice and left tab 1a showing
+        # every label the file carries -- so the choice appeared to do nothing.
+        _mk = (self.marker_choice.get() or "").strip()
+        if (not (self.event_sources or {}).get(self.channel_idx)
+                and _mk and _mk.lower() not in ("all", "a", "")
+                and _mk in stim_types_found and len(stim_types_found) > 1):
+            self.log(f"   Marker source '{_mk}' chosen — restricting the "
+                     f"analysis to it. Use Event sources to combine more "
+                     f"than one.")
+            stim_types_found = {_mk}
+            self.available_markers = [_mk]
+
+        _cfg_sources = (self.event_sources or {}).get(self.channel_idx) or []
+        if _cfg_sources:
+            _cfg_events, _cfg_warn = self._configured_events(fpath)
+            for _w in _cfg_warn:
+                self.log(f"   ⚠️  {_w}")
+            if _cfg_events:
+                stim_types_found = set(_cfg_events)
+                # The marker dropdown describes the same thing and would
+                # otherwise still name a type the analysis will not use.
+                self.available_markers = sorted(_cfg_events)
+                if self.marker_choice.get() not in _cfg_events:
+                    self.marker_choice.set(sorted(_cfg_events)[0])
+                try:
+                    self._update_marker_dropdown()
+                except Exception:
+                    pass
+                self.log("   Stimulus types from the configured sources: "
+                         + ", ".join(f"{k} ({len(v)})"
+                                     for k, v in sorted(_cfg_events.items())))
 
         # ── prompt for study metadata (BIDS)
         self.prompt_study_metadata()
@@ -6905,7 +7214,21 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin):
         try:
             emg, fs, _unit = extract_emg_waveform_and_fs(
                 fpath, channel_idx=getattr(self, "channel_idx", 0))
-            stim_times = extract_stim_times(fpath, "")
+            # The configured events, not every marker in the file. Two reasons.
+            #
+            # A delay is the offset between an event and the stimulus artefact,
+            # so it has to be measured against the events the analysis will
+            # use: with a threshold source configured, reading the file's
+            # markers here would measure the wrong thing and propose it with
+            # the same confidence as the right one.
+            #
+            # And a file often carries markers that are not stimuli at all --
+            # this study's recordings hold 162 'Trigger' comments beside 6
+            # 'Start Task' -- which were scanned, reported, and counted in
+            # "Scanned N type(s)" despite having no row to fill in.
+            stim_times, _delay_warn = self._configured_events(fpath)
+            for _w in _delay_warn:
+                self.log(f"   ⚠️  {_w}")
         except Exception as exc:
             self.log(f"❌ Could not read the recording for the delay scan "
                      f"({type(exc).__name__}: {exc})")

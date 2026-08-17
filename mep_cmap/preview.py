@@ -98,7 +98,7 @@ import numpy as np
 
 from .event_sources import EventSource
 from .pipeline import (PipelineConfig, pipeline_apply_filters,
-                       pipeline_load_file)
+                       pipeline_load_file, window_samples)
 from .preferences import prefs
 
 
@@ -418,12 +418,24 @@ class PreviewDetectionMixin:
         params = loaded["params"]
         prestim_ms = float(params["prestim_ms"])
         post_ms    = float(params["post_ms"])
+        # The window is per stimulus type, exactly as the analysis resolves it.
+        # Cutting every type to one window here would have the preview offer
+        # trials of a length the run will not produce -- and for a type given a
+        # longer window, show a response truncated where the analysis measures
+        # it whole.
+        #
+        # Pre stays prestim_ms, matching what the pipeline hands the Inspector:
+        # the review deliberately shows a wider lead-in than the analysis
+        # window. Only post varies by type.
+        _wincfg = PipelineConfig(pre_ms=float(params["pre_ms"]),
+                                 post_ms=post_ms,
+                                 window_map=params.get("window_map") or {})
         samples_before = int(prestim_ms * fs / 1000)
-        samples_after  = int(post_ms    * fs / 1000)
         delay_map = params.get("delay_ms_map") or {}
 
         segments, picked, dropped = {}, {}, {}
         for stim_type, idxs in chosen.items():
+            samples_after = window_samples(_wincfg, stim_type, fs)[1]
             times = loaded["usable"].get(stim_type, [])
             # The event delay MUST be applied here, exactly as the pipeline
             # applies it when building its own inspector segments.
@@ -467,7 +479,8 @@ class PreviewDetectionMixin:
                  "trial is shown. Markers are fixed and nothing is saved.")
 
         self._open_inspector_preview(
-            payload["segments"], payload["prestim_ms"], payload["post_ms"],
+            payload["segments"], payload["fs"],
+            payload["prestim_ms"], payload["post_ms"],
             payload["unit"],
             dict(getattr(self, "label_map", {}) or {}),
             dict(getattr(self, "color_map", {}) or {}))

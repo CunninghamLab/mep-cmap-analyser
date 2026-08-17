@@ -566,12 +566,20 @@ def test_adjusting_a_level_keeps_your_place():
     assert "self._cur_event = min(self._cur_event" in body
 
 
-def test_the_detail_width_defaults_to_the_analysis_window():
+def test_the_detail_width_defaults_to_the_seed_epoch():
+    """Event sources are per file, not per stimulus type.
+
+    The width used to come from the file-wide epoch fields on tab 1c. Those
+    are gone -- the epoch is set per type on 1a now -- and no one type's
+    window is the right answer for a dialogue configuring the whole file, so
+    it takes the preference seed instead.
+    """
     a = APP.index("def _open_event_sources")
     b = APP.index("\n    def ", a + 10)
     body = APP[a:b]
     assert "window_ms=" in body
-    assert "pre_time.get()" in body and "post_time.get()" in body
+    assert "prefs.default_epoch_ms" in body
+    assert "pre_time.get()" not in body
 
 
 def test_an_event_outside_the_recording_is_reported_not_blank():

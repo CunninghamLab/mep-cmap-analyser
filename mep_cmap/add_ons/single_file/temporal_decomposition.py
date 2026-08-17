@@ -389,9 +389,10 @@ def run(context):
 
     cfg     = context.config or {}
     log     = context.log
-    fs      = float(context.fs)
-    t_ms    = np.asarray(context.time_ms, dtype=float)
-    t_s     = t_ms / 1000.0
+    # Resolved per stimulus type inside the loop below: types may be epoched
+    # over different windows, and one axis applied to all of them meets traces
+    # of another length.
+    _t_ms_for = getattr(context, "time_ms_for", None)
     unit    = context.unit or "mV"
 
     bin_ms      = _as_float(cfg.get("td_bin_ms"),      2.0)
@@ -431,12 +432,11 @@ def run(context):
     bin_cols = [_bin_label(edges[i], edges[i + 1], unit)
                 for i in range(edges.size - 1)]
 
-    # Baseline window: start of epoch -> td_baseline_end_ms.
-    base_mask = t_ms <= base_end_ms
-    if base_mask.sum() < 2:
-        log(f"{ADDON_NAME}: pre-stimulus baseline window (up to {base_end_ms:g} ms) "
-            f"holds <2 samples; baseline correction disabled for this file.")
-        basecorr = False
+    # The baseline window depends on the time axis, which is per stimulus
+    # type, so the mask is built inside the loop below. A type epoched with a
+    # short lead-in may have too few baseline samples while another in the same
+    # recording has plenty; disabling correction for the file on account of one
+    # of them would discard it where it was perfectly available.
 
     lut = _build_marker_lookup(getattr(context, "trials", None), log)
     if not lut:
@@ -457,6 +457,16 @@ def run(context):
 
     skipped_types = []
     for stim_type, stack in sorted(context.segments.items()):
+        t_ms = np.asarray(_t_ms_for(stim_type) if _t_ms_for
+                          else context.time_ms, dtype=float)
+        t_s  = t_ms / 1000.0
+        base_mask = t_ms <= base_end_ms
+        _basecorr = basecorr
+        if _basecorr and base_mask.sum() < 2:
+            log(f"{ADDON_NAME}: '{stim_type}' has fewer than 2 samples before "
+                f"{base_end_ms:g} ms; baseline correction disabled for this "
+                f"stimulus type.")
+            _basecorr = False
         if only_types and str(stim_type) not in only_types:
             skipped_types.append(str(stim_type))
             continue
@@ -514,7 +524,7 @@ def run(context):
             rect = np.abs(trace)
             cum  = _cumulative_integral(rect, t_s)
 
-            base_amp = float(np.mean(rect[base_mask])) if basecorr else 0.0
+            base_amp = float(np.mean(rect[base_mask])) if _basecorr else 0.0
 
             def _corrected(a_ms, b_ms):
                 """Area between two times, minus background EMG over that span."""
@@ -565,7 +575,7 @@ def run(context):
                 # the late window. Prefer these when windows differ in length.
                 f"TD_Early_Mean_Amp({unit})": _per_ms(early, early_dur),
                 f"TD_Late_Mean_Amp({unit})":  _per_ms(late,  late_dur),
-                f"TD_Baseline_Amp({unit})":   base_amp if basecorr else None,
+                f"TD_Baseline_Amp({unit})":   base_amp if _basecorr else None,
                 "TD_N_Bins_Valid":          n_valid_bins,
                 "TD_N_Bins_Total":          len(bin_cols),
                 "TD_Valid":                 True,

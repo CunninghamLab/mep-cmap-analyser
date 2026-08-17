@@ -65,6 +65,8 @@ from tkinter import ttk, filedialog, messagebox, simpledialog, scrolledtext, fon
 from .compat import _np_trapz
 from .bids import StudyMetadata, _sanitise_bids_label, TOOL_VERSION
 from .bidsify_tab import BidsifyTabMixin
+from .tooltips import (INFO_ICON, attach_info_icon, check_with_help,
+                       label_with_help)
 from .preview import PreviewDetectionMixin
 from .dataset_session import (DatasetSession, FileEntry,
                                STATUS_NOT_STARTED, STATUS_IN_PROGRESS,
@@ -184,11 +186,244 @@ _DETECTION_TK_ATTRS = {
 }
 
 
+#: Explanation shown by the ⓘ beside each tab 1c field. Same purpose as
+#: COLUMN_HELP: a setting that needs a paragraph should carry it, rather than
+#: being described in a block of prose that has to be matched back to the
+#: field by name.
+FIELD_HELP = {
+    "ptp_start": (
+        "Where peak-to-peak amplitude begins being measured, in ms after the "
+        "stimulus.\n\n"
+        "Onset detection is NOT limited by this window — onset uses each "
+        "stimulus type's latency profile on tab 1a. The two are separate "
+        "questions: where the response starts, and over what interval its "
+        "size is read.\n\n"
+        "With amplitude anchoring enabled in Preferences → Detection, each "
+        "type's start comes from its own median detected onset and this value "
+        "is used only as a fallback for types with too few onsets to anchor."
+    ),
+    "ptp_end": (
+        "Where peak-to-peak amplitude stops being measured, in ms after the "
+        "stimulus. This always applies, including when anchoring is on: it is "
+        "the ceiling.\n\n"
+        "Too early truncates the response and the amplitude is read from a "
+        "shoulder rather than the peak. Too late admits later activity — a "
+        "voluntary contraction returning, or a second response — as though it "
+        "were part of the first."
+    ),
+    "prestim": (
+        "Length of baseline handed to the detectors and used for the RMS "
+        "measurement, in ms before the stimulus.\n\n"
+        "This is one setting for the recording. The epoch each stimulus type "
+        "is cut to, and shown at in the Data Inspector, is set per type on "
+        "tab 1a.\n\n"
+        "On a pre-epoched recording it is shortened to fit the stored epoch, "
+        "less any blanking gap, because a baseline reaching past the start of "
+        "an epoch draws its samples from the previous trial's response."
+    ),
+    "csp_search_start": (
+        "Earliest point after the stimulus at which a cortical silent period "
+        "may begin, in ms.\n\n"
+        "It should sit after the motor evoked potential, since the silence "
+        "being measured follows the response rather than containing it."
+    ),
+    "csp_search_end": (
+        "Latest point after the stimulus at which the silent period may end, "
+        "in ms. Nothing beyond this is searched, so a window shorter than the "
+        "true silence reports the ceiling rather than the duration."
+    ),
+    "csp_min_silence": (
+        "Shortest interval of quiet accepted as a silent period, in ms. "
+        "Brief dips in ongoing EMG are common and are not silent periods."
+    ),
+    "csp_min_return": (
+        "How long EMG must stay back above threshold before the silence is "
+        "called over, in ms. Without it a single sample of returning activity "
+        "ends the measurement early."
+    ),
+    "csp_criterion": (
+        "Z-score threshold multiplier defining the quiet level, relative to "
+        "pre-stimulus EMG. 1.96 corresponds to a 95% confidence interval.\n\n"
+        "Higher is more permissive about what counts as silence."
+    ),
+    "csp_significance": (
+        "Bootstrap percentile used to decide the minimum duration, where 0.99 "
+        "is the 99th percentile. Higher demands stronger evidence that the "
+        "silence is longer than chance variation in the baseline."
+    ),
+    "csp_boot": (
+        "Bootstrap iterations used to build that distribution. More is "
+        "steadier and slower; the default is enough for a stable threshold."
+    ),
+    "csp_max_offset": (
+        "The silent period must start within this many ms of the second peak "
+        "of the motor evoked potential.\n\n"
+        "Without it, a quiet stretch late in the epoch can be reported as a "
+        "silent period that began long after the response it is supposed to "
+        "follow."
+    ),
+    "outlier_z": (
+        "Trials whose peak-to-peak amplitude or pre-stimulus RMS falls beyond "
+        "this many standard deviations from the stimulus type's mean are "
+        "flagged.\n\n"
+        "Flagged is not excluded: with review enabled each is shown and the "
+        "decision recorded in the output."
+    ),
+    "outlier_review": (
+        "Show each flagged trial before it is excluded, so exclusions are "
+        "decisions rather than a side effect of a threshold. Every decision is "
+        "written to the trial file."
+    ),
+    "individual_plots": (
+        "Write a separate figure per stimulus type in addition to the "
+        "combined one. Useful when types overlap heavily on the shared axes."
+    ),
+    "compute_auc": (
+        "Integrate the rectified response between onset and offset, reported "
+        "in mV·s. Adds a column to the trial file and an adjustable shaded "
+        "region in the Data Inspector."
+    ),
+    "enable_inspector": (
+        "Open the trial-by-trial review window when the analysis finishes, so "
+        "markers can be checked and adjusted before the results are saved."
+    ),
+    "average_waveform": (
+        "Additionally quantify the average waveform of each stimulus type, "
+        "rather than only averaging the per-trial measurements.\n\n"
+        "The two are not the same: a measure taken from the mean trace is not "
+        "the mean of the measures, and which is wanted depends on the "
+        "question."
+    ),
+}
+
+
+#: What the marker dropdown offers for "every stimulus type in the file".
+#: A sentinel rather than the empty string, because a blank selection reads as
+#: nothing chosen and this is a choice.
+ALL_MARKERS = "All"
+
+
+#: Explanation shown by the ⓘ beside each tab 1a heading. Keyed by the exact
+#: heading text, so a column renamed without its help being revisited loses
+#: the icon rather than showing an explanation of something else.
+COLUMN_HELP = {
+    "Stim": (
+        "The event code as it appears in the recording. One row per stimulus "
+        "type found in the file, or per type produced by the event sources "
+        "configured for this channel."
+    ),
+    "Label": (
+        "The name this stimulus type is given in figures, in the trial and "
+        "summary files, and in the group-level output. Renaming here does not "
+        "change which events belong to it."
+    ),
+    "Colour": (
+        "Plot colour for this stimulus type, used in the trace figures and in "
+        "the Data Inspector."
+    ),
+    "Gap (ms)": (
+        "Time blanked immediately before each stimulus pulse, so that signal "
+        "which would contaminate the pre-stimulus baseline is excluded.\n\n"
+        "The background window keeps its full length and is moved back: with "
+        "a 10 ms gap and a 100 ms pre-stimulus window it runs from -110 to "
+        "-10 ms, giving 100 ms of data rather than 90. The larger of this and "
+        "the RMS guard in Preferences is used.\n\n"
+        "In paired-pulse protocols (SICI, ICF) a conditioning pulse precedes "
+        "the test pulse by a fixed interval; setting the gap just longer than "
+        "that interval keeps the conditioning artefact out of the background "
+        "EMG measurement. Leave at 0 if unused."
+    ),
+    "Delay (ms)": (
+        "Correction between the file's event marker and the instant the "
+        "stimulus actually fired, when the two differ. Negative means the "
+        "pulse came BEFORE the marker.\n\n"
+        "Everything measured from t = 0 moves with it, including reported "
+        "latencies. A marker that is late by two milliseconds does not produce "
+        "a visibly wrong latency; it produces an epoch whose zero is wrong, so "
+        "that part of the response falls into the pre-stimulus window and "
+        "every measure defined against the baseline fails in a different way.\n\n"
+        "Press Detect delays to measure it from the stimulus artefact."
+    ),
+    "Pre (ms)": (
+        "How much of the recording before the stimulus is cut into each trial "
+        "of this stimulus type, and how much of it the Data Inspector shows.\n\n"
+        "Per type because the epoch a response needs is a property of the "
+        "response: a cortical silent period wants several hundred "
+        "milliseconds, an M-wave a few tens.\n\n"
+        "This is not the detectors' baseline, which is set once for the "
+        "recording as Pre-stim for analysis on tab 1c."
+    ),
+    "Post (ms)": (
+        "How much of the recording after the stimulus is cut into each trial "
+        "of this stimulus type, and how much of it the Data Inspector shows.\n\n"
+        "Too short truncates the response; far too long carries samples "
+        "through every trial for no benefit. On a pre-epoched recording a "
+        "window longer than the stored epoch is shortened to fit, and the "
+        "change is reported in the log."
+    ),
+    "Detect CSP": (
+        "Measure a cortical silent period for this stimulus type. The search "
+        "window and criteria are on tab 1c.\n\n"
+        "Leave unticked for types where the concept does not apply, such as "
+        "resting recordings or peripheral nerve stimulation: a silent period "
+        "found where none exists is a measurement of noise."
+    ),
+    "Normalise to (internal)": (
+        "Express this stimulus type's amplitudes relative to another type in "
+        "the same recording -- an Mmax or a test pulse, for instance.\n\n"
+        "None leaves the amplitudes as measured. External references, from a "
+        "different file, are configured on tab 1d."
+    ),
+    "Plateau (%)": (
+        "Tolerance for deciding that a recruitment curve has reached its "
+        "plateau, as a percentage. Larger accepts more variation between the "
+        "largest responses before calling them a plateau."
+    ),
+    "Stim type": (
+        "What delivered this stimulus. It selects which set of latency "
+        "profiles the muscle group is read from: a peripheral nerve response "
+        "and a cortical one in the same muscle arrive at quite different "
+        "times."
+    ),
+    "Muscle group": (
+        "The muscle this channel records. Choosing one fills the latency "
+        "bounds beside it from the stored profile for that muscle and "
+        "stimulus type.\n\n"
+        "A muscle group that contradicts the bounds is reported, since the "
+        "symptom otherwise is onsets accumulating at a limit the interface is "
+        "no longer displaying."
+    ),
+    "Min lat (ms)": (
+        "Earliest latency at which a response of this type is accepted. Onset "
+        "detection searches from here.\n\n"
+        "Set too late, the true onset falls outside the window and detections "
+        "pile up at this bound rather than failing visibly -- a latency that "
+        "looks measured and is really the setting being reported back.\n\n"
+        "Filled from the muscle group and stimulus type, and editable where a "
+        "participant or montage genuinely differs."
+    ),
+    "Max lat (ms)": (
+        "Latest latency at which a response of this type is accepted. Onset "
+        "detection searches up to here.\n\n"
+        "A window that is too wide admits later activity as though it were "
+        "the response; too narrow reports no onset at all rather than a wrong "
+        "one."
+    ),
+}
+
+
 class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
                      PreviewDetectionMixin):
     def __init__(self, root):
         self.root = root
         # ── State that setup_gui() widgets depend on — must come first ────────
+        # The tab 1a entry widgets, keyed by stimulus type. Empty here rather
+        # than only in _build_labels_tab, because setup_gui binds a trace that
+        # reads them: writing to pre_time or post_time before a file was ever
+        # opened -- restoring a session, or any other early set -- reached a
+        # table that did not exist yet.
+        self._lab_entry_pre    = {}
+        self._lab_entry_post   = {}
         self.crop_start        = None
         self.crop_end          = None
         self.crop_ranges       = None
@@ -664,8 +899,10 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
                                 channel_name=_nm,
                                 # So the detail view frames roughly the epoch
                                 # that will actually be cut.
-                                window_ms=(float(self.pre_time.get())
-                                           + float(self.post_time.get())))
+                                # Event sources are configured per file, not
+                                # per stimulus type, so the detail view takes
+                                # the seed window rather than any one type's.
+                                window_ms=sum(prefs.default_epoch_ms))
         self.root.wait_window(dlg.top)
         if dlg.result is None:
             return
@@ -910,7 +1147,10 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         self.label_map = {}
         self.color_map = {}
         self.marker_choice = tk.StringVar()
-        self.plot_included = {}
+        # {stim_type: (pre_ms, post_ms)}. A type absent, or carrying None,
+        # uses the file-wide window from tab 1c, which is what every type did
+        # before this existed.
+        self.window_map = {}
         self.csp_types     = set()   # event types where silent period is detected
         self.available_markers = []
         self.channel_choice = tk.StringVar()
@@ -945,7 +1185,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         # _harvest_labels_tab actually assigns, so a map added to the tab
         # cannot be left out of here.
         self._chan_settings_keys = (
-            "label_map", "color_map", "plot_included", "gap_ms_map",
+            "label_map", "color_map", "window_map", "gap_ms_map",
             "delay_ms_map", "delay_source_map", "csp_types", "reference_map",
             "latency_map", "latency_stim_map", "latency_muscle_map",
             "_reference_display",
@@ -1079,6 +1319,23 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         response, and a preview that did not clamp would look fine while
         showing the wrong epoch.
         """
+        # Read tab 1a into state first, so the snapshot describes what is on
+        # screen rather than what was last confirmed.
+        #
+        # Harvesting used to happen only on Confirm Setup, a channel switch, or
+        # copy-to-all, while the confirmation itself was invalidated only when
+        # the table was REBUILT -- not when a field was edited. So editing a
+        # row and pressing Run or Preview while the button still read
+        # "confirmed" analysed the previous values, and the interface showed
+        # the new ones throughout. It surfaced on the epoch window, where the
+        # discrepancy is visible as a differently sized plot, but every map on
+        # that table behaved the same way.
+        if getattr(self, "_labels_tab_built", False):
+            try:
+                self._harvest_labels_tab()
+            except Exception as _e:
+                self.log(f"   ⚠️  Could not read the setup table: {_e}")
+
         # ---- TAKE A SNAPSHOT OF ALL GUI VARIABLES ----
         params = dict(
             # file & marker
@@ -1150,7 +1407,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             chan_segment_meta = copy.deepcopy(self._chan_segment_meta),
             label_map         = self.label_map.copy(),
             color_map         = self.color_map.copy(),
-            plot_included     = self.plot_included.copy(),
+            window_map        = dict(self.window_map),
             crop_start        = self.crop_start,
             crop_end          = self.crop_end,
             crop_ranges       = getattr(self, "crop_ranges", None),
@@ -1192,6 +1449,20 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         if _bounds:
             from .pipeline import clamp_config_to_epoch_bounds as _clamp
             params, _changes = _clamp(params, _bounds)
+            # The same map is also held per channel, and the analysis reads
+            # that copy in preference to this one. Clamping only the file-wide
+            # copy left the run epoching past the end of the data while the
+            # preview, which reads this one, stopped at it -- so the two
+            # disagreed about how long a trial was, and the run's extra
+            # samples were mirror-padded guard band drawn as a flat line.
+            from .pipeline import clamp_window_map as _clamp_wm
+            for _ch, _setup in (params.get("chan_settings") or {}).items():
+                _wm = (_setup or {}).get("window_map")
+                if not _wm:
+                    continue
+                _setup["window_map"], _wch = _clamp_wm(_wm, _bounds[0], _bounds[1])
+                for _f, _o, _n in _wch:
+                    _changes.append((f"channel {_ch} {_f}", _o, _n))
             self._log_gui(
                 f"📐 Pre-epoched file: {_bounds[0]:g} ms before and "
                 f"{_bounds[1]:g} ms after each stimulus are available.")
@@ -1238,10 +1509,16 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         pre_ms here is the analysis/extraction pre-stim (prestim_ms, e.g. 100ms).
         visible_pre_ms is the display window (pre_time, e.g. 20ms).
         """
-        n = len(next(iter(segments_dict.values()))[0])
-        time_axis = np.linspace(-pre_ms, post_ms, n, endpoint=False)
+        # Per stimulus type: types epoched over different windows have
+        # different segment lengths, and the axis follows from each length.
+        time_axis = self._axes_by_type(segments_dict, fs, pre_ms)
         _analysis_pre  = analysis_pre_ms if analysis_pre_ms is not None else pre_ms
-        _visible_pre   = self.pre_time.get()  # display window only
+        # What the Inspector shows now follows the same per-type window as the
+        # analysis. The segments still carry prestim_ms of lead-in, because the
+        # detectors and the RMS baseline need it -- but the view opens at the
+        # type's own pre rather than one global number, so judging an M-wave
+        # does not mean staring at 80 ms of flat baseline.
+        _visible_pre   = self._visible_pre_by_type()
         # Single source of truth: start from the anchored auto-onset seed, then
         # layer any previously saved edits on top so a resumed session shows the
         # final result (manual edits win per field). A fresh start (empty saved
@@ -1329,8 +1606,42 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         # are never lost if the user forgets Save Session.
         self._autosave_session()
 
+    def _visible_pre_by_type(self):
+        """{stim_type: pre_ms} for the Inspector's x-limit, from tab 1a.
+
+        A plain float is returned when nothing is configured, which is what
+        every caller handled before this existed.
+        """
+        out = {}
+        for stim, win in (self.window_map or {}).items():
+            if win and win[0] not in (None, ""):
+                try:
+                    out[stim] = float(win[0])
+                except (TypeError, ValueError):
+                    continue
+        return out or float(self.pre_time.get())
+
+    @staticmethod
+    def _axes_by_type(segments_dict, fs, pre_ms):
+        """One latency axis per stimulus type, derived from segment length.
+
+        Types epoched over different windows have different segment lengths,
+        so a single axis cannot describe them. Nothing new has to be passed to
+        find that out: the samples are already here and the step is 1000/fs,
+        so each type's axis follows from its own length. That matters because
+        this payload is unpacked positionally through three hops, and adding a
+        parameter to carry the windows would have meant changing all of them.
+        """
+        out = {}
+        for _st, _segs in (segments_dict or {}).items():
+            if not len(_segs):
+                continue
+            _n = len(_segs[0])
+            out[_st] = np.arange(_n) * (1000.0 / float(fs)) - float(pre_ms)
+        return out
+
     # ──────────────────────────────────────────────────────────────
-    def _open_inspector_preview(self, segments_dict, pre_ms, post_ms, unit,
+    def _open_inspector_preview(self, segments_dict, fs, pre_ms, post_ms, unit,
                                 label_map, color_map):
         """Open the Inspector read-only, before any analysis has run.
 
@@ -1351,8 +1662,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         drags here are a way of looking, not edits to an analysis that does not
         yet exist.
         """
-        n = len(next(iter(segments_dict.values()))[0])
-        time_axis = np.linspace(-pre_ms, post_ms, n, endpoint=False)
+        time_axis = self._axes_by_type(segments_dict, fs, pre_ms)
         _det_params = self._current_detection_params()
 
         inspector = DataInspectorWindow(
@@ -1366,7 +1676,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             # and _preview_show says so in the log.
             ptp_windows_by_type = None,
             analysis_pre_ms     = pre_ms,
-            visible_pre_ms      = self.pre_time.get(),
+            visible_pre_ms      = self._visible_pre_by_type(),
             extra_segs          = {},
             wide_window_s       = self.wide_window_s.get(),
             # Onset detection method
@@ -1574,7 +1884,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
                     multi_channel        = len(_chan_list) > 1,
                     custom_labels        = _own("label_map", {}),
                     color_map            = _own("color_map", {}),
-                    plot_included        = _own("plot_included", {}),
+                    window_map           = _own("window_map", {}),
                     crop_start           = params["crop_start"],
                     crop_end             = params["crop_end"],
                     crop_ranges          = params["crop_ranges"],
@@ -1755,8 +2065,17 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         # Onset search-window anchoring (per-run detection config; not a global pref)
         self.onset_anchor             = tk.BooleanVar(value=False)
         self.onset_anchor_halfwidth   = tk.DoubleVar(value=8.0)
-        self.pre_time = tk.IntVar(value=20)
-        self.post_time = tk.IntVar(value=400)
+        # Retained as the internal fallback for any stimulus type not on tab
+        # 1a, and for sessions written before the per-type column existed.
+        # They are no longer editable on 1c: the seed for a new row comes from
+        # preferences, and the value in force is the row itself.
+        _seed_pre, _seed_post = prefs.default_epoch_ms
+        self.pre_time = tk.IntVar(value=int(_seed_pre))
+        self.post_time = tk.IntVar(value=int(_seed_post))
+        # Tab 1a's per-type boxes are seeded from these, and rows still showing
+        # the old value follow a change here rather than being stranded on it.
+        for _v in (self.pre_time, self.post_time):
+            _v.trace_add("write", self._follow_default_window)
         self.ptp_start = tk.IntVar(value=10)
         self.ptp_end = tk.IntVar(value=50)
         self.prestim_ms = tk.IntVar(value=100)
@@ -1932,15 +2251,17 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         time_frame.pack(padx=6, pady=(10, 0), fill='x')
 
         # ── Sub-section: Time Windows ────────────────────────────────────────
-        # Row 0
-        tk.Label(time_frame, text="Pre-stim visible (ms):").grid(
-            row=0, column=0, sticky='e', padx=6)
-        tk.Entry(time_frame, textvariable=self.pre_time, width=6).grid(
-            row=0, column=1, sticky='w')
-        tk.Label(time_frame, text="Post-stim visible (ms):").grid(
-            row=0, column=2, sticky='e', padx=6)
-        tk.Entry(time_frame, textvariable=self.post_time, width=6).grid(
-            row=0, column=3, sticky='w')
+        #
+        # The epoch window used to live here as "Pre-stim visible" and
+        # "Post-stim visible". Neither was visible-only: both determined what
+        # was extracted and measured, and the first additionally set the
+        # Inspector's zoom. Three fields on this tab therefore looked like
+        # pre-stimulus settings and meant three different things.
+        #
+        # The window is now set per stimulus type on tab 1a, where it belongs:
+        # the epoch a response needs is a property of the response, not of the
+        # file. What remains here is the baseline the detectors are given,
+        # which genuinely is one setting for the recording.
         # Row 1 — amplitude measurement window.
         #
         # Relabelled from a bare "PTP window start/end". These bounds used to
@@ -1949,18 +2270,20 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         # all: onset uses each event type's latency profile from 1a. Leaving
         # the old wording implied a coupling that no longer exists and made the
         # field look contradictory once anchoring was added.
-        self._ptp_start_lbl = tk.Label(
-            time_frame, text="Amplitude window start (ms):")
+        self._ptp_start_lbl = label_with_help(
+            time_frame, "Amplitude window start (ms):", FIELD_HELP["ptp_start"])
         self._ptp_start_lbl.grid(row=1, column=0, sticky='e', padx=6)
         self._ptp_start_entry = tk.Entry(
             time_frame, textvariable=self.ptp_start, width=6)
         self._ptp_start_entry.grid(row=1, column=1, sticky='w')
-        tk.Label(time_frame, text="Amplitude window end (ms):").grid(
+        label_with_help(time_frame, "Amplitude window end (ms):",
+                        FIELD_HELP["ptp_end"]).grid(
             row=1, column=2, sticky='e', padx=6)
         tk.Entry(time_frame, textvariable=self.ptp_end, width=6).grid(
             row=1, column=3, sticky='w')
         # Row 2
-        tk.Label(time_frame, text="Pre-stim for analysis (ms):").grid(
+        label_with_help(time_frame, "Pre-stim for analysis (ms):",
+                        FIELD_HELP["prestim"]).grid(
             row=2, column=0, sticky='e', padx=6)
         tk.Entry(time_frame, textvariable=self.prestim_ms, width=6).grid(
             row=2, column=1, sticky='w')
@@ -1994,9 +2317,13 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             does not determine. Labelling it as a 1a value would be wrong in a
             way that is hard to notice.
             """
+            # The note on screen states the CURRENT STATE in one line; the
+            # explanation of what that state means is the ⓘ beside the field.
+            # Five lines of grey prose repeated the same standing explanation
+            # on every visit to the tab, to say one thing that had changed.
             _COMMON = ("Amplitude window: where peak-to-peak is measured. "
                        "Onset is not limited by it — onset uses each event "
-                       "type's latency profile (1a). ")
+                       "type's latency profile on tab 1a.\n\n")
             try:
                 anchored = bool(prefs.ptp_anchor)
                 min_n = int(prefs.ptp_anchor_min_trials)
@@ -2006,23 +2333,38 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             self._ptp_start_entry.config(state="normal")
             if anchored:
                 self._ptp_start_lbl.config(
-                    text="Amplitude start — fallback (ms):", fg="#555")
+                    text="Amplitude start — fallback (ms): " + INFO_ICON,
+                    fg="#555")
                 self._ptp_note.config(
-                    text=_COMMON +
-                         "PTP anchoring is ON: for each event type the start "
-                         "is its median onset minus %g ms, so the value at "
-                         "left is used only as a fallback, for event types "
-                         "with fewer than %d detected onsets. The end above "
-                         "always applies as a ceiling."
-                         % (pre, min_n))
+                    text="Anchoring is ON — each event type starts at its own "
+                         "median onset minus %g ms." % pre)
+                _detail = (_COMMON +
+                           "Anchoring is ON: for each event type the start is "
+                           "its median detected onset minus %g ms, so the "
+                           "value in this box is used only as a fallback, for "
+                           "event types with fewer than %d detected onsets. "
+                           "The end above always applies as a ceiling.\n\n"
+                           "The anchored start is not the 1a latency profile "
+                           "either: it is each type's own median DETECTED "
+                           "onset, which that profile bounds but does not "
+                           "determine." % (pre, min_n))
             else:
                 self._ptp_start_lbl.config(
-                    text="Amplitude window start (ms):", fg="black")
+                    text="Amplitude window start (ms): " + INFO_ICON,
+                    fg="black")
                 self._ptp_note.config(
-                    text=_COMMON +
-                         "For files mixing M-waves and MEPs, enable PTP "
-                         "anchoring in Preferences → Detection so each event "
-                         "type gets its own window.")
+                    text="Anchoring is OFF — every event type uses this "
+                         "window.")
+                _detail = (_COMMON +
+                           "Anchoring is OFF, so this window applies to every "
+                           "event type.\n\n"
+                           "For files mixing M-waves and MEPs that is usually "
+                           "wrong, the two arriving at quite different times: "
+                           "enable amplitude anchoring in Preferences → "
+                           "Detection so each type gets its own window.")
+            _tip = getattr(self._ptp_start_lbl, "tooltip", None)
+            if _tip is not None:
+                _tip.set_text(_detail)
 
         self._refresh_ptp_note = _refresh_ptp_note
         _refresh_ptp_note()
@@ -2094,39 +2436,35 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         csp_frame = tk.LabelFrame(self.main_frame,
             text="CSP (Cortical Silent Period) Detection Settings", padx=6, pady=8)
         csp_frame.pack(padx=6, pady=(8,0), fill='x')
-        tk.Label(csp_frame, text="Search start (ms post-stim):").grid(row=0,column=0,sticky='e',padx=6)
+        label_with_help(csp_frame, "Search start (ms post-stim):", FIELD_HELP["csp_search_start"]).grid(row=0,column=0,sticky='e',padx=6)
         tk.Entry(csp_frame, textvariable=self.csp_search_start_ms, width=5).grid(row=0,column=1,sticky='w')
-        tk.Label(csp_frame, text="Search end (ms post-stim):").grid(row=0,column=2,sticky='e',padx=6)
+        label_with_help(csp_frame, "Search end (ms post-stim):", FIELD_HELP["csp_search_end"]).grid(row=0,column=2,sticky='e',padx=6)
         tk.Entry(csp_frame, textvariable=self.csp_search_end_ms, width=5).grid(row=0,column=3,sticky='w')
-        tk.Label(csp_frame, text="Min silence (ms):").grid(row=1,column=0,sticky='e',padx=6)
+        label_with_help(csp_frame, "Min silence (ms):", FIELD_HELP["csp_min_silence"]).grid(row=1,column=0,sticky='e',padx=6)
         tk.Entry(csp_frame, textvariable=self.csp_min_silence_ms, width=5).grid(row=1,column=1,sticky='w')
-        tk.Label(csp_frame, text="Min return (ms):").grid(row=1,column=2,sticky='e',padx=6)
+        label_with_help(csp_frame, "Min return (ms):", FIELD_HELP["csp_min_return"]).grid(row=1,column=2,sticky='e',padx=6)
         tk.Entry(csp_frame, textvariable=self.csp_min_return_ms, width=5).grid(row=1,column=3,sticky='w')
-        tk.Label(csp_frame, text="Z-score criterion:").grid(row=2,column=0,sticky='e',padx=6)
+        label_with_help(csp_frame, "Z-score criterion:", FIELD_HELP["csp_criterion"]).grid(row=2,column=0,sticky='e',padx=6)
         tk.Entry(csp_frame, textvariable=self.csp_criterion, width=5).grid(row=2,column=1,sticky='w')
-        tk.Label(csp_frame, text="Bootstrap significance:").grid(row=2,column=2,sticky='e',padx=6)
+        label_with_help(csp_frame, "Bootstrap significance:", FIELD_HELP["csp_significance"]).grid(row=2,column=2,sticky='e',padx=6)
         tk.Entry(csp_frame, textvariable=self.csp_significance, width=5).grid(row=2,column=3,sticky='w')
-        tk.Label(csp_frame, text="Bootstrap iterations:").grid(row=3,column=0,sticky='e',padx=6)
+        label_with_help(csp_frame, "Bootstrap iterations:", FIELD_HELP["csp_boot"]).grid(row=3,column=0,sticky='e',padx=6)
         tk.Entry(csp_frame, textvariable=self.csp_n_boot, width=7).grid(row=3,column=1,sticky='w')
-        tk.Label(csp_frame, text="Max offset from MEP 2nd peak (ms):").grid(row=3,column=2,sticky='e',padx=6)
+        label_with_help(csp_frame, "Max offset from MEP 2nd peak (ms):", FIELD_HELP["csp_max_offset"]).grid(row=3,column=2,sticky='e',padx=6)
         tk.Entry(csp_frame, textvariable=self.csp_max_mep_offset_ms, width=5).grid(row=3,column=3,sticky='w')
-        _csp_help = tk.Label(csp_frame,
-            text="Z-score: threshold multiplier (1.96 = 95% CI)  ·  Significance: bootstrap percentile for min duration (0.99 = 99th pct)  ·  "
-                 "Max offset: cSP start must fall within this many ms after the 2nd MEP peak (prevents unrealistic late placements)",
-            fg="grey", justify="left", wraplength=1000)
-        _csp_help.grid(row=4,column=0,columnspan=4,sticky='w',padx=6,pady=(2,0))
-        # Wrap the footnote to the frame's width so it never forces the grid wider
-        # than the visible area (which was clipping the right-hand column).
-        csp_frame.bind("<Configure>",
-                       lambda e, _l=_csp_help: _l.configure(wraplength=max(300, e.width - 24)))
+        # The footnote that stood here described three of the eight fields
+        # above and had to be re-wrapped on every resize to stop it forcing the
+        # grid wider than the visible area. Each of those explanations is now
+        # the ⓘ on the field it belongs to.
 
         # ─── Outlier Detection ─────────────────────────────────────────────────
         out_frame = tk.LabelFrame(self.main_frame, text="Outlier Detection Settings",
                                   padx=6, pady=6)
         out_frame.pack(padx=6, pady=(10, 0), fill='x')
-        tk.Checkbutton(out_frame, text="Enable Outlier Review",
-                       variable=self.outlier_review).grid(row=0, column=0, sticky='w')
-        tk.Label(out_frame, text="Z-score threshold:").grid(row=0, column=1, sticky='e', padx=(20,4))
+        check_with_help(out_frame, "Enable Outlier Review",
+                        FIELD_HELP["outlier_review"],
+                        variable=self.outlier_review).grid(row=0, column=0, sticky='w')
+        label_with_help(out_frame, "Z-score threshold:", FIELD_HELP["outlier_z"]).grid(row=0, column=1, sticky='e', padx=(20,4))
         tk.Entry(out_frame, textvariable=self.outlier_threshold, width=6).grid(row=0, column=2, sticky='w')
 
         # ─── Analysis Options + Session + Run ─────────────────────────────────
@@ -2136,13 +2474,13 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         run_frame = tk.LabelFrame(self.main_frame, text="Analysis Options",
                                   padx=6, pady=6)
         run_frame.pack(padx=6, pady=(10, 0), fill='x')
-        tk.Checkbutton(run_frame, text="Generate individual plots per event type",
+        check_with_help(run_frame, "Generate individual plots per event type", FIELD_HELP["individual_plots"],
             variable=self.generate_individual_plots).grid(row=0, column=0, sticky='w', padx=4)
-        tk.Checkbutton(run_frame, text="Enable Data Inspector",
+        check_with_help(run_frame, "Enable Data Inspector", FIELD_HELP["enable_inspector"],
             variable=self.enable_inspector).grid(row=0, column=1, sticky='w', padx=4)
-        tk.Checkbutton(run_frame, text="Compute AUC",
+        check_with_help(run_frame, "Compute AUC", FIELD_HELP["compute_auc"],
             variable=self.enable_auc_global).grid(row=1, column=0, sticky='w', padx=4)
-        tk.Checkbutton(run_frame, text="Analyse average waveform per event type",
+        check_with_help(run_frame, "Analyse average waveform per event type", FIELD_HELP["average_waveform"],
             variable=self.average_mode).grid(row=1, column=1, sticky='w', padx=4)
 
         # Log stays in the scrollable area so it expands with content
@@ -2152,7 +2490,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
 
         # Small author label
         author_font = font.Font(size=12, slant="italic")
-        tk.Label(self.main_frame, text="Author: Justin Andrushko PhD, Northumbria University",
+        tk.Label(self.main_frame, text="Author: Justin Andrushko PhD",
                  font=author_font, anchor='center').pack(pady=(0,5))
 
         # ── Fixed footer: session buttons + run + progress bar ────────────────
@@ -2297,7 +2635,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             "crop_end":         self.crop_end,
             "label_map":        self.label_map,
             "color_map":        self.color_map,
-            "plot_included":    self.plot_included,
+            "window_map":       {k: list(v) for k, v in self.window_map.items()},
             "gap_ms_map":       self.gap_ms_map,
             "reference_map":    self.reference_map,
             "reference_display": getattr(self, '_reference_display', {}),
@@ -2503,7 +2841,11 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         cr=sess.get("crop_ranges"); self.crop_ranges=[tuple(r) for r in cr] if cr else None
         self.crop_start=sess.get("crop_start"); self.crop_end=sess.get("crop_end")
         self.label_map=sess.get("label_map",{}); self.color_map=sess.get("color_map",{})
-        self.plot_included=sess.get("plot_included",{}); self.gap_ms_map=sess.get("gap_ms_map",{})
+        # Sessions written before per-type windows carry plot_included and no
+        # window_map; both are simply absent here, which is the same as every
+        # type using the file-wide window.
+        self.window_map={k: tuple(v) for k, v in (sess.get("window_map") or {}).items()}
+        self.gap_ms_map=sess.get("gap_ms_map",{})
         self.delay_ms_map=sess.get("delay_ms_map",{})
         self.delay_source_map=sess.get("delay_source_map",{})
         self.reference_map=sess.get("reference_map",{})
@@ -3121,7 +3463,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         tk.Label(win, text="MEP-CMAP Analyser",
                  font=("TkDefaultFont", 13, "bold")).pack(pady=(16,2))
         tk.Label(win, text=f"Version {TOOL_VERSION}").pack()
-        tk.Label(win, text="Author: Justin Andrushko PhD\nNorthumbria University",
+        tk.Label(win, text="Author: Justin Andrushko PhD",
                  justify="center", fg="grey").pack(pady=(6,4))
         tk.Label(win,
             text="BIDS-compliant TMS/EMG neurophysiology\n"
@@ -5254,9 +5596,21 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             self.log("📋 ADInstruments binary (CFWB) format — stim times from trigger channel")
 
         elif _fmt == 'edf':
-            self.marker_choice.set('A')
+            self.marker_choice.set(ALL_MARKERS)
             self.log("📋 BIDS EDF/BDF format — stim times from sidecar _events.tsv "
                      "(or EDF+ annotations)")
+            # Say which of the two won, and whether the other disagrees. The
+            # .tsv takes precedence silently, so one written from an earlier or
+            # cropped run replaces the recording's own markers -- stimulus
+            # types go missing and the events stop where that run stopped, with
+            # nothing on screen to say why.
+            try:
+                from .formats.edf import event_source_summary as _edf_src
+                _line = _edf_src(fpath)
+                if _line:
+                    self.log(f"   {_line}")
+            except Exception:
+                pass
             # stim_events populated later via extract_stim_times in pipeline
 
         elif _fmt in ('brainvision', 'labchart_mat', 'mne'):
@@ -5880,15 +6234,22 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
                         _chan_vars[_cn] = _v
 
                 # Event marker row (only show if >1 marker)
+                # "All" first, because analysing every stimulus type in the
+                # file is the ordinary case and there was previously no way to
+                # ask for it: the list offered only individual sources, so a
+                # recording carrying A through G could be analysed one letter
+                # at a time or by leaving the field at whatever it defaulted
+                # to and hoping.
+                _marker_opts = [ALL_MARKERS] + list(_markers)
                 _cur_marker = self.marker_choice.get()
                 stim_var = _tk.StringVar(
-                    value=_cur_marker if _cur_marker in _markers else
-                    (next((m for m in _markers if "DigMark" in m), _markers[0])
-                     if _markers else ""))
+                    value=_cur_marker if _cur_marker in _marker_opts
+                    else ALL_MARKERS)
                 if len(_markers) > 1:
                     _tk.Label(frm, text="Event/marker source:", anchor="w", width=22)                        .grid(row=1, column=0, sticky="w", pady=6)
                     _ttk.Combobox(frm, textvariable=stim_var,
-                                  values=_markers, state="readonly", width=28)                        .grid(row=1, column=1, sticky="w")
+                                  values=_marker_opts, state="readonly",
+                                  width=28)                        .grid(row=1, column=1, sticky="w")
 
                 _tk.Label(
                     frm,
@@ -6160,7 +6521,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         # every label the file carries -- so the choice appeared to do nothing.
         _mk = (self.marker_choice.get() or "").strip()
         if (not (self.event_sources or {}).get(self.channel_idx)
-                and _mk and _mk.lower() not in ("all", "a", "")
+                and _mk and _mk.upper() != ALL_MARKERS and _mk
                 and _mk in stim_types_found and len(stim_types_found) > 1):
             self.log(f"   Marker source '{_mk}' chosen — restricting the "
                      f"analysis to it. Use Event sources to combine more "
@@ -6779,6 +7140,49 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
                     "setup to all channels' if they should share one."))
 
     # ──────────────────────────────────────────────────────────────────────
+    def _default_window_ms(self):
+        """The file-wide window from tab 1c, as floats.
+
+        Read defensively: these are IntVars being typed into, and .get() on a
+        half-typed value raises rather than returning the old one.
+        """
+        try:
+            pre = float(self.pre_time.get())
+        except Exception:
+            pre = 20.0
+        try:
+            post = float(self.post_time.get())
+        except Exception:
+            post = 400.0
+        return pre, post
+
+    def _follow_default_window(self, *_a):
+        """Move rows still showing the old default onto the new one.
+
+        Only those: a row the analyst has changed is a decision, and quietly
+        overwriting it would be worse than not propagating at all.
+
+        Bound as a trace in the constructor, so it can fire long before any
+        table exists and at any point during teardown. Neither is an error
+        worth reporting: there is simply nothing to move.
+        """
+        if not getattr(self, "_lab_entry_pre", None) and \
+                not getattr(self, "_lab_entry_post", None):
+            return
+        pre, post = self._default_window_ms()
+        for var, new, old_attr in (
+                (self._lab_entry_pre, pre, "_last_default_pre"),
+                (self._lab_entry_post, post, "_last_default_post")):
+            old = getattr(self, old_attr, None)
+            for _stim, _v in var.items():
+                try:
+                    cur = str(_v.get()).strip()
+                except Exception:
+                    continue
+                if cur == "" or (old is not None and cur == f"{old:g}"):
+                    _v.set(f"{new:g}")
+        self._last_default_pre, self._last_default_post = pre, post
+
     def _build_labels_tab(self, stim_types):
         """
         Build (or rebuild) the Stage 1a labels tab with per-stim configuration:
@@ -6824,26 +7228,17 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
                    lambda e: cv.configure(scrollregion=cv.bbox("all")))
 
         # ── header hint ───────────────────────────────────────────────────────
+        # The two long paragraphs that used to sit here, on the blanking gap
+        # and the event delay, are now the ⓘ beside those columns. They took
+        # roughly a third of the tab's height to explain two of fourteen
+        # settings, and sat far enough from the fields that reading one meant
+        # holding a column name in mind while scrolling.
         tk.Label(inner,
             text="Configure labels, colours, and analysis options for each "
-                 "stimulus type found in the loaded file.\n"
+                 "stimulus type found in the loaded file.  Hover or click the "
+                 "\u24d8 beside a column for what it does.\n"
                  "Click  \u2714  Confirm Setup  when ready \u2014 Run Analysis will "
-                 "not proceed until this is confirmed.\n\n"
-                 "Gap (ms): time blanked immediately before each stimulus pulse, "
-                 "so that signal which would contaminate the pre-stimulus baseline "
-                 "is excluded. The background window keeps its full length and is "
-                 "moved back: with a 10 ms gap and a 100 ms pre-stimulus window it "
-                 "runs from \u2212110 to \u221210 ms, giving 100 ms of data rather than 90. "
-                 "The larger of this and the RMS guard in Preferences is used. "
-                 "Example: in paired-pulse protocols (SICI, ICF) a conditioning pulse "
-                 "precedes the test pulse by a fixed interval \u2014 setting the gap just "
-                 "longer than that interval keeps the conditioning artefact out of the "
-                 "background EMG measurement. Leave at 0 if unused.\n\n"
-                 "Delay (ms): correction between the file's event marker and the "
-                 "instant the stimulus actually fired, when the two differ. Negative "
-                 "means the pulse came BEFORE the marker. Everything measured from "
-                 "t = 0 moves with it, including reported latencies. Press "
-                 "Detect delays to measure it from the stimulus artefact.",
+                 "not proceed until this is confirmed.",
             fg="grey", justify="left", wraplength=900
         ).grid(row=0, column=0, columnspan=13, sticky="w", padx=10, pady=(10,6))
 
@@ -6865,18 +7260,34 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         self._MUSCLE_OPTIONS   = MUSCLE_OPTIONS
 
         # ── column headers ────────────────────────────────────────────────────
-        headers = ["Stim", "Label", "Colour", "In combined",
-                   "Gap (ms)", "Delay (ms)", "Detect CSP",
+        # Pre and Post sit beside Gap and Delay because all four are timing
+        # about the pulse and are not interpretable apart. "In combined" was
+        # removed: it selected which stimulus types appeared on one figure and
+        # affected nothing else -- not the analysis, not the per-type figures,
+        # not any CSV.
+        headers = ["Stim", "Label", "Colour",
+                   "Gap (ms)", "Delay (ms)", "Pre (ms)", "Post (ms)",
+                   "Detect CSP",
                    "Normalise to (internal)", "Plateau (%)",
                    "Stim type", "Muscle group", "Min lat (ms)", "Max lat (ms)"]
+        # Each heading carries its own explanation, reached by hovering or
+        # clicking the ⓘ. Settings that need a paragraph previously had only
+        # one place to receive it -- a block of prose above the table -- which
+        # occupied the space the table needed and sat nowhere near the column
+        # it described.
         for c, h in enumerate(headers):
-            tk.Label(inner, text=h)\
-                .grid(row=2, column=c, padx=6, pady=(0,4), sticky="w")
+            _cell = tk.Frame(inner)
+            _cell.grid(row=2, column=c, padx=6, pady=(0, 4), sticky="w")
+            tk.Label(_cell, text=h).pack(side="left")
+            _help = COLUMN_HELP.get(h)
+            if _help:
+                attach_info_icon(_cell, _help).pack(side="left", padx=(3, 0))
 
         # ── per-stim rows ─────────────────────────────────────────────────────
         self._lab_entry_label   = {}
         self._lab_entry_colour  = {}
-        self._lab_entry_include = {}
+        self._lab_entry_pre     = {}
+        self._lab_entry_post    = {}
         self._lab_entry_gap     = {}
         self._lab_entry_delay   = {}
         self._lab_entry_csp     = {}
@@ -6907,16 +7318,10 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
                 .grid(row=r, column=2, padx=4, sticky="w")
             self._lab_entry_colour[stim] = v_col
 
-            # Include in combined plot
-            v_inc = tk.BooleanVar(value=self.plot_included.get(stim, True))
-            tk.Checkbutton(inner, variable=v_inc)\
-                .grid(row=r, column=3, padx=10, sticky="w")
-            self._lab_entry_include[stim] = v_inc
-
             # Gap ms
             v_gap = tk.DoubleVar(value=self.gap_ms_map.get(stim, 0.0))
             tk.Entry(inner, textvariable=v_gap, width=6)\
-                .grid(row=r, column=4, padx=4, sticky="w")
+                .grid(row=r, column=3, padx=4, sticky="w")
             self._lab_entry_gap[stim] = v_gap
 
             # Event delay: correction between the file's marker and the actual
@@ -6925,13 +7330,42 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             # neither is interpretable without the other in view.
             v_delay = tk.DoubleVar(value=self.delay_ms_map.get(stim, 0.0))
             tk.Entry(inner, textvariable=v_delay, width=6)\
-                .grid(row=r, column=5, padx=4, sticky="w")
+                .grid(row=r, column=4, padx=4, sticky="w")
             self._lab_entry_delay[stim] = v_delay
+
+            # Epoch window for this stimulus type. Blank means the file-wide
+            # setting on tab 1c, which is what every type used before these
+            # columns existed -- so a table left alone behaves as it always did.
+            # They are per type because the epoch a response needs is a
+            # property of the response: a silent period wants several hundred
+            # milliseconds after the pulse, an M-wave a few tens.
+            # Pre-filled with the file-wide values from tab 1c rather than
+            # left blank, so the window in force is visible on the row instead
+            # of being an empty box the analyst has to know the meaning of.
+            #
+            # A row still showing the 1c value follows 1c when it changes; an
+            # edited row keeps what was typed. Without that, pre-filling would
+            # sever the link silently: changing the default on 1c would leave
+            # every row showing the old number and the run would use it.
+            _win = (self.window_map or {}).get(stim) or (None, None)
+            _def_pre, _def_post = self._default_window_ms()
+            v_pre = tk.StringVar(value=(f"{_def_pre:g}" if _win[0] in (None, "")
+                                        else f"{float(_win[0]):g}"))
+            tk.Entry(inner, textvariable=v_pre, width=6)\
+                .grid(row=r, column=5, padx=4, sticky="w")
+            self._lab_entry_pre[stim] = v_pre
+
+            v_post = tk.StringVar(value=(f"{_def_post:g}" if _win[1] in (None, "")
+                                         else f"{float(_win[1]):g}"))
+            tk.Entry(inner, textvariable=v_post, width=6)\
+                .grid(row=r, column=6, padx=4, sticky="w")
+            self._lab_entry_post[stim] = v_post
+            self._last_default_pre, self._last_default_post = _def_pre, _def_post
 
             # Detect CSP
             v_csp = tk.BooleanVar(value=(stim in self.csp_types))
             tk.Checkbutton(inner, variable=v_csp)\
-                .grid(row=r, column=6, padx=10, sticky="w")
+                .grid(row=r, column=7, padx=10, sticky="w")
             self._lab_entry_csp[stim] = v_csp
 
             # Internal normalisation reference
@@ -6939,14 +7373,14 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             v_ref = tk.StringVar(value=_ref_display)
             ref_cb = ttk.Combobox(inner, textvariable=v_ref,
                                    width=26, state="readonly")
-            ref_cb.grid(row=r, column=7, padx=6, sticky="w")
+            ref_cb.grid(row=r, column=8, padx=6, sticky="w")
             self._lab_entry_ref[stim] = (v_ref, ref_cb)
 
             # Plateau tolerance (per-stim, default from global)
             v_plat = tk.DoubleVar(value=self.plateau_tolerance.get())
             tk.Spinbox(inner, from_=1, to=30, increment=1, width=5,
                        textvariable=v_plat)\
-                .grid(row=r, column=8, padx=4, sticky="w")
+                .grid(row=r, column=9, padx=4, sticky="w")
             self._lab_entry_plateau[stim] = v_plat
 
             # Stim type dropdown
@@ -6958,7 +7392,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             stype_cb = ttk.Combobox(inner, textvariable=v_stype,
                                     values=list(MUSCLE_OPTIONS.keys()),
                                     state="readonly", width=14)
-            stype_cb.grid(row=r, column=9, padx=4, sticky="w")
+            stype_cb.grid(row=r, column=10, padx=4, sticky="w")
 
             # Muscle group — restore saved value, ensuring it's valid for stim type
             _muscle_opts = MUSCLE_OPTIONS.get(_prev_stype, ["Hand / FDI"])
@@ -6968,7 +7402,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             muscle_cb = ttk.Combobox(inner, textvariable=v_muscle,
                                      values=_muscle_opts,
                                      state="readonly", width=22)
-            muscle_cb.grid(row=r, column=10, padx=4, sticky="w")
+            muscle_cb.grid(row=r, column=11, padx=4, sticky="w")
 
             self._lat_stype_vars[stim]  = v_stype
             self._lat_muscle_vars[stim] = v_muscle
@@ -6985,9 +7419,9 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             v_min = tk.DoubleVar(value=_def_min)
             v_max = tk.DoubleVar(value=_def_max)
             tk.Entry(inner, textvariable=v_min, width=5)\
-                .grid(row=r, column=11, padx=4, sticky="w")
-            tk.Entry(inner, textvariable=v_max, width=5)\
                 .grid(row=r, column=12, padx=4, sticky="w")
+            tk.Entry(inner, textvariable=v_max, width=5)\
+                .grid(row=r, column=13, padx=4, sticky="w")
 
             self._lat_min_vars[stim] = v_min
             self._lat_max_vars[stim] = v_max
@@ -7360,8 +7794,24 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
                               for k, v in self._lab_entry_label.items()}
         self.color_map     = {k: v.get()
                               for k, v in self._lab_entry_colour.items()}
-        self.plot_included = {k: v.get()
-                              for k, v in self._lab_entry_include.items()}
+        # Blank stays blank: an empty box means "use the file-wide window",
+        # and coercing it to zero would silently epoch a type over no time at
+        # all.
+        def _opt_ms(var):
+            txt = str(var.get()).strip()
+            if not txt:
+                return None
+            try:
+                return float(txt)
+            except ValueError:
+                return None
+
+        self.window_map = {}
+        for k in self._lab_entry_pre:
+            _pre = _opt_ms(self._lab_entry_pre[k])
+            _post = _opt_ms(self._lab_entry_post.get(k, tk.StringVar()))
+            if _pre is not None or _post is not None:
+                self.window_map[k] = (_pre, _post)
         self.gap_ms_map    = {k: float(v.get() or 0.)
                               for k, v in self._lab_entry_gap.items()}
         _prev_delay = dict(self.delay_ms_map)

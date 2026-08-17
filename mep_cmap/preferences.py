@@ -26,6 +26,9 @@ DEFAULTS   = {
     # Trials per stimulus type pre-selected in Preview detection's trial
     # chooser. A default, not a cap -- any subset can be chosen there.
     "preview_trials_per_type": 8,
+    # Seed for a new stimulus type's epoch window on tab 1a, in ms. The value
+    # in force is the row itself; this only decides what a fresh row starts at.
+    "default_epoch_ms": [20, 400],
 }
 DEFAULTS.update(_detection_pref_defaults())
 # Stamped so a superseded default can be recognised rather than shadowed
@@ -137,6 +140,19 @@ class Preferences:
 
     def reset(self):
         self._data = dict(DEFAULTS)
+        self.save()
+
+    @property
+    def default_epoch_ms(self):
+        """(pre_ms, post_ms) a new stimulus type's window starts at."""
+        v = self._data.get("default_epoch_ms") or [20, 400]
+        try:
+            return float(v[0]), float(v[1])
+        except Exception:
+            return 20.0, 400.0
+
+    def set_default_epoch_ms(self, pre, post):
+        self._data["default_epoch_ms"] = [float(pre), float(post)]
         self.save()
 
     @property

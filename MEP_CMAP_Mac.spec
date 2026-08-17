@@ -114,7 +114,11 @@ app = BUNDLE(
     # MEP.icns produces NO icon on macOS in practice while MEP.ico renders
     # correctly (verified on a real Mac). Leave this alone.
     icon='MEP.ico',
-    bundle_identifier='com.northumbria.mep-cmap-analyser',
+    # Reverse-DNS of a domain the author controls. Changing this makes
+    # macOS treat the app as a new one, so preferences and any codesigning
+    # identity keyed to the old identifier do not carry over -- harmless
+    # here because no signed release has used it.
+    bundle_identifier='io.github.jandrushko.mep-cmap-analyser',
     info_plist={
         'CFBundleName':              'MEP-CMAP Analyser',
         'CFBundleDisplayName':       'MEP-CMAP Analyser',

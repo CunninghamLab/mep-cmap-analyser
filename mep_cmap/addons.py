@@ -44,15 +44,34 @@ class AddonContext:
     stimulus. Add-ons write new files into `results_dir` named with `bids_prefix`.
     """
     __slots__ = ("trials", "segments", "fs", "unit", "time_ms",
+                 "time_ms_by_type",
                  "config", "results_dir", "figures_dir", "bids_prefix", "log")
 
+    def time_ms_for(self, stim_type):
+        """The time axis for one stimulus type.
+
+        Windows are per stimulus type, so a recording has no single axis. An
+        add-on that took one and applied it to every type met an axis of one
+        length and traces of another -- a broadcast error where the numbers
+        happened to differ, and a silently misaligned measurement where they
+        did not.
+        """
+        axis = self.time_ms_by_type.get(stim_type)
+        return self.time_ms if axis is None else axis
+
     def __init__(self, *, trials, segments, fs, unit, time_ms, config,
-                 results_dir, bids_prefix, log, figures_dir=None):
+                 results_dir, bids_prefix, log, figures_dir=None,
+                 time_ms_by_type=None):
         self.trials      = trials         # pandas.DataFrame | None
         self.segments    = segments       # {stim_type: ndarray[n_trials, n_samples]}
         self.fs          = fs             # float
         self.unit        = unit           # str | None
         self.time_ms     = time_ms        # 1-D ndarray (ms rel. stim, 0 = stim)
+        # {stim_type: 1-D ndarray}. Stimulus types may be epoched over
+        # different windows, so there is no single axis for a recording; use
+        # time_ms_for(). `time_ms` is retained as the first group's axis, which
+        # is what it always was and is still correct when the windows agree.
+        self.time_ms_by_type = dict(time_ms_by_type or {})
         self.config      = config         # dict
         self.results_dir = results_dir    # str  (…/ses-*/results)
         self.figures_dir = figures_dir    # str  (…/ses-*/figures) sibling of results
@@ -105,9 +124,28 @@ def load_contexts(segments_npz_path, config=None, log=print):
         segments = {stims[i]: z[f"wav_{i}"] for i in idxs}
         fs   = float(fss[idxs[0]])
         unit = units[idxs[0]] or None
+
+        # One axis per stimulus type, from that group's own pre and length.
+        # The bundle has always recorded both per group; collapsing them to the
+        # first group's values was harmless only while every type shared a
+        # window.
+        def _axis(_pre, _n):
+            return (np.arange(_n) - int(float(_pre) * fs / 1000)) / fs * 1000.0
+
+        time_ms_by_type = {}
+        for i in idxs:
+            _seg = segments[stims[i]]
+            time_ms_by_type[stims[i]] = _axis(pres[i], _seg.shape[1])
+
         pre  = float(pres[idxs[0]])
         L    = next(iter(segments.values())).shape[1]
-        time_ms = (np.arange(L) - int(pre * fs / 1000)) / fs * 1000.0
+        time_ms = _axis(pre, L)
+        _shapes = {(float(pres[i]), segments[stims[i]].shape[1]) for i in idxs}
+        if len(_shapes) > 1:
+            log(f"add-ons: {fname} has stimulus types epoched over different "
+                f"windows; add-ons using context.time_ms rather than "
+                f"context.time_ms_for(stim_type) will see only "
+                f"{stims[idxs[0]]}'s axis")
 
         tdf = trials_df
         if trials_df is not None and "File" in trials_df.columns:
@@ -116,6 +154,7 @@ def load_contexts(segments_npz_path, config=None, log=print):
         prefix = f"{run_prefix}_{fname}" if multi else run_prefix
         contexts.append(AddonContext(
             trials=tdf, segments=segments, fs=fs, unit=unit, time_ms=time_ms,
+            time_ms_by_type=time_ms_by_type,
             config=dict(config or {}), results_dir=results_dir,
             figures_dir=figures_dir, bids_prefix=prefix, log=log))
     return contexts

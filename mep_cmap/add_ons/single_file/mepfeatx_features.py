@@ -477,18 +477,16 @@ def run(context):
 
     log = context.log
     fs = float(context.fs)
+    _t_ms_for = getattr(context, "time_ms_for", None)
     time_ms = np.asarray(context.time_ms, float)
     scale, assumed = _unit_scale_to_uV(context.unit)
     if assumed:
         log(f"mepfeatx: amplitude unit '{context.unit}' unrecognised — assuming microvolts "
             f"(the 50 uV MEP floor may not apply correctly).")
 
-    # background window clamped to the available pre-stimulus samples
-    pre_avail = float(time_ms.min())
-    t_bg = [max(-40.0, pre_avail + 1.0 / fs), -5.0]
-    if t_bg[1] <= t_bg[0]:
-        raise ValueError("mepfeatx: not enough pre-stimulus baseline for the -40..-5 ms window "
-                         f"(segment starts at {pre_avail:.1f} ms). Increase pre_ms in Stage 1a.")
+    # The background window is clamped to the available pre-stimulus samples,
+    # which is a property of each stimulus type's epoch rather than of the
+    # file; computed inside the loop below.
 
     plot = bool((context.config or {}).get("mepfeatx_plot", True))
     debug = bool((context.config or {}).get("mepfeatx_debug", False))
@@ -507,6 +505,16 @@ def run(context):
     reject_counts = {}
     details_by_stim = {}     # stim_type -> [(trial_idx, detail, feats, found, y_uV), ...]
     for stim_type, stack in context.segments.items():
+        time_ms = np.asarray(_t_ms_for(stim_type) if _t_ms_for
+                             else context.time_ms, float)
+        pre_avail = float(time_ms.min())
+        t_bg = [max(-40.0, pre_avail + 1.0 / fs), -5.0]
+        if t_bg[1] <= t_bg[0]:
+            raise ValueError(
+                f"mepfeatx: '{stim_type}' has too little pre-stimulus baseline "
+                f"for the -40..-5 ms window (its epoch starts at "
+                f"{pre_avail:.1f} ms). Increase Pre (ms) for this stimulus "
+                f"type on tab 1a.")
         stack = np.asarray(stack, float)
         t_onset = _onset_window(context.config, stim_type)
         thr = {
@@ -564,7 +572,12 @@ def run(context):
                                     os.path.join(fig_dir,
                                     f"{context.bids_prefix}_stim-{stim_type}_trial-{ti:03d}.png"))
                         n_png += 1
-                _plot_montage(items, stim_type, "uV", time_ms,
+                # This type's own axis, not whichever one the measuring loop
+                # happened to leave behind: the figures are drawn in a second
+                # pass, so the variable had already moved on.
+                _mt = np.asarray(_t_ms_for(stim_type) if _t_ms_for
+                                 else context.time_ms, float)
+                _plot_montage(items, stim_type, "uV", _mt,
                               os.path.join(fig_dir,
                               f"{context.bids_prefix}_stim-{stim_type}_montage.png"))
                 n_png += 1

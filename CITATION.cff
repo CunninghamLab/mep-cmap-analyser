@@ -14,7 +14,6 @@ authors:
   - family-names: "Andrushko"
     given-names: "Justin W."
     orcid: "https://orcid.org/0000-0003-2258-1689"
-    affiliation: "School of Sport, Exercise and Rehabilitation, Northumbria University, Newcastle upon Tyne, UK"
 repository-code: "https://github.com/jandrushko/mep-cmap-analyser"
 url: "https://pypi.org/project/mep-cmap-analyser/"
 identifiers:

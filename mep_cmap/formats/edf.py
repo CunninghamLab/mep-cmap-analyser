@@ -145,6 +145,47 @@ def _read_annotations(file_path: str):
     return out or None
 
 
+def event_source_summary(file_path: str) -> str:
+    """Which source the events came from, and whether the other disagrees.
+
+    A sibling _events.tsv wins outright over the annotations inside the file,
+    and nothing said so. A TSV written from an earlier, cropped run therefore
+    silently replaced the recording's own markers: stimulus types present in
+    the EDF went missing, and the events stopped where that crop had, on a file
+    whose annotations ran to the end. Both symptoms, one precedence rule, no
+    indication of which source was in use.
+
+    Returns a line for the log, or "" when there is nothing to report.
+    """
+    tsv_path = _events_tsv_path(file_path)
+    tsv = _read_events_tsv(tsv_path)
+    if not tsv:
+        return ""
+
+    n_tsv = sum(len(v) for v in tsv.values())
+    line = (f"events from {os.path.basename(tsv_path)} "
+            f"({n_tsv} event(s), {', '.join(sorted(tsv))}), "
+            f"which takes precedence over the file's own annotations")
+
+    try:
+        ann = _read_annotations(file_path)
+    except Exception:
+        return line
+    if not ann:
+        return line
+
+    missing = sorted(set(ann) - set(tsv))
+    n_ann = sum(len(v) for v in ann.values())
+    if missing or n_ann != n_tsv:
+        line += (f".  The file itself carries {n_ann} event(s) in "
+                 f"{', '.join(sorted(ann))}")
+        if missing:
+            line += f"; {', '.join(missing)} appear only there"
+        line += (".  Delete or regenerate the .tsv to use the file's own "
+                 "markers")
+    return line
+
+
 def extract_stim_times(file_path: str, marker_name: str = None) -> dict:
     """
     Stim timestamps grouped by trial type, in seconds.

@@ -71,7 +71,7 @@ def run(context):
     your own computation; keep the read-from-context / write-new-file shape.
     """
     fs         = context.fs
-    time_ms    = np.asarray(context.time_ms)
+    _t_ms_for  = getattr(context, "time_ms_for", None)
     unit       = context.unit or "a.u."      # varies by format; may be None
     cfg        = context.config
     log        = context.log
@@ -81,16 +81,20 @@ def run(context):
     win_end_ms   = float(cfg.get("ptp_end",   50.0))
     dt           = 1.0 / fs
 
-    # Boolean mask selecting the window on the shared time axis.
-    in_window = (time_ms >= win_start_ms) & (time_ms <= win_end_ms)
-    if not in_window.any():
-        raise ValueError(
-            f"{ADDON_NAME}: analysis window {win_start_ms}-{win_end_ms} ms "
-            f"falls outside the segment time axis."
-        )
+    # The window mask is per stimulus type, since each may be epoched over a
+    # different span; built inside the loop below.
 
     rows = []
     for stim_type, stack in context.segments.items():
+        time_ms = np.asarray(_t_ms_for(stim_type) if _t_ms_for
+                             else context.time_ms)
+        in_window = (time_ms >= win_start_ms) & (time_ms <= win_end_ms)
+        if not in_window.any():
+            raise ValueError(
+                f"{ADDON_NAME}: analysis window {win_start_ms}-{win_end_ms} ms "
+                f"falls outside {stim_type}'s time axis "
+                f"({time_ms[0]:.1f} to {time_ms[-1]:.1f} ms)."
+            )
         stack = np.asarray(stack, dtype=float)          # [n_trials, n_samples]
         for trial_idx, trace in enumerate(stack):
             windowed = np.abs(trace[in_window])

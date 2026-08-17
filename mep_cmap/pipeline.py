@@ -129,7 +129,49 @@ def clamp_config_to_epoch_bounds(cfg, bounds):
         if new != old:
             _set(field, new)
             changes.append((field, old, new))
+
+    # Per-stimulus-type windows are clamped too, for exactly the reason the
+    # file-wide pair is. A pre-epoched recording contains nothing outside its
+    # own epoch, so a window reaching past it draws its baseline from the
+    # previous trial's response and reports that as background EMG. Adding a
+    # per-type column without this would have made that contamination
+    # reachable again through a route the clamp did not know about.
+    _wmap = _get('window_map') or {}
+    if _wmap:
+        _clamped, _wchanges = clamp_window_map(_wmap, pre_avail, post_avail)
+        changes.extend(_wchanges)
+        _set('window_map', _clamped)
     return cfg, changes
+
+
+def clamp_window_map(window_map, pre_avail, post_avail):
+    """Clamp {stim_type: (pre_ms, post_ms)} to what the file contains.
+
+    Separate from clamp_config_to_epoch_bounds because the same map is held in
+    two places: once file-wide in the parameters, and once per channel in the
+    per-channel setup. The analysis reads the per-channel copy in preference,
+    so clamping only the first left the run using the unclamped window while
+    everything else used the clamped one -- and on a stitched pre-epoched
+    recording the extra samples are mirror-padded guard band, drawn as a flat
+    line and indistinguishable from a quiet trace.
+
+    Returns (clamped_map, changes).
+    """
+    out, changes = {}, []
+    for stim_type, win in (window_map or {}).items():
+        try:
+            pre, post = win
+        except Exception:
+            out[stim_type] = win
+            continue
+        new_pre = None if pre in (None, "") else min(float(pre), pre_avail)
+        new_post = None if post in (None, "") else min(float(post), post_avail)
+        if pre not in (None, "") and new_pre != float(pre):
+            changes.append((f"window_map[{stim_type}].pre", pre, new_pre))
+        if post not in (None, "") and new_post != float(post):
+            changes.append((f"window_map[{stim_type}].post", post, new_post))
+        out[stim_type] = (new_pre, new_post)
+    return out, changes
 
 
 # Short alias so the field list below stays readable.
@@ -256,8 +298,18 @@ class PipelineConfig:
     # Output labels / colours
     custom_labels:   dict = field(default_factory=dict)
     color_map:       dict = field(default_factory=dict)
-    plot_included:   dict = field(default_factory=dict)
     gap_ms_map:      dict = field(default_factory=dict)
+    # Per-stimulus-type epoch window, {stim_type: (pre_ms, post_ms)}. A type
+    # absent from the map uses the file-wide pre_ms/post_ms, so an empty map
+    # reproduces the single-window behaviour exactly -- there is one code path,
+    # and the shared window is its degenerate case.
+    #
+    # It exists because the epoch a response needs is a property of the
+    # response: a cortical silent period wants several hundred milliseconds
+    # after the pulse, an M-wave a few tens, and forcing both to share a window
+    # means either truncating the first or carrying an order of magnitude of
+    # unnecessary samples through every trial of the second.
+    window_map:      dict = field(default_factory=dict)
     # Per-stimulus-type correction, in ms, between the file's event marker and
     # the actual stimulus. Negative means the pulse fired BEFORE the marker.
     # Applied when epoching, so every measure defined from t=0 follows.
@@ -429,6 +481,35 @@ def pipeline_prestim_rms(prestim, cfg: PipelineConfig = None, axis=None):
     return compute_prestim_rms(prestim, demean=demean, axis=axis)
 
 
+def resolve_window(cfg: PipelineConfig, stim_type: str):
+    """This stimulus type's (pre_ms, post_ms), falling back to the file-wide pair.
+
+    One accessor, so every stage answers the question the same way. Reading
+    cfg.window_map directly in each place is how the pre-stimulus window and
+    the amplitude window would come to disagree about where a trial starts.
+    """
+    win = (cfg.window_map or {}).get(stim_type)
+    if not win:
+        return float(cfg.pre_ms), float(cfg.post_ms)
+    pre, post = win
+    pre = float(cfg.pre_ms) if pre in (None, "") else float(pre)
+    post = float(cfg.post_ms) if post in (None, "") else float(post)
+    return pre, post
+
+
+def window_samples(cfg: PipelineConfig, stim_type: str, fs: float):
+    """(samples_before, samples_after) for one stimulus type."""
+    pre, post = resolve_window(cfg, stim_type)
+    return int(pre * fs / 1000), int(post * fs / 1000)
+
+
+def time_axis_for(cfg: PipelineConfig, stim_type: str, fs: float):
+    """The latency axis, in ms, for one stimulus type's epochs."""
+    pre, post = resolve_window(cfg, stim_type)
+    before, after = window_samples(cfg, stim_type, fs)
+    return np.linspace(-pre, post, before + after, endpoint=False)
+
+
 def pipeline_extract_segments(time, emg, stim_times, stim_types, fs,
                                cfg: PipelineConfig):
     """Extract per-trial EMG and pre-stim segments for every stim type.
@@ -441,8 +522,6 @@ def pipeline_extract_segments(time, emg, stim_times, stim_types, fs,
     preserved so downstream stages can reconstruct chronological trial order
     across stim types for session-level detrending and other analyses.
     """
-    samples_before  = int(cfg.pre_ms     * fs / 1000)
-    samples_after   = int(cfg.post_ms    * fs / 1000)
     prestim_samples = int(cfg.prestim_ms * fs / 1000)
 
     result = {}
@@ -451,6 +530,9 @@ def pipeline_extract_segments(time, emg, stim_times, stim_types, fs,
     for stim_type in stim_types:
         valid_times = [t for t in stim_times[stim_type]
                        if time.min() <= t <= time.max()]
+        # Per type, alongside the gap and the delay: the window is the same
+        # kind of quantity as those, and was the only one still shared.
+        samples_before, samples_after = window_samples(cfg, stim_type, fs)
         gap_samples = int(cfg.gap_ms_map.get(stim_type, 0.0) * fs / 1000)
         # The background-EMG window must clear the stimulus artefact. Use the
         # larger of the configured guard and this stim type's artefact gap, so a
@@ -1714,25 +1796,37 @@ def pipeline_write_outputs(latency_manual, results_out, bids_prefix,
             .pipe(_tag_channel).to_csv(_p("summary_with_outliers.csv"), index=False)
 
 
-def pipeline_generate_plots(trace_stats, time_axis, segments_metadata,
-                             color_map, custom_labels, plot_included,
+def pipeline_generate_plots(trace_stats, segments_metadata,
+                             color_map, custom_labels,
                              figures_out, figures_all, bids_prefix, name, unit,
                              enable_individual, cfg: PipelineConfig):
-    """Save the combined trace figure and (optionally) per-stim-type figures."""
+    """Save the combined trace figure and (optionally) per-stim-type figures.
+
+    Each entry of trace_stats carries its own latency axis, because stimulus
+    types may be epoched over different windows and one shared axis could not
+    describe them. Matplotlib draws lines of differing length on shared axes
+    without complaint, and the result is more honest than stretching a short
+    window to fill the plot: a type measured over less time occupies less of
+    the axis.
+
+    The former plot_included filter is gone. It selected which types appeared
+    on the combined figure and did nothing else -- not the analysis, not the
+    per-type figures, not any CSV -- and a control that changes one image was
+    not worth a column on a table where the epoch window now needs two.
+    """
     def _ylab(base="EMG"):
         return f"{base} ({unit})" if unit else base
 
     # Combined figure
     fig = matplotlib.figure.Figure(figsize=(12, 6))
     ax  = fig.add_subplot(111)
-    for stim_type, segments, emg_segments, mean_trace, mean_ptp in trace_stats:
-        if plot_included and not plot_included.get(stim_type, True):
-            continue
+    for stim_type, segments, emg_segments, mean_trace, mean_ptp, t_axis \
+            in trace_stats:
         color      = color_map.get(stim_type, "gray")
         label_name = custom_labels.get(stim_type, stim_type)
         for s in emg_segments:
-            ax.plot(time_axis, s, color=color, alpha=0.2, linewidth=0.5)
-        ax.plot(time_axis, mean_trace, color=color, linewidth=3,
+            ax.plot(t_axis, s, color=color, alpha=0.2, linewidth=0.5)
+        ax.plot(t_axis, mean_trace, color=color, linewidth=3,
                 label=f"{label_name} Mean PTP: {mean_ptp:.2f}")
     ax.axvline(0, color="black", linestyle="--")
     ax.set_title(f"{name} – EMG Responses")
@@ -1744,14 +1838,15 @@ def pipeline_generate_plots(trace_stats, time_axis, segments_metadata,
     fig.clf()
 
     if enable_individual:
-        for stim_type, segments, emg_segments, mean_trace, mean_ptp in trace_stats:
+        for stim_type, segments, emg_segments, mean_trace, mean_ptp, t_axis \
+                in trace_stats:
             color      = color_map.get(stim_type, "gray")
             label_name = custom_labels.get(stim_type, stim_type)
             fig_i = matplotlib.figure.Figure(figsize=(12, 6))
             ax_i  = fig_i.add_subplot(111)
             for s in emg_segments:
-                ax_i.plot(time_axis, s, color=color, alpha=0.2, linewidth=0.5)
-            ax_i.plot(time_axis, mean_trace, color=color, linewidth=3,
+                ax_i.plot(t_axis, s, color=color, alpha=0.2, linewidth=0.5)
+            ax_i.plot(t_axis, mean_trace, color=color, linewidth=3,
                       label=f"{label_name} Mean PTP: {mean_ptp:.2f}")
             ax_i.axvline(0, color="black", linestyle="--")
             ax_i.set_title(f"{name} – {label_name} Responses")
@@ -1813,9 +1908,12 @@ def pipeline_assemble_condition_means(stats_per_type, emg, time, fs, cfg,
                  "n": int}}   Conditions with no usable clean trials are skipped.
     """
     _insp_sb = int(cfg.prestim_ms * fs / 1000)
-    _insp_sa = int(cfg.post_ms    * fs / 1000)
     means = {}
     for stim_type, info in stats_per_type.items():
+        # Per type, matching the analysis and the Inspector: an average built
+        # over a different window from the trials it averages is not their
+        # average.
+        _insp_sa = window_samples(cfg, stim_type, fs)[1]
         stim_ts = info.get("stim_times_s", [])
         out     = info.get("outlier_set", set()) or set()
         clean   = []
@@ -2173,7 +2271,7 @@ def run_pipeline(input_path,
                  filter_order,
                  filter_family="butter", cheby_ripple=1.0,
                  flexible_bandpass=False, hp_order=2, lp_order=2,
-                 custom_labels=None, color_map=None, plot_included=None,
+                 custom_labels=None, color_map=None, window_map=None,
                  enable_individual_plots=True,
                  log_callback=print,
                  marker_name="Keyboard",
@@ -2260,7 +2358,7 @@ def run_pipeline(input_path,
         enable_outlier_review=enable_outlier_review,
         custom_labels=custom_labels or {},
         color_map=color_map or {},
-        plot_included=plot_included or {},
+        window_map=window_map or {},
         gap_ms_map=gap_ms_map or {},
         delay_ms_map=delay_ms_map or {},
         reference_map=reference_map or {},
@@ -2407,19 +2505,27 @@ def run_pipeline(input_path,
             emg = pipeline_apply_filters(emg, fs, cfg)
 
             # ── Stage 3: Extract segments ─────────────────────────────────────
-            samples_before = int(pre_ms  * fs / 1000)
-            samples_after  = int(post_ms * fs / 1000)
-            time_axis      = np.linspace(-pre_ms, post_ms,
-                                         samples_before + samples_after,
-                                         endpoint=False)
-            ptp_start_idx  = samples_before + int(ptp_start * fs / 1000)
-            ptp_end_idx    = samples_before + int(ptp_end   * fs / 1000)
+            # Windows are per stimulus type now, so there is no single
+            # samples_before, time_axis or amplitude index for the file. Each
+            # is resolved where it is used, from the type being handled.
+            def _win_s(_st):
+                return window_samples(cfg, _st, fs)
+
+            def _axis(_st):
+                return time_axis_for(cfg, _st, fs)
+
+            def _ptp_idx(_st):
+                _b, _a = _win_s(_st)
+                return (_b + int(ptp_start * fs / 1000),
+                        _b + int(ptp_end   * fs / 1000))
 
             all_segments = pipeline_extract_segments(
                 time, emg, stim_times, stim_types, fs, cfg)
 
             # ── Stage 4: Save "with-outliers" CSVs and figures ────────────────
             for stim_type, segs in all_segments.items():
+                samples_before, samples_after = _win_s(stim_type)
+                time_axis = _axis(stim_type)
                 emg_all  = np.array([s[0] for s in segs])
                 mean_all = emg_all.mean(axis=0)
                 df_all   = pd.DataFrame(emg_all).T
@@ -2458,8 +2564,9 @@ def run_pipeline(input_path,
                 mean_tr   = emg_segs.mean(axis=0)
                 mean_ptp  = float(_np_ptp(mean_tr))
 
+                _p0, _p1 = _ptp_idx(stim_type)
                 ptps, rms_vals, preptp, rms_z, ptp_z, out_idx = pipeline_detect_outliers(
-                    emg_segs, pre_segs, ptp_start_idx, ptp_end_idx, cfg)
+                    emg_segs, pre_segs, _p0, _p1, cfg)
 
                 rejected, log_entries = pipeline_review_outliers(
                     stim_type, name, emg_segs, pre_segs,
@@ -2521,7 +2628,12 @@ def run_pipeline(input_path,
                 # peak-to-peak read from the wrong samples while every
                 # uncorrected condition was fine.
                 _insp_sb = int(cfg.prestim_ms * fs / 1000)
-                _insp_sa = int(cfg.post_ms    * fs / 1000)
+                # Pre stays prestim_ms -- the inspector deliberately shows a
+                # wider lead-in than the analysis window. Post is the analysis
+                # window and is now per type, so a type epoched over 500 ms
+                # after the pulse is reviewed over 500 ms rather than being
+                # cut to whatever the file-wide setting happened to be.
+                _insp_sa = window_samples(cfg, stim_type, fs)[1]
                 _insp_delay = int(round(
                     float(cfg.delay_ms_map.get(stim_type, 0.0)) * fs / 1000.0))
                 for _t0 in [t for t in stim_times.get(stim_type, [])
@@ -2532,7 +2644,11 @@ def run_pipeline(input_path,
                     _seg = emg[max(0,_ix-_insp_sb):_ix+_insp_sa]
                     if len(_seg) == _insp_sb + _insp_sa:
                         segments_inspector[stim_type].append(_seg)
-                trace_stats.append((stim_type, segs, emg_segs, mean_tr, mean_ptp))
+                # The axis travels with the traces: the combined figure draws
+                # types whose windows differ, so a single shared axis could not
+                # describe all of them.
+                trace_stats.append((stim_type, segs, emg_segs, mean_tr,
+                                    mean_ptp, _axis(stim_type)))
 
                 ptp_data.setdefault(stim_type, []).extend(ptps.tolist())
                 rms_data.setdefault(stim_type, []).extend(rms_vals.tolist())
@@ -2550,9 +2666,10 @@ def run_pipeline(input_path,
             # are one computation. auto_onsets_by_type: {stim_type: {idx: ms}}.
             auto_onsets_by_type = {}
             for _st, _info in stats_per_type.items():
+                _p0, _p1 = _ptp_idx(_st)
                 auto_onsets_by_type[_st] = pipeline_detect_onsets(
                     _st, _info["segs_all"], _info["outlier_set"],
-                    ptp_start_idx, ptp_end_idx, fs, cfg,
+                    _p0, _p1, fs, cfg,
                     log_callback=log_callback)
 
             # ── Stage 5d: PTP window per stimulus type ────────────────────────
@@ -2563,9 +2680,11 @@ def run_pipeline(input_path,
             # where amplitude is measured.
             ptp_window_by_type = {}
             for _st in stats_per_type:
+                _p0, _p1 = _ptp_idx(_st)
+                _sb, _sa = _win_s(_st)
                 ptp_window_by_type[_st] = ptp_window_for_stim_type(
                     _st, auto_onsets_by_type.get(_st, {}), fs, cfg,
-                    ptp_start_idx, ptp_end_idx, samples_before,
+                    _p0, _p1, _sb,
                     log_callback=log_callback)
             # Seed for the inspector, in inspector index space (stim @ _insp_sb).
             _insp_sb_seed = int(round(cfg.prestim_ms * fs / 1000))
@@ -2741,7 +2860,7 @@ def run_pipeline(input_path,
                     info["outlier_set"], excluded_sets[stim_type],
                     segments_metadata,
                     *ptp_window_by_type.get(
-                        stim_type, (ptp_start_idx, ptp_end_idx, None))[:2],
+                        stim_type, _ptp_idx(stim_type) + (None,))[:2],
                     fs, cfg, custom_labels or {}, name,
                     auto_onsets_by_type.get(stim_type, {}),
                     log_callback=log_callback,
@@ -2810,9 +2929,9 @@ def run_pipeline(input_path,
                     os.remove(_old_fig)
                 except Exception:
                     pass
-            combined_plot = pipeline_generate_plots(
-                trace_stats, time_axis, segments_metadata,
-                cfg.color_map, cfg.custom_labels, cfg.plot_included,
+            pipeline_generate_plots(
+                trace_stats, segments_metadata,
+                cfg.color_map, cfg.custom_labels,
                 figures_out, figures_all, _bids_prefix, name, unit,
                 enable_individual_plots, cfg)
 

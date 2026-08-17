@@ -242,7 +242,18 @@ class DataInspectorWindow:
         # _condition_template. Invalidated when an exclusion changes.
         self._template_cache = {}
         self._is_closing = False
-        self.t         = time_axis
+        # time_axis may be one array, or {stim_type: array} where stimulus
+        # types are epoched over different windows. Held as a mapping either
+        # way and re-selected whenever the displayed type changes, so every
+        # index-to-latency conversion below -- marker placement, the AUC
+        # window, the reported latencies -- uses the axis belonging to the
+        # trial on screen rather than to whichever type happened to be first.
+        if isinstance(time_axis, dict):
+            self._axes_by_type = dict(time_axis)
+            self.t = next(iter(time_axis.values())) if time_axis else None
+        else:
+            self._axes_by_type = {}
+            self.t = time_axis
         self.meta      = metadata_dict
         self.snap_radius = 8
         self.label_map = label_map or {}
@@ -256,7 +267,13 @@ class DataInspectorWindow:
         self.ptp_windows_by_type  = dict(ptp_windows_by_type or {})
         # visible_pre_ms: how much pre-stim to SHOW (xlim)
         # _analysis_pre_ms: full pre-stim used for detection (may be larger)
-        self.visible_pre_ms       = visible_pre_ms
+        # May be one number, or {stim_type: pre_ms} where types are epoched
+        # over different windows. Resolved per trial rather than at
+        # construction, since the displayed type changes.
+        self._visible_pre_map = (dict(visible_pre_ms)
+                                 if isinstance(visible_pre_ms, dict) else {})
+        self.visible_pre_ms = (None if self._visible_pre_map
+                               else visible_pre_ms)
         self.onset_method              = onset_method
         self.onset_bootstrap_crit      = onset_bootstrap_crit
         self.onset_bootstrap_n         = onset_bootstrap_n
@@ -460,6 +477,7 @@ class DataInspectorWindow:
         self.btn_row.pack(side="bottom", pady=(0, 8))    # 👈 ALWAYS at the bottom
         # --------- internal state ---------------------------------------
         self.cur_type = self.dd_event["values"][0]
+        self._select_axis()
         self.cur_idx  = 0
         self.dd_event.current(0)
 
@@ -509,6 +527,7 @@ class DataInspectorWindow:
         self._save_note_from_widget()
         self._silent_per_type[self.cur_type] = self.enable_silent.get()
         self.cur_type, self.cur_idx = self.dd_event.get(), 0
+        self._select_axis()
         self._plot()
 
     def _next(self):
@@ -713,6 +732,18 @@ class DataInspectorWindow:
             if key in self.meta and 'note' in self.meta[key]:
                 del self.meta[key]['note']
     
+    def _select_axis(self):
+        """Point self.t and the x-limit at the current type's window."""
+        if self._visible_pre_map:
+            _vp = self._visible_pre_map.get(self.cur_type)
+            if _vp is not None:
+                self.visible_pre_ms = float(_vp)
+        if not self._axes_by_type:
+            return
+        axis = self._axes_by_type.get(self.cur_type)
+        if axis is not None:
+            self.t = axis
+
     def _resize_window(self):
         """Resize the Toplevel so every widget (note box included) is visible.
         Skipped when the window is maximised — geometry() would un-maximise it."""

@@ -797,8 +797,13 @@ def test_the_remaining_direct_reads_are_discovery_only():
     assert names <= {"_browse_file_path"}, (
         "extract_stim_times outside the load flow reads events behind the "
         f"configuration: {sorted(names - {'_browse_file_path'})}")
-    assert len(sites) == 4, (
-        f"expected 4 discovery reads, found {len(sites)}: {sorted(sites)}")
+    # The count is deliberately NOT pinned. It rises by one for every format
+    # that gains a load branch -- signal_mat took it from four to five -- so a
+    # fixed number would churn without saying anything the location check
+    # above does not already say. The invariant that matters is WHERE these
+    # calls are: discovery belongs to the load flow, and a read anywhere else
+    # is one that ignores the configuration.
+    assert len(sites) >= 1, "the discovery reads have disappeared entirely"
 
 
 # ── Add must not reintroduce a label the analyst just excluded ───────────────

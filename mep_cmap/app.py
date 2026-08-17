@@ -5341,6 +5341,43 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             else:
                 self.log("   ⚠️  No stimulus events found in this file")
 
+        elif _fmt == 'signal_mat':
+            # CED Signal MATLAB export: frames are trials already cut around
+            # the trigger, and each frame carries a state label, so the states
+            # arrive as StimTypes. No unit dialogue -- unlike epoched_mat, the
+            # export states its unit per channel.
+            self.log("📋 CED Signal MATLAB export detected — frames already "
+                     "cut around the trigger")
+            try:
+                from .formats.signal_mat import (
+                    get_epoch_bounds as _sig_bounds,
+                    get_trial_count  as _sig_ntrial,
+                    list_frame_states as _sig_states,
+                )
+                _pre, _post = _sig_bounds(fpath)
+                self.log(f"   {_sig_ntrial(fpath)} frame(s) | window "
+                         f"-{_pre:g} to +{_post:g} ms about the trigger")
+                _states = _sig_states(fpath)
+                if _states:
+                    self.log("   Frame states: " + ", ".join(_states))
+            except Exception as _e:
+                self.log(f"❌ Error reading Signal export: {_e}")
+                return
+
+            self.marker_choice.set('A')
+            try:
+                stim_events = extract_stim_times(fpath, '')
+            except Exception as _e:
+                self.log(f"   ⚠️  Could not read frame times: {_e}")
+                stim_events = {}
+            if stim_events:
+                self.available_markers = sorted(stim_events)
+                self.marker_choice.set(sorted(stim_events)[0])
+                self.log("   Stim types found: " + ", ".join(
+                    f"{k} ({len(v)})" for k, v in sorted(stim_events.items())))
+            else:
+                self.log("   ⚠️  No frames found in this file")
+
         elif _fmt in ('acqknowledge_acq', 'acqknowledge_mat', 'brainsight'):
             # Trigger/marker-channel formats: one stim type, labelled by
             # marker_choice — same contract as labchart / cfwb.
@@ -6061,7 +6098,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
                 self.log(f"   Marker codes in range: {', '.join(sorted(stim_types_found))}")
 
         elif _fmt in ('edf', 'brainvision', 'labchart_mat', 'mne',
-                      'epoched_mat'):
+                      'epoched_mat', 'signal_mat'):
             # Marker-based formats (BIDS EDF/BDF sidecar _events.tsv or EDF+
             # annotations; BrainVision .vmrk; LabChart .mat comments; MNE
             # annotations) — read the actual labels present so the labels tab

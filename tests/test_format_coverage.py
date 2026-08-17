@@ -152,7 +152,7 @@ def test_detect_format_returns_known_set():
         "spike2", "spike2_smr", "labchart", "labchart_mat", "cfwb",
         "generic_tsv", "edf", "brainvision", "brainsight",
         "acqknowledge_acq", "acqknowledge_mat", "mne",
-        "epoched_mat",
+        "epoched_mat", "signal_mat",
     }
 
 

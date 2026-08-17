@@ -41,6 +41,7 @@ hiddenimports += collect_submodules('pywt')
 hiddenimports += collect_submodules('mpl_toolkits')
 hiddenimports += collect_submodules('pyedflib')   # BIDS-ify EDF/BDF writer (C ext)
 hiddenimports += collect_submodules('statsmodels') # EMG excitability compensation (QR)
+hiddenimports += collect_submodules('h5py')       # CED Signal MATLAB v7.3 exports (HDF5)
 hiddenimports += collect_submodules('patsy')       # statsmodels formula dependency
 
 # Explicit extras that PyInstaller sometimes misses

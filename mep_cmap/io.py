@@ -65,6 +65,7 @@ from .formats import brainsight  as _brainsight
 from .formats import acqknowledge_mat as _acqknowledge_mat
 from .formats import acqknowledge_acq as _acqknowledge_acq
 from .formats import epoched_mat  as _epoched_mat
+from .formats import signal_mat   as _signal_mat
 from .formats import brainvision  as _brainvision
 from .formats import edf          as _edf
 from .formats import cfwb        as _cfwb
@@ -133,8 +134,9 @@ UNREADABLE_FORMATS = {
                 "from LabChart as text (File → Export) or as an ADInstruments "
                 "binary (.adibin), both of which this tool reads."),
     ".adidat": ("ADInstruments LabChart data file. Export as text or .adibin."),
-    ".cfs":    ("CED Signal/CFS format. Export from Signal as a Spike2 (.smr) "
-                "file or as text."),
+    ".cfs":    ("CED Signal CFS format. In Signal, use File \u2192 Export As "
+                "\u2192 MATLAB, which this tool reads directly, or export as "
+                "Spike2 (.smr) or as text."),
     ".s2r":    ("Spike2 resource file, not a recording. Open the .smr instead."),
 }
 
@@ -179,6 +181,15 @@ def detect_format(file_path: str) -> str:
     # ── Binary formats: check magic bytes before opening as text ─────────────
     if _cfwb.is_cfwb(file_path):
         return 'cfwb'
+
+    # CED Signal MATLAB export (.mat) — checked FIRST among the .mat readers
+    # because it is the only one written as MATLAB v7.3. The others go through
+    # scipy.io.loadmat, which refuses v7.3 outright, so a Signal export used to
+    # fall past all three and report unsupported_binary. The test is eight
+    # magic bytes before h5py is imported at all, so it costs nothing for the
+    # .mat files that are not Signal exports.
+    if ext == '.mat' and _signal_mat.is_signal_mat(file_path):
+        return 'signal_mat'
 
     # LabChart MATLAB export (.mat) — verify signature vars without loading data
     if ext == '.mat' and _labchart_mat.is_labchart_mat(file_path):
@@ -282,16 +293,63 @@ def needs_wizard(file_path: str) -> bool:
 # Public API — dispatches to the correct format reader
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _unreadable_reason(file_path: str) -> str:
+    """Why this file cannot be read, in words the analyst can act on."""
+    ext = _os.path.splitext(file_path)[1].lower()
+    if ext == ".mat" and _signal_mat.looks_like_mat73(file_path) \
+            and not _signal_mat.h5py_available():
+        # A missing package is not an unreadable file, and only one of those
+        # is something the analyst can do anything about. is_signal_mat has to
+        # swallow the ImportError to stay total, so the distinction is drawn
+        # here instead.
+        return ("This is a MATLAB v7.3 file, which is HDF5 rather than the "
+                "older MATLAB format, and reading it needs the h5py package. "
+                "Install it with:  pip install h5py")
+    if ext == ".mat" and _is_signal_cfs_mat(file_path):
+        # Signal writes two different MATLAB files. The frame-based export is
+        # read by signal_mat; this one is a dump of the CFS container and has
+        # no waveform matrix to read.
+        return ("This is a CED Signal CFS-export MATLAB file, which holds the "
+                "CFS container rather than the sweeps. In Signal, use "
+                "File \u2192 Export As \u2192 MATLAB instead, which writes the "
+                "frame data this tool reads.")
+    return UNREADABLE_FORMATS.get(
+        ext,
+        "This file is not in a format the tool can read. The readable formats "
+        "are listed in File \u2192 Open.")
+
+
+def _is_signal_cfs_mat(file_path: str) -> bool:
+    """True for Signal's CFS-container MATLAB dump (a 'CfsFile' variable)."""
+    try:
+        import scipy.io as _sio
+        keys = _sio.whosmat(file_path)
+        return any(str(name) == "CfsFile" for name, _shape, _cls in keys)
+    except Exception:
+        return False
+
+
 def list_waveform_channels(file_path: str) -> list:
     """Return channel names for display in the channel selector."""
     file_path = _resolve_path(file_path)
     fmt = detect_format(file_path)
+    if fmt == 'unsupported_binary':
+        # Raised here rather than left to a reader further down. This function
+        # is what the file queue calls to warm a file up, before
+        # _browse_file_path and its unsupported-format message are reached, so
+        # without this the analyst saw whatever the text reader said when it
+        # was handed binary -- on a build with the Rust extension, "stream did
+        # not contain valid UTF-8", which names neither the file nor the fix.
+        raise ValueError(
+            f"{_os.path.basename(file_path)}: {_unreadable_reason(file_path)}")
     if fmt == 'spike2_smr':
         return _spike2_smr.list_waveform_channels(file_path)
     if fmt == 'acqknowledge_acq':
         return _acqknowledge_acq.list_waveform_channels(file_path)
     if fmt == 'acqknowledge_mat':
         return _acqknowledge_mat.list_waveform_channels(file_path)
+    if fmt == 'signal_mat':
+        return _signal_mat.list_waveform_channels(file_path)
     if fmt == 'epoched_mat':
         return _epoched_mat.list_waveform_channels(file_path)
     if fmt == 'brainvision':
@@ -421,6 +479,8 @@ def _extract_emg_native(file_path: str, channel_idx: int = 0):
         return _acqknowledge_acq.extract_emg_waveform_and_fs(file_path, channel_idx)
     if fmt == 'acqknowledge_mat':
         return _acqknowledge_mat.extract_emg_waveform_and_fs(file_path, channel_idx)
+    if fmt == 'signal_mat':
+        return _signal_mat.extract_emg_waveform_and_fs(file_path, channel_idx)
     if fmt == 'epoched_mat':
         return _epoched_mat.extract_emg_waveform_and_fs(file_path, channel_idx)
     if fmt == 'brainvision':
@@ -462,7 +522,10 @@ def get_epoch_bounds(file_path: str):
     None              : for continuous formats
     """
     file_path = _resolve_path(file_path)
-    if detect_format(file_path) == 'epoched_mat':
+    _fmt = detect_format(file_path)
+    if _fmt == 'signal_mat':
+        return _signal_mat.get_epoch_bounds(file_path)
+    if _fmt == 'epoched_mat':
         return _epoched_mat.get_epoch_bounds(file_path)
     return None
 
@@ -477,7 +540,11 @@ def units_assumed(file_path: str) -> bool:
     measurement or an unverified assumption.
     """
     file_path = _resolve_path(file_path)
-    if detect_format(file_path) == 'epoched_mat':
+    _fmt = detect_format(file_path)
+    if _fmt == 'signal_mat':
+        # The export states its unit per channel, so nothing is inferred.
+        return _signal_mat.units_assumed(file_path)
+    if _fmt == 'epoched_mat':
         return _epoched_mat.units_assumed(file_path)
     return False
 
@@ -519,6 +586,8 @@ def extract_stim_times(file_path: str, marker_name: str, stim_channel: str = Non
         return _acqknowledge_acq.extract_stim_times(file_path, marker_name)
     if fmt == 'acqknowledge_mat':
         return _acqknowledge_mat.extract_stim_times(file_path, marker_name)
+    if fmt == 'signal_mat':
+        return _signal_mat.extract_stim_times(file_path, marker_name)
     if fmt == 'epoched_mat':
         return _epoched_mat.extract_stim_times(file_path, marker_name)
     if fmt == 'brainvision':

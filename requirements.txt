@@ -9,3 +9,4 @@ pyinstaller>=5.13
 neo>=0.10
 pyedflib>=0.1.30
 bioread>=3.0
+h5py>=3.7

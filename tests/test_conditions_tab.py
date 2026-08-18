@@ -351,7 +351,7 @@ def test_reloading_clears_the_history():
 def test_the_button_names_what_it_will_undo():
     """'Undo split' is a different proposition from 'Undo delete'."""
     body = _method("_cond_refresh_history_buttons")
-    assert "_cond_undo_stack[-1][1]" in body
+    assert "_cond_undo_stack[-1][-1]" in body
     # ast.unparse normalises quotes, so match the value not the literal
     assert "disabled" in body
 
@@ -376,3 +376,242 @@ def test_the_history_holds_frozen_rows():
     """
     from mep_cmap.conditions import ConditionRow
     assert getattr(ConditionRow, "__dataclass_params__").frozen
+
+
+# ── the review pane's channel and window ─────────────────────────────────────
+
+def test_the_pane_draws_the_chosen_channel_not_the_first():
+    """Whether trials belong together is judged on the muscle they were
+    recorded from.
+
+    The pane opened on whichever channel the analysis started with, so on a
+    recording whose first channel is not the one under study it showed a trace
+    with nothing to do with the question being asked.
+    """
+    body = _method("_cond_load_segments")
+    assert "_cond_selected_channel_idx()" in body
+    assert 'params["channel_idx"]' not in body
+
+
+def test_the_picker_offers_the_analysed_channels():
+    body = _method("_cond_channel_names")
+    assert "_analysis_channel_indices()" in body
+
+
+def test_the_picker_opens_on_the_current_channel():
+    body = _method("_cond_refresh_channel_picker")
+    # read through getattr, so match the attribute name rather than the access
+    assert "channel_idx" in body
+    assert "_cond_chan.set(" in body
+
+
+def test_changing_channel_drops_the_cached_epochs():
+    """Reusing them would draw the previous channel's waveforms under the new
+    channel's name -- the failure this control exists to fix, reintroduced."""
+    body = _method("_cond_channel_changed")
+    assert "self._cond_segments = {}" in body
+    assert "_cond_draw()" in body
+
+
+def test_the_viewing_window_does_not_change_the_analysis():
+    """Widening the view to see whether a late component belongs to a
+    condition is a question about looking; silently re-epoching the analysis
+    to answer it would be a surprising thing for a viewing control to do."""
+    body = _method("_cond_window_changed")
+    assert "window_map" not in body
+    assert "_snapshot_analysis_params" not in body
+
+
+def test_each_side_of_the_window_overrides_independently():
+    """Widening only the tail should not require restating the lead-in."""
+    body = _method("_cond_load_segments")
+    assert "if _vpre is not None:" in body
+    assert "if _vpost is not None:" in body
+
+
+def test_a_blank_or_bad_window_falls_back_to_the_analysis_one():
+    body = _method("_cond_view_window_ms")
+    assert "except (TypeError, ValueError)" in body
+    assert "return None" in body
+
+
+def test_the_axis_names_the_unit_that_was_read():
+    body = _method("_cond_draw")
+    assert "_cond_unit" in body
+
+
+def test_the_marker_choice_narrows_the_conditions_table():
+    """162 Trigger comments and 6 Start Task: choosing Trigger and then being
+    offered both is the failure _configured_events exists to prevent, one
+    caller further along."""
+    body = _method("_configured_events", src=APP)
+    assert "self.marker_choice.get()" in body
+    assert "ALL_MARKERS" in body
+
+
+# ── the pane must show what the analysis will see ────────────────────────────
+
+def test_the_review_pane_filters_as_the_analysis_does():
+    """Raw epochs carry whatever DC offset and drift the amplifier had.
+
+    That stacks the trials at different baselines, which makes an overlay
+    unreadable -- and shows the analyst something the analysis never sees,
+    which is the failure a review pane exists to prevent rather than commit.
+    """
+    body = _method("_cond_load_segments")
+    assert "pipeline_apply_filters(" in body
+    assert "FILTER_CFG_FIELDS" in body
+
+
+def test_the_filter_field_list_is_shared_not_copied():
+    """Two copies drift the moment a filter setting is added to one of them."""
+    pipe = (PKG / "pipeline.py").read_text(encoding="utf-8")
+    prev = (PKG / "preview.py").read_text(encoding="utf-8")
+    assert "FILTER_CFG_FIELDS = (" in pipe
+    assert "FILTER_CFG_FIELDS = (" not in prev, \
+        "preview should import the list, not redefine it"
+    assert "from .pipeline import FILTER_CFG_FIELDS" in prev
+
+
+def test_unfilterable_data_is_drawn_and_said_so():
+    """A filter that cannot be applied is not a reason to draw nothing."""
+    body = _method("_cond_load_segments")
+    assert "Showing unfiltered data" in body
+
+
+def test_the_viewing_window_is_clamped_on_a_stitched_file():
+    """A pre-epoched recording is stitched from its own epochs with
+    mirror-padded guard bands between them.
+
+    A window longer than an epoch reads that padding, which draws as plausible
+    signal and is not signal at all, or reaches into the neighbouring trial.
+    The analysis clamps for exactly this reason, and a typed viewing window
+    would otherwise walk straight past that protection.
+    """
+    body = _method("_cond_load_segments")
+    assert "get_epoch_bounds(" in body
+    assert "clamp_window_map(" in body
+    assert "_vpre = _bp" in body and "_vpost = _bq" in body
+
+
+def test_a_continuous_file_is_not_clamped():
+    """There are no epoch bounds to clamp to, and a recording is not stitched."""
+    body = _method("_cond_load_segments")
+    assert "if _bounds:" in body
+    assert "self._cond_clamped = None" in body
+
+
+def test_clamping_is_reported_in_the_pane():
+    """A view that silently drew less than was asked for would look like the
+    window control not working."""
+    body = _method("_cond_draw")
+    assert "_cond_clamped" in body
+    assert "pre-epoched file" in body
+
+
+# ── setting the epoch from what is on screen ─────────────────────────────────
+
+def test_the_table_shows_each_conditions_epoch():
+    body = _method("_cond_refresh_table")
+    assert "_win_cells(row)" in body
+    assert "Pre (ms)" in TAB and "Post (ms)" in TAB
+
+
+def test_epochs_are_held_per_channel():
+    """A condition is a property of the TRIAL -- trial 5 is 'pre' whichever
+    muscle is looked at -- so the table is the same for every channel. An
+    epoch is a property of the RESPONSE, and a hand muscle and a leg muscle
+    legitimately want different windows.
+    """
+    body = _method("_build_conditions_tab")
+    assert "self._cond_epochs = {}" in body
+    assert "_cond_epochs_for_channel" in TAB
+
+
+def test_the_epoch_columns_follow_the_reviewed_channel():
+    """They show the channel they were judged against."""
+    body = _method("_cond_refresh_table")
+    assert "_cond_epochs_for_channel()" in body
+    assert "_cond_refresh_table()" in _method("_cond_channel_changed")
+
+
+def test_the_epoch_comes_from_the_window_being_viewed():
+    """The point of setting it here is that the decision can be seen: whether
+    the response is truncated, whether a silent period runs past the end. On
+    the labels tab the same numbers are typed blind."""
+    body = _method("_cond_set_epoch")
+    assert "_cond_view_window_ms()" in body
+
+
+def test_the_epoch_taken_is_the_one_actually_drawn():
+    """On a stitched file the view is clamped to the stored epoch, and handing
+    the analysis a window the recording cannot supply would undo that."""
+    body = _method("_cond_set_epoch")
+    assert "_cond_clamped" in body
+    assert "min(pre, clamp[0])" in body and "min(post, clamp[1])" in body
+
+
+def test_setting_an_epoch_can_cover_every_analysed_channel():
+    """Setting one and finding it on one channel of two is the fault this
+    replaced."""
+    body = _method("_cond_set_epoch")
+    assert "_cond_epoch_all_chans" in body
+    assert "_cond_channel_names()" in body
+
+
+def test_the_scope_defaults_to_every_channel():
+    """One window for a recording is the ordinary case; differing windows per
+    muscle is the exception, and the exception should be the thing opted in
+    to."""
+    body = _method("_build_conditions_tab")
+    assert "_cond_epoch_all_chans = tk.BooleanVar(value=True)" in body
+
+
+def test_setting_an_epoch_with_no_view_says_what_to_do():
+    assert "Type a viewing window" in _method("_cond_set_epoch")
+
+
+def test_the_epoch_can_be_cleared_back_to_the_default():
+    body = _method("_cond_clear_epoch")
+    assert "book.pop(" in body
+    assert "_cond_push_epochs(" in body
+
+
+def test_confirming_writes_every_channels_epochs():
+    """window_map is PER CHANNEL state held in _chan_settings.
+
+    Writing self.window_map alone reaches only the channel currently selected,
+    which is why an epoch set here appeared on one channel and not the other.
+    """
+    body = _method("_cond_apply")
+    assert "self._cond_epochs or {}" in body
+    assert "_chan_settings.setdefault(ch, {})" in body
+
+
+def test_the_hand_off_merges_rather_than_replaces():
+    """A window set on the labels tab for a stimulus type this table did not
+    give one to is still the analyst's setting."""
+    body = _method("_cond_apply")
+    assert body.count("merged.update(book)") == 2, \
+        "both the current channel and the others must merge, not overwrite"
+
+
+def test_setting_an_epoch_is_undoable():
+    """Epochs share the table's history, so one Undo means the last thing
+    done rather than the last thing done to one of two structures."""
+    for fn in ("_cond_set_epoch", "_cond_clear_epoch"):
+        assert "_cond_push_epochs(" in _method(fn)
+    for fn in ("_cond_undo", "_cond_redo"):
+        assert "self._cond_epochs" in _method(fn)
+
+
+def test_the_history_entries_carry_both_structures():
+    body = _method("_cond_commit")
+    assert "copy.deepcopy(self._cond_epochs)" in body
+
+
+def test_the_button_label_reads_the_last_element():
+    """The history entry gained a field; a fixed index would have started
+    naming the epoch book instead of the action."""
+    body = _method("_cond_refresh_history_buttons")
+    assert "[-1][-1]" in body

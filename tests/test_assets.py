@@ -18,7 +18,9 @@ SPLASH = (ROOT / "splash_screen.py").read_text(encoding="utf-8")
 
 
 def test_the_logo_is_present_at_the_sizes_used():
-    for name in ("tmsmultilab.png", "tmsmultilab_22.png", "tmsmultilab_64.png"):
+    for name in ("tmsmultilab.png", "tmsmultilab_22.png",
+                 "tmsmultilab_32.png", "tmsmultilab_40.png",
+                 "tmsmultilab_64.png"):
         assert (ASSETS / name).is_file(), f"{name} missing"
 
 
@@ -48,7 +50,11 @@ def test_the_loader_caches():
 
 def test_widgets_keep_their_own_reference():
     """Belt and braces: the cache keeps it alive, and so does the widget."""
-    assert APP.count(".image = _logo") >= 1
+    # Any name: what matters is that a widget holds a reference, not which
+    # local variable it came from.
+    import re
+    assert re.search(r"\.image = \w+", APP), \
+        "no widget in app.py keeps a reference to its image"
     assert "badge.image = logo" in SPLASH
 
 
@@ -158,3 +164,60 @@ def test_the_orcids_agree_between_the_two_files():
     zen = json.loads((ROOT / "zenodo.json").read_text(encoding="utf-8"))
     zen_ids = {c["orcid"] for c in zen["creators"] if "orcid" in c}
     assert cff_ids == zen_ids
+
+
+# ── where the mark lives ─────────────────────────────────────────────────────
+
+def test_the_mark_sits_above_the_notebook():
+    """Outside every tab, so it is present on all of them.
+
+    The derivatives bar it used to sit on changes colour with the folder
+    state, so the mark was on red as often as green.
+    """
+    i = APP.index("_brand = tk.Frame(self.root)")
+    j = APP.index("self.notebook = ttk.Notebook(self.root)")
+    assert i < j, "the branding strip must be packed before the notebook"
+
+
+def test_there_is_only_one_copy_of_the_mark_in_the_main_window():
+    """Two copies reads as an oversight rather than as branding."""
+    import re
+    assert len(re.findall(r"tmsmultilab_logo\(\d+\)", APP)) == 2, \
+        "one mark in the header, one in the About box"
+
+
+def test_every_size_asked_for_is_shipped():
+    """load_photo falls back to the full-size file, which Tk would then draw at
+    140 px -- a mark five times the size intended, rather than a missing one.
+    """
+    import re
+    from mep_cmap.assets import asset_path
+    import os
+    for size in set(re.findall(r"tmsmultilab_logo\((\d+)\)", APP)):
+        assert os.path.isfile(asset_path(f"tmsmultilab_{size}.png")), \
+            f"app.py asks for {size} px and no such file is shipped"
+
+
+def test_the_mark_is_labelled_and_links_out():
+    """A mark alone says nothing to a reader who does not recognise it."""
+    assert 'text="TMSMultiLab"' in APP
+    assert "TMSMultiLab/wiki" in APP
+
+
+def test_opening_a_link_cannot_raise():
+    """A decorative link failing is not worth a dialogue, and the environments
+    where it fails -- a headless session, a locked-down desktop -- are ones
+    where a traceback would be the more confusing outcome.
+
+    Checked in the source: app.py needs a working matplotlib Tk backend and
+    cannot be imported by the suite.
+    """
+    import ast
+
+    tree = ast.parse(APP)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "_open_url":
+            body = ast.unparse(node)
+            assert "try:" in body and "except Exception:" in body
+            return
+    raise AssertionError("_open_url not found")

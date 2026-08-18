@@ -301,6 +301,20 @@ FIELD_HELP = {
 #: What the marker dropdown offers for "every stimulus type in the file".
 #: A sentinel rather than the empty string, because a blank selection reads as
 #: nothing chosen and this is a choice.
+def _open_url(url):
+    """Open a link in the browser, silently if that is not possible.
+
+    A decorative link failing is not worth a dialogue, and the environments
+    where webbrowser cannot find a handler -- a headless session, a locked-down
+    desktop -- are ones where a traceback would be the more confusing outcome.
+    """
+    try:
+        import webbrowser
+        webbrowser.open_new_tab(url)
+    except Exception:
+        pass
+
+
 ALL_MARKERS = "All"
 
 #: Shown in About. One string rather than a name typed into each window, so it
@@ -1013,6 +1027,33 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
           • Tab 1 – Stage 1: single-file processing  (scrollable)
           • Tab 2 – Stage 2: group-level analysis
         """
+        # ── Branding strip ────────────────────────────────────────────────────
+        # Above the notebook rather than on the derivatives bar at the bottom:
+        # that bar changes colour with the folder state, so a mark on it sits
+        # on red as often as green, and at the size it had to be there it was
+        # easy to miss entirely. Here it is in the window's own chrome, present
+        # on every tab because it is outside all of them.
+        _brand = tk.Frame(self.root)
+        _brand.pack(fill="x", side="top")
+        try:
+            from .assets import tmsmultilab_logo
+            _mark = tmsmultilab_logo(32)
+            if _mark is not None:
+                _mw = tk.Label(_brand, image=_mark, bd=0, cursor="hand2")
+                _mw.image = _mark          # Tk keeps only a weak reference
+                _mw.pack(side="right", padx=(6, 12), pady=(5, 2))
+                Tooltip(_mw, "TMSMultiLab", pin_on_click=False)
+                _mw.bind("<Button-1>", lambda _e: _open_url(
+                    "https://github.com/TMSMultiLab/TMSMultiLab/wiki"))
+                _tx = tk.Label(_brand, text="TMSMultiLab", fg="#1F3864",
+                               cursor="hand2",
+                               font=("TkDefaultFont", 9))
+                _tx.pack(side="right", pady=(5, 2))
+                _tx.bind("<Button-1>", lambda _e: _open_url(
+                    "https://github.com/TMSMultiLab/TMSMultiLab/wiki"))
+        except Exception:
+            pass
+
         # ── Top-level notebook ────────────────────────────────────────────────
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill="both", expand=True)
@@ -1048,19 +1089,9 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         self._deriv_status_bar.bind(
             "<Button-1>", lambda e: self.browse_derivatives_folder())
 
-        # TMSMultiLab mark, on the one strip visible from every tab. Beside the
-        # derivatives bar rather than inside it, so the bar keeps changing
-        # colour with the folder state without the logo sitting on red.
-        try:
-            from .assets import tmsmultilab_logo
-            _logo = tmsmultilab_logo(22)
-            if _logo is not None:
-                _lab = tk.Label(_bar_row, image=_logo, bd=0)
-                _lab.image = _logo          # Tk keeps only a weak reference
-                _lab.pack(side="right", padx=(6, 8))
-                Tooltip(_lab, "TMSMultiLab")
-        except Exception:
-            pass
+        # The mark lives on the branding strip above the notebook, not here:
+        # one copy, and not on a bar that turns red when no derivatives folder
+        # is set.
 
         # ══ Top-level notebook: Setup | Stage 1: Single File | Stage 2: Group Level
         # self.notebook (created above) is now the TOP notebook holding three
@@ -3062,6 +3093,16 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         every file does until someone says otherwise.
         """
         from .io import extract_events, extract_stim_times as _est
+
+        # The marker chosen in Channel Assignment narrows this too, not only
+        # the labels tab. That narrowing used to live in the load flow, so
+        # anything else asking this helper for "the events" got every label in
+        # the file: on a recording carrying 162 Trigger comments and 6 Start
+        # Task, choosing Trigger and then being offered both is the same
+        # failure this helper was written to prevent, one caller further along.
+        if fallback_marker is None:
+            _mk = (self.marker_choice.get() or "").strip()
+            fallback_marker = "" if _mk.upper() == ALL_MARKERS.upper() else _mk
 
         sources = (self.event_sources or {}).get(self.channel_idx) or []
         if not sources:

@@ -102,16 +102,11 @@ from .pipeline import (PipelineConfig, pipeline_apply_filters,
 from .preferences import prefs
 
 
-#: The cfg fields ``pipeline_apply_filters`` reads. Named, not derived: the
-#: snapshot and PipelineConfig disagree on two unrelated names, so a filter by
-#: field name would quietly drop settings and preview the wrong filtering.
-#: test_preview_detection.py holds this list to what the filter stage reads.
-FILTER_CFG_FIELDS = (
-    "apply_filter", "apply_bandpass", "apply_notch", "apply_humbug",
-    "highpass", "lowpass", "hp_order", "lp_order", "flexible_bandpass",
-    "notch_freq", "notch_q", "filter_order", "filter_harmonics",
-    "humbug_harmonics",
-)
+#: Re-exported from pipeline, where it sits beside the function that reads it.
+#: One list: the preview and the conditions review pane both filter for
+#: display, and two copies of this would drift the moment a filter setting was
+#: added to one of them.
+from .pipeline import FILTER_CFG_FIELDS  # noqa: E402,F401
 
 
 def select_preview_trials(n_available: int, k: int) -> list:

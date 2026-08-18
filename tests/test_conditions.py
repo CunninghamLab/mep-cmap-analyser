@@ -488,3 +488,45 @@ def test_the_loader_keeps_no_second_copy_of_the_rule():
     body = PIPE[a:b]
     assert "stim_times.pop(k)" not in body, \
         "the inline crop was replaced by the shared helper"
+
+
+# ── per-condition epochs ─────────────────────────────────────────────────────
+
+def test_a_row_takes_the_default_until_given_a_window():
+    row = C.ConditionRow("A", "pre", (0, 1))
+    assert row.window is None
+
+
+def test_a_row_with_a_window_reports_it():
+    row = C.ConditionRow("A", "pre", (0, 1), pre_ms=20.0, post_ms=50.0)
+    assert row.window == (20.0, 50.0)
+
+
+def test_the_window_map_is_keyed_by_group_not_stimulus_type():
+    """A-pre and A-post are separate rows on the labels tab and may want
+    different windows, which is the whole reason for setting one per
+    condition."""
+    rows = [C.ConditionRow("A", "pre", (0,), pre_ms=20.0, post_ms=50.0),
+            C.ConditionRow("A", "post", (1,), pre_ms=100.0, post_ms=500.0)]
+    wm = C.window_map_from_rows(rows)
+    assert wm == {"A" + C.SEPARATOR + "pre": (20.0, 50.0),
+                  "A" + C.SEPARATOR + "post": (100.0, 500.0)}
+
+
+def test_an_untouched_table_contributes_no_windows():
+    """Which is the same as having no per-type windows at all."""
+    stim = {"A": [1.0, 2.0], "B": [3.0]}
+    assert C.window_map_from_rows(C.rows_from_events(stim)) == {}
+
+
+def test_an_excluded_condition_contributes_no_window():
+    rows = [C.ConditionRow("A", "x", (0,), excluded=True,
+                           pre_ms=20.0, post_ms=50.0)]
+    assert C.window_map_from_rows(rows) == {}
+
+
+def test_one_side_only_is_carried_through():
+    """Widening only the tail should not require restating the lead-in."""
+    rows = [C.ConditionRow("A", "x", (0,), post_ms=500.0)]
+    assert C.window_map_from_rows(rows) == {"A" + C.SEPARATOR + "x":
+                                            (None, 500.0)}

@@ -204,6 +204,13 @@ class ConditionRow:
     condition: str = ""
     trials: tuple = field(default_factory=tuple)
     excluded: bool = False
+    # Epoch for this condition, in ms, or None to use the file-wide default.
+    # Held here because the review pane is the only place the analyst can SEE
+    # whether a window is right -- whether the response is truncated, whether
+    # a silent period runs past the end -- and deciding it there is better
+    # informed than typing numbers on a settings tab and hoping.
+    pre_ms: float = None
+    post_ms: float = None
 
     @property
     def group_key(self):
@@ -213,6 +220,13 @@ class ConditionRow:
     @property
     def n(self):
         return len(self.trials)
+
+    @property
+    def window(self):
+        """(pre, post) or None when this condition takes the default."""
+        if self.pre_ms is None and self.post_ms is None:
+            return None
+        return (self.pre_ms, self.post_ms)
 
     def describe(self):
         where = format_trials(self.trials) or "no trials"
@@ -396,6 +410,28 @@ def validate(rows, stim_times, allow_unassigned=False):
 
 
 # ── output ───────────────────────────────────────────────────────────────────
+
+def window_map_from_rows(rows):
+    """{group_key: (pre_ms, post_ms)} for conditions given their own epoch.
+
+    Keyed by the group key rather than the stimulus type, because that is what
+    the analysis groups by and what the labels tab lists: A-pre and A-post are
+    separate rows there and may want different windows, which is the whole
+    reason for setting one per condition.
+
+    Conditions left on the default contribute nothing, so a table nobody
+    touched produces an empty map -- which is the same as having no per-type
+    windows at all.
+    """
+    out = {}
+    for row in rows:
+        if row.excluded:
+            continue
+        win = row.window
+        if win is not None:
+            out[row.group_key] = win
+    return out
+
 
 def to_event_rows(rows, stim_times, duration=0.0):
     """Records for a BIDS ``_events.tsv``, sorted by onset.

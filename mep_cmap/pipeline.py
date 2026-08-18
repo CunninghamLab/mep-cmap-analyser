@@ -435,6 +435,22 @@ def pipeline_load_file(file_path, channel_idx, marker_name,
     return emg, time, fs, unit, stim_times
 
 
+#: The cfg fields ``pipeline_apply_filters`` reads, named rather than derived.
+#: A caller that filters for display must supply exactly these, and building
+#: the config by filtering a params snapshot against PipelineConfig field names
+#: is silently wrong: the snapshot says `min_amp` and `enable_out_review` where
+#: the fields are `min_peak_amplitude` and `enable_outlier_review`, so a name
+#: filter substitutes defaults. Defined here, beside the function, so the
+#: preview and the conditions review pane share one list instead of keeping a
+#: copy each. test_preview_detection.py holds it to what the filter stage reads.
+FILTER_CFG_FIELDS = (
+    "apply_filter", "apply_bandpass", "apply_notch", "apply_humbug",
+    "highpass", "lowpass", "hp_order", "lp_order", "flexible_bandpass",
+    "notch_freq", "notch_q", "filter_order", "filter_harmonics",
+    "humbug_harmonics",
+)
+
+
 def pipeline_apply_filters(emg, fs, cfg: PipelineConfig):
     """Apply the enabled filter chain to *emg* and return the filtered signal."""
     if not cfg.apply_filter:

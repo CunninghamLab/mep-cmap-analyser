@@ -121,6 +121,17 @@ class ConditionsTabMixin:
         self._cond_source_path = None # the recording the table was built from
         self._cond_confirmed_path = None  # the recording last confirmed here
         self._cond_confirming = False # set while handing over to the labels tab
+        self._cond_chan_idx = None    # channel the review pane is drawing
+        self._cond_clamped = None     # epoch bounds, when the file is stitched
+        # {channel_idx: {group_key: (pre_ms, post_ms)}}.
+        #
+        # A condition is a property of the TRIAL -- trial 5 is "pre" whichever
+        # muscle is being looked at -- so the table itself is the same for
+        # every channel. An epoch is a property of the RESPONSE, and a hand
+        # muscle and a leg muscle legitimately want different windows, so the
+        # epoch columns belong to the channel they were judged on.
+        self._cond_epochs = {}
+        self._cond_unit = None
         # Undo/redo stacks of (rows, what-was-done). A snapshot is the list
         # itself rather than a copy that has to be kept honest: ConditionRow is
         # frozen and every editing helper returns a new list.
@@ -148,11 +159,12 @@ class ConditionsTabMixin:
         tk.Label(_lh, text="Conditions table").pack(side="left")
         attach_info_icon(_lh, HELP["table"]).pack(side="left", padx=(3, 0))
 
-        cols = ("stim", "cond", "trials", "n")
+        cols = ("stim", "cond", "trials", "n", "pre", "post")
         self._cond_tree = ttk.Treeview(left, columns=cols, show="headings",
                                        selectmode="extended", height=12)
-        for c, txt, w in (("stim", "Stim", 70), ("cond", "Condition", 130),
-                          ("trials", "Trials", 210), ("n", "N", 45)):
+        for c, txt, w in (("stim", "Stim", 70), ("cond", "Condition", 120),
+                          ("trials", "Trials", 180), ("n", "N", 40),
+                          ("pre", "Pre (ms)", 65), ("post", "Post (ms)", 68)):
             self._cond_tree.heading(c, text=txt)
             self._cond_tree.column(c, width=w,
                                    anchor="w" if c != "n" else "e")
@@ -170,9 +182,21 @@ class ConditionsTabMixin:
                          ("Set from selection", self._cond_set_from_selection),
                          ("Rename…", self._cond_rename),
                          ("Auto fill…", self._cond_autofill),
+                         ("Set epoch from view", self._cond_set_epoch),
+                         ("Clear epoch", self._cond_clear_epoch),
                          ("Exclude", self._cond_toggle_exclude),
                          ("Delete", self._cond_delete)):
             tk.Button(btns, text=txt, command=cmd).pack(side="left", padx=(0, 4))
+
+        _ep = tk.Frame(left)
+        _ep.pack(fill="x", pady=(3, 0))
+        self._cond_epoch_all_chans = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            _ep, variable=self._cond_epoch_all_chans,
+            command=self._cond_refresh_table,
+            text="Epoch applies to every analysed channel").pack(side="left")
+        self._cond_epoch_scope = tk.Label(_ep, fg="grey", text="")
+        self._cond_epoch_scope.pack(side="left", padx=(8, 0))
 
         hist = tk.Frame(left)
         hist.pack(fill="x", pady=(4, 0))
@@ -230,6 +254,35 @@ class ConditionsTabMixin:
             tk.Radiobutton(_rh, text=txt, value=val,
                            variable=self._cond_mode,
                            command=self._cond_draw).pack(side="left", padx=(8, 0))
+        _ctl = tk.Frame(right)
+        _ctl.pack(fill="x", pady=(4, 0))
+        tk.Label(_ctl, text="Channel:").pack(side="left")
+        # The channels ticked in Channel Assignment. Whether trials belong
+        # together is judged on the muscle they were recorded from, and on a
+        # recording where several were analysed there is no one right answer
+        # -- the pane opened on whichever channel the analysis happened to
+        # start with, which on a file whose first channel is not the one under
+        # study showed a trace with nothing to do with the question.
+        self._cond_chan = tk.StringVar(value="")
+        self._cond_chan_dd = ttk.Combobox(_ctl, textvariable=self._cond_chan,
+                                          state="readonly", width=18, values=[])
+        self._cond_chan_dd.pack(side="left", padx=(4, 12))
+        self._cond_chan.trace_add("write", lambda *_a: self._cond_channel_changed())
+
+        tk.Label(_ctl, text="Window (ms):  pre").pack(side="left")
+        self._cond_pre = tk.StringVar(value="")
+        tk.Entry(_ctl, textvariable=self._cond_pre, width=6).pack(side="left",
+                                                                  padx=(4, 6))
+        tk.Label(_ctl, text="post").pack(side="left")
+        self._cond_post = tk.StringVar(value="")
+        tk.Entry(_ctl, textvariable=self._cond_post, width=6).pack(side="left",
+                                                                   padx=(4, 6))
+        tk.Button(_ctl, text="Apply window",
+                  command=self._cond_window_changed).pack(side="left")
+        tk.Label(_ctl, fg="grey",
+                 text="  for looking only — the analysis window is on tab 1a"
+                 ).pack(side="left")
+
         self._cond_note = tk.Label(right, text="", fg="#1F3864", anchor="w")
         self._cond_note.pack(fill="x", pady=(2, 0))
 
@@ -324,6 +377,7 @@ class ConditionsTabMixin:
 
         self._cond_source_path = path
         self._cond_stim_times = {k: list(v) for k, v in events.items()}
+        self._cond_refresh_channel_picker()
         self._cond_rows = C.rows_from_events(self._cond_stim_times)
         # Undoing past a reload would restore rows belonging to a recording
         # that is no longer open.
@@ -332,6 +386,7 @@ class ConditionsTabMixin:
         self._cond_undo_stack.clear()
         self._cond_redo_stack.clear()
         self._cond_segments, self._cond_axis = {}, None
+        self._cond_chan_idx = None
         _cropped = ""
         try:
             _p = self._snapshot_analysis_params()
@@ -360,22 +415,74 @@ class ConditionsTabMixin:
         if not path or not self._cond_stim_times:
             return False
         try:
-            from .pipeline import (PipelineConfig, pipeline_load_file,
-                                   window_samples)
+            from .pipeline import (FILTER_CFG_FIELDS, PipelineConfig,
+                                   clamp_window_map, pipeline_apply_filters,
+                                   pipeline_load_file, window_samples)
+            from .io import get_epoch_bounds
             params = self._snapshot_analysis_params()
+            _ch = self._cond_selected_channel_idx()
+            self._cond_chan_idx = _ch
             emg, time, fs, _unit, _stim = pipeline_load_file(
-                params["input_path"], params["channel_idx"],
+                params["input_path"], _ch,
                 params["marker_choice"],
                 crop_ranges=params.get("crop_ranges"),
                 crop_start=params.get("crop_start"),
                 crop_end=params.get("crop_end"),
                 sources=None, event_rows=None)
+
+            # Filtered as the analysis filters. Raw epochs carry whatever DC
+            # offset and drift the amplifier had, which stacks the trials at
+            # different baselines and makes the overlay unreadable -- and shows
+            # the analyst something the analysis never sees, which is the
+            # failure a review pane exists to prevent rather than commit.
+            try:
+                _fcfg = PipelineConfig(**{f: params[f]
+                                          for f in FILTER_CFG_FIELDS})
+                emg = pipeline_apply_filters(emg, fs, _fcfg)
+            except Exception as _fe:
+                self._cond_note.config(
+                    text=f"Showing unfiltered data: {_fe}", fg="#B03A2E")
             wincfg = PipelineConfig(pre_ms=float(params["pre_ms"]),
                                     post_ms=float(params["post_ms"]),
                                     window_map=params.get("window_map") or {})
+            _vpre, _vpost = self._cond_view_window_ms()
+
+            # A pre-epoched recording is stitched from its own epochs with
+            # mirror-padded guard bands between them. A window longer than an
+            # epoch reads that padding -- it draws as plausible signal and is
+            # not signal at all -- or reaches into the neighbouring trial. The
+            # analysis clamps for exactly this reason; a typed viewing window
+            # would otherwise walk straight past that protection.
+            _bounds = None
+            try:
+                _bounds = get_epoch_bounds(params["input_path"])
+            except Exception:
+                _bounds = None
+            if _bounds:
+                _bp, _bq = float(_bounds[0]), float(_bounds[1])
+                if _vpre is not None and _vpre > _bp:
+                    _vpre = _bp
+                if _vpost is not None and _vpost > _bq:
+                    _vpost = _bq
+                _wm, _ = clamp_window_map(params.get("window_map") or {},
+                                          _bp, _bq)
+                wincfg = PipelineConfig(
+                    pre_ms=min(float(params["pre_ms"]), _bp),
+                    post_ms=min(float(params["post_ms"]), _bq),
+                    window_map=_wm)
+                self._cond_clamped = (_bp, _bq)
+            else:
+                self._cond_clamped = None
+
             out = {}
             for stim, times in self._cond_stim_times.items():
                 before, after = window_samples(wincfg, stim, fs)
+                # A typed viewing window overrides the analysis one, per side,
+                # so widening only the tail is possible without restating both.
+                if _vpre is not None:
+                    before = int(_vpre * fs / 1000)
+                if _vpost is not None:
+                    after = int(_vpost * fs / 1000)
                 segs = []
                 for t in times:
                     ix = int(np.argmin(np.abs(time - t)))
@@ -387,6 +494,7 @@ class ConditionsTabMixin:
                                  np.arange(len(keep[0])) * 1000.0 / fs
                                  - before * 1000.0 / fs)
             self._cond_segments = out
+            self._cond_unit = _unit
             return bool(out)
         except Exception as exc:                      # noqa: BLE001 — reported
             self._cond_note.config(
@@ -396,6 +504,18 @@ class ConditionsTabMixin:
     # ── the table ────────────────────────────────────────────────────────────
 
     def _cond_refresh_table(self):
+        # The epoch columns show the channel the review pane is on, since that
+        # is the channel they were judged against.
+        _eps = self._cond_epochs_for_channel()
+
+        def _win_cells(row):
+            win = _eps.get(row.group_key)
+            if not win:
+                return ("", "")
+            p, q = win
+            return ("" if p is None else f"{p:g}",
+                    "" if q is None else f"{q:g}")
+
         sel = set(self._cond_tree.selection()) if self._cond_tree else set()
         self._cond_tree.delete(*self._cond_tree.get_children())
         for i, row in enumerate(self._cond_rows):
@@ -404,10 +524,19 @@ class ConditionsTabMixin:
                 values=(row.stim_type,
                         ("— excluded —" if row.excluded
                          else (row.condition or "")),
-                        C.format_trials(row.trials), row.n))
+                        C.format_trials(row.trials), row.n,
+                        *_win_cells(row)))
         for iid in sel:
             if self._cond_tree.exists(iid):
                 self._cond_tree.selection_add(iid)
+        try:
+            _nm = self._cond_chan.get() or "this channel"
+            _n_set = len(self._cond_epochs_for_channel())
+            self._cond_epoch_scope.config(
+                text=(f"showing epochs for {_nm}"
+                      + (f" \u2014 {_n_set} set" if _n_set else "")))
+        except Exception:
+            pass
         self._cond_refresh_history_buttons()
         self._cond_refresh_status()
 
@@ -459,7 +588,83 @@ class ConditionsTabMixin:
             out.setdefault(ri, []).append(t)
         return {k: tuple(sorted(v)) for k, v in out.items()}
 
+    def _cond_channel_names(self):
+        """(index, name) for every channel the analysis will run over."""
+        try:
+            names = list(self.channel_dd["values"]) or []
+        except Exception:
+            names = []
+        out = []
+        for i in self._analysis_channel_indices():
+            out.append((i, names[i] if i < len(names) else f"Channel {i + 1}"))
+        return out
+
+    def _cond_refresh_channel_picker(self):
+        """Offer the analysed channels, opening on the current one."""
+        pairs = self._cond_channel_names()
+        labels = [nm for _i, nm in pairs]
+        self._cond_chan_dd.config(values=labels)
+        if not labels:
+            return
+        current = dict(pairs).get(getattr(self, "channel_idx", 0))
+        if self._cond_chan.get() not in labels:
+            self._cond_chan.set(current if current in labels else labels[0])
+
+    def _cond_selected_channel_idx(self):
+        for i, nm in self._cond_channel_names():
+            if nm == self._cond_chan.get():
+                return i
+        return getattr(self, "channel_idx", 0)
+
+    def _cond_channel_changed(self):
+        """Redraw on the newly chosen channel.
+
+        The cut epochs are per channel, so the cache is dropped rather than
+        reused: keeping it would draw the previous channel's waveforms under
+        the new channel's name, which is the failure this control exists to
+        fix rather than a new one to introduce.
+        """
+        idx = self._cond_selected_channel_idx()
+        if idx == self._cond_chan_idx:
+            return
+        self._cond_segments = {}
+        self._cond_refresh_table()
+        self._cond_draw()
+
+    def _cond_window_changed(self):
+        """Redraw with the typed viewing window.
+
+        Deliberately does not touch the analysis window on tab 1a. Widening the
+        view to see whether a late component belongs to a condition is a
+        question about looking, and silently re-epoching the analysis to answer
+        it would be a surprising thing for a viewing control to do.
+        """
+        self._cond_segments = {}
+        self._cond_draw()
+
+    def _cond_view_window_ms(self):
+        """(pre, post) for the review pane, or None to use the analysis window."""
+        def _num(var):
+            try:
+                v = float(str(var.get()).strip())
+            except (TypeError, ValueError):
+                return None
+            return v if v > 0 else None
+        return _num(self._cond_pre), _num(self._cond_post)
+
     # ── history ──────────────────────────────────────────────────────────────
+
+    def _cond_push_epochs(self, what):
+        """Record the epoch book before it changes.
+
+        Held on the same stack as the table edits, so one Undo means the last
+        thing done rather than the last thing done to one of two structures.
+        """
+        import copy
+        self._cond_undo_stack.append(
+            (list(self._cond_rows), copy.deepcopy(self._cond_epochs), what))
+        del self._cond_undo_stack[:-UNDO_DEPTH]
+        self._cond_redo_stack.clear()
 
     def _cond_commit(self, new_rows, what):
         """Adopt an edited table, remembering what it replaced.
@@ -470,7 +675,9 @@ class ConditionsTabMixin:
         undo: it teaches the analyst the button is unreliable, and the next
         press is the one that goes too far.
         """
-        self._cond_undo_stack.append((list(self._cond_rows), what))
+        import copy
+        self._cond_undo_stack.append(
+            (list(self._cond_rows), copy.deepcopy(self._cond_epochs), what))
         del self._cond_undo_stack[:-UNDO_DEPTH]
         # A new edit invalidates the redo path: redoing onto a table that has
         # since changed would apply an edit to rows it was never made against.
@@ -481,18 +688,22 @@ class ConditionsTabMixin:
     def _cond_undo(self):
         if not self._cond_undo_stack:
             return
-        rows, what = self._cond_undo_stack.pop()
-        self._cond_redo_stack.append((list(self._cond_rows), what))
-        self._cond_rows = rows
+        import copy
+        rows, eps, what = self._cond_undo_stack.pop()
+        self._cond_redo_stack.append(
+            (list(self._cond_rows), copy.deepcopy(self._cond_epochs), what))
+        self._cond_rows, self._cond_epochs = rows, eps
         self._cond_refresh_table()
         self.log(f"\u21b6 Undid: {what}")
 
     def _cond_redo(self):
         if not self._cond_redo_stack:
             return
-        rows, what = self._cond_redo_stack.pop()
-        self._cond_undo_stack.append((list(self._cond_rows), what))
-        self._cond_rows = rows
+        import copy
+        rows, eps, what = self._cond_redo_stack.pop()
+        self._cond_undo_stack.append(
+            (list(self._cond_rows), copy.deepcopy(self._cond_epochs), what))
+        self._cond_rows, self._cond_epochs = rows, eps
         self._cond_refresh_table()
         self.log(f"\u21b7 Redid: {what}")
 
@@ -506,13 +717,13 @@ class ConditionsTabMixin:
         if self._cond_undo_stack:
             self._cond_undo_btn.config(
                 state="normal",
-                text=f"\u21b6 Undo {self._cond_undo_stack[-1][1]}")
+                text=f"\u21b6 Undo {self._cond_undo_stack[-1][-1]}")
         else:
             self._cond_undo_btn.config(state="disabled", text="\u21b6 Undo")
         if self._cond_redo_stack:
             self._cond_redo_btn.config(
                 state="normal",
-                text=f"\u21b7 Redo {self._cond_redo_stack[-1][1]}")
+                text=f"\u21b7 Redo {self._cond_redo_stack[-1][-1]}")
         else:
             self._cond_redo_btn.config(state="disabled", text="\u21b7 Redo")
 
@@ -596,6 +807,66 @@ class ConditionsTabMixin:
             return
         self._cond_commit(new_rows, "auto fill")
 
+    def _cond_epochs_for_channel(self, ch=None):
+        if ch is None:
+            ch = self._cond_selected_channel_idx()
+        return self._cond_epochs.setdefault(ch, {})
+
+    def _cond_set_epoch(self):
+        """Give the selected conditions the window currently being viewed.
+
+        The point of setting it here rather than on the labels tab is that the
+        decision can be seen: whether the response is truncated, whether a
+        silent period runs past the end of the window, whether a long tail is
+        empty. On the labels tab the same numbers are typed blind.
+        """
+        rows = self._cond_selected_indices()
+        if not rows:
+            messagebox.showinfo(
+                "Epoch", "Select the condition(s) to give this window to.",
+                parent=self.root)
+            return
+        pre, post = self._cond_view_window_ms()
+        if pre is None and post is None:
+            messagebox.showinfo(
+                "Epoch",
+                "Type a viewing window above the plot first, then use this to "
+                "make it this condition's epoch.", parent=self.root)
+            return
+        # Whatever is actually being drawn, not what was typed: on a stitched
+        # file the view is clamped to the stored epoch, and handing the
+        # analysis a window the recording cannot supply would undo that.
+        clamp = getattr(self, "_cond_clamped", None)
+        if clamp:
+            if pre is not None:
+                pre = min(pre, clamp[0])
+            if post is not None:
+                post = min(post, clamp[1])
+        targets = ([i for i, _n in self._cond_channel_names()]
+                   if self._cond_epoch_all_chans.get()
+                   else [self._cond_selected_channel_idx()])
+        self._cond_push_epochs("set epoch")
+        for ch in targets:
+            book = self._cond_epochs_for_channel(ch)
+            for ri in rows:
+                book[self._cond_rows[ri].group_key] = (pre, post)
+        self._cond_refresh_table()
+
+    def _cond_clear_epoch(self):
+        """Return the selected conditions to the file-wide window."""
+        rows = self._cond_selected_indices()
+        if not rows:
+            return
+        targets = ([i for i, _n in self._cond_channel_names()]
+                   if self._cond_epoch_all_chans.get()
+                   else [self._cond_selected_channel_idx()])
+        self._cond_push_epochs("clear epoch")
+        for ch in targets:
+            book = self._cond_epochs_for_channel(ch)
+            for ri in rows:
+                book.pop(self._cond_rows[ri].group_key, None)
+        self._cond_refresh_table()
+
     def _cond_toggle_exclude(self):
         rows = self._cond_selected_indices()
         if not rows:
@@ -661,12 +932,17 @@ class ConditionsTabMixin:
 
         ax.axvline(0.0, color="0.4", linestyle="--", linewidth=1.0)
         ax.set_xlabel("Time about the stimulus (ms)", fontsize=8)
-        ax.set_ylabel(f"EMG ({getattr(self, 'emg_unit', 'mV')})", fontsize=8)
+        _u = getattr(self, "_cond_unit", None) or "a.u."
+        ax.set_ylabel(f"EMG ({_u})", fontsize=8)
         ax.tick_params(labelsize=8)
         if len(sel) > 1:
             ax.legend(fontsize=7, loc="upper right")
-        self._cond_note.config(
-            text=f"{drawn} trial(s) from {len(sel)} condition(s)", fg="#1F3864")
+        _msg = f"{drawn} trial(s) from {len(sel)} condition(s)"
+        if getattr(self, "_cond_clamped", None):
+            _bp, _bq = self._cond_clamped
+            _msg += (f"  \u2014  pre-epoched file: the view is limited to the "
+                     f"stored epoch, -{_bp:g} to +{_bq:g} ms")
+        self._cond_note.config(text=_msg, fg="#1F3864")
         self._cond_canvas.draw_idle()
 
     # ── apply ────────────────────────────────────────────────────────────────
@@ -699,6 +975,32 @@ class ConditionsTabMixin:
         # analysis and the preview group trials by these conditions.
         self.condition_event_rows = event_rows
         self.condition_map = decoded
+
+        # Per-condition epochs become the per-type windows the labels tab and
+        # the analysis already understand, keyed by group key. Merged rather
+        # than replacing: a window set on the labels tab for a stimulus type
+        # this table did not give one to is still the analyst's setting.
+        # window_map is PER CHANNEL state, held in _chan_settings. Writing
+        # self.window_map alone reaches only the channel currently selected,
+        # which is why an epoch set here appeared on one channel and not the
+        # other. Each channel's book is written into that channel's snapshot.
+        _cur = getattr(self, "channel_idx", 0)
+        for ch, book in (self._cond_epochs or {}).items():
+            if not book:
+                continue
+            if ch == _cur:
+                merged = dict(getattr(self, "window_map", None) or {})
+                merged.update(book)
+                self.window_map = merged
+            else:
+                snap = self._chan_settings.setdefault(ch, {})
+                merged = dict(snap.get("window_map") or {})
+                merged.update(book)
+                snap["window_map"] = merged
+            self.log(f"   Epochs for channel {ch + 1}: "
+                     + ", ".join(f"{k} {p if p is not None else 'default'}"
+                                 f"/{q if q is not None else 'default'} ms"
+                                 for k, (p, q) in sorted(book.items())))
 
         self._cond_confirmed_path = path
         self.log("🏷  Conditions applied: "

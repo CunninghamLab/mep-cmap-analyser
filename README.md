@@ -6,7 +6,7 @@
 *Collaborators:* [*David Cunningham PhD*](https://fescenter.org/team/investigators/cunningham-david-phd/) *(*[*TMS Analysis ToolBox*](https://github.com/CunninghamLab/TMSAnalysisToolBox)*) ·* [*Nicholas Holmes PhD*](https://www.birmingham.ac.uk/staff/profiles/sportex/holmes-nick) *·* [*TMSMultiLab*](https://github.com/TMSMultiLab/TMSMultiLab/wiki)
 
 [![PyPI version](https://badge.fury.io/py/mep-cmap-analyser.svg)](https://pypi.org/project/mep-cmap-analyser/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/jandrushko/mep-cmap-analyser/blob/main/LICENSE)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://github.com/jandrushko/mep-cmap-analyser/blob/main/LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 
 **PyPI:** https://pypi.org/project/mep-cmap-analyser/  
@@ -1355,5 +1355,20 @@ If you use MEP-CMAP Analyser in published research, please cite:
 
 ## License
 
-MIT License — see [LICENSE](https://github.com/jandrushko/mep-cmap-analyser/blob/main/LICENSE) for details.
+GNU General Public License v3.0 or later — see
+[LICENSE](https://github.com/jandrushko/mep-cmap-analyser/blob/main/LICENSE)
+for the full text.
+
+**Versions 1.3.3 and earlier were released under the MIT Licence and remain
+so.** That grant is irrevocable: anyone who obtained those releases keeps the
+rights they were given under them. From version 1.4.0 the project is GPL-3,
+which was necessary in order to incorporate work derived from the
+[TMS Analysis ToolBox](https://github.com/CunninghamLab/TMSAnalysisToolBox)
+(Cunningham, Zhang & Cahn, 2021), a GPL-3 project whose terms require
+derivative works to carry the same licence. See [NOTICE](https://github.com/jandrushko/mep-cmap-analyser/blob/main/NOTICE)
+for the licence history and third-party attribution.
+
+In practice this means software incorporating MEP-CMAP Analyser must also be
+distributed under GPL-3. Using the application to analyse data, and publishing
+results obtained with it, are unaffected.
 

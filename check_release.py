@@ -48,6 +48,13 @@ STRIP_NOISE = re.compile(
     # The authoritative version strings (the header line and the citation) are
     # still checked, so nothing real is masked.
     r"|What's New in \d[\d.]*"
+    # Statements about which versions carried which licence. "Versions 1.3.3
+    # and earlier were released under the MIT Licence" is a permanent fact
+    # about the past, not a version string that needs bumping -- and rewriting
+    # it to say 1.4.0 would make it false. Narrow on purpose: it matches the
+    # phrasing, not any mention of a number near the word licence.
+    r"|[Vv]ersions? \d[\d.]* and earlier"
+    r"|from [Vv]ersion \d[\d.]*"
 )
 
 # Matches 1.2.7 and v1.2.7 alike — \b fails after 'v', since both are word
@@ -104,6 +111,47 @@ def check_conflict_markers():
         print("            resolve the merge/rebase, or restore a clean copy")
     if not bad:
         print("  ok       no unresolved conflict markers")
+    return bad
+
+
+def check_licence_agreement():
+    """Every declaration of the licence must say the same thing.
+
+    A licence is stated in five places that nothing keeps in step, and the
+    consequences of their disagreeing are worse than for a version string: a
+    PyPI page and a repository claiming different terms is a question about
+    what a user is actually permitted to do, and it is the metadata rather
+    than the LICENSE file that most tooling reads.
+    """
+    checks = [
+        ("LICENSE",       "GNU GENERAL PUBLIC LICENSE"),
+        ("LICENSE",       "Version 3, 29 June 2007"),
+        ("pyproject.toml", "GNU General Public License v3 or later (GPLv3+)"),
+        ("CITATION.cff",  "license: GPL-3.0-or-later"),
+        ("zenodo.json",   '"license": "GPL-3.0-or-later"'),
+        ("README.md",     "License-GPLv3"),
+        ("NOTICE",        "GNU General Public License"),
+    ]
+    bad = 0
+    for name, needle in checks:
+        path = ROOT / name
+        if not path.exists():
+            print(f"  MISSING  {name}")
+            bad += 1
+            continue
+        if needle not in path.read_text(encoding="utf-8", errors="replace"):
+            print(f"  MISMATCH {name}  (expected to contain {needle!r})")
+            bad += 1
+    # A stale MIT claim is the specific failure worth naming, since the project
+    # was MIT through 1.3.3 and the strings are easy to leave behind.
+    for name in ("pyproject.toml", "CITATION.cff", "zenodo.json"):
+        path = ROOT / name
+        if path.exists() and '"MIT"' in path.read_text(encoding="utf-8",
+                                                       errors="replace"):
+            print(f"  MISMATCH {name}  (still declares MIT)")
+            bad += 1
+    if not bad:
+        print("  ok       licence stated consistently (GPL-3.0-or-later)")
     return bad
 
 
@@ -170,18 +218,22 @@ def main():
 
     print()
     conflicts = check_conflict_markers()
+    licence = check_licence_agreement()
     escapes = check_markdown_escapes(fix=fix)
     print()
-    if problems or escapes or conflicts:
+    if problems or escapes or conflicts or licence:
         if problems:
             print(f"{len(problems)} version string(s) out of sync.")
         if conflicts:
             print(f"{conflicts} unresolved git conflict marker(s).")
         if escapes:
             print(f"{escapes} escaped markdown character(s) in README.md.")
+        if licence:
+            print(f"{licence} licence declaration(s) inconsistent.")
         print("Fix before releasing.")
         return 1
-    print("All version strings agree; no conflict markers; markdown is clean.")
+    print("All version strings agree; licence is consistent; no conflict "
+          "markers; markdown is clean.")
     return 0
 
 

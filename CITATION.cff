@@ -4,7 +4,7 @@ title: "MEP-CMAP Analyser"
 type: software
 version: "1.4.0"
 date-released: "2026-08-17"
-license: MIT
+license: GPL-3.0-or-later
 # After publishing on Zenodo, open the record page and look under "Cite all
 # versions". If the concept DOI shown there differs from the value below, put
 # the concept DOI here so the citation always resolves to the latest release,

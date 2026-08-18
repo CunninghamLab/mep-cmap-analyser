@@ -64,4 +64,4 @@ include = ["mep_cmap*"]
 
 [tool.setuptools.package-data]
 # Ship the BIDS-ify (BEP037) schema asset inside the wheel/sdist.
-mep_cmap = ["schema/*.json"]
+mep_cmap = ["schema/*.json", "assets/*.png"]

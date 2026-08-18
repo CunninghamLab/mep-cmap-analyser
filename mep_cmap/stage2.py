@@ -34,7 +34,23 @@ _S2_CORE_SUFFIXES = (
 
 # A sidecar must carry these to be joinable per trial. Segment is 1-based and
 # indexes segs_all, so it is stable even if a table is filtered or re-sorted.
+# Condition joins alongside StimType: with conditions assigned, A·pre and
+# A·post both decompose to StimType=A and both have a Segment 1, so joining on
+# the pair alone would match an add-on's row for one condition against the
+# core row for the other -- silently, and only for files where conditions were
+# used. A file without conditions has an empty Condition throughout, which
+# joins exactly as before.
 _S2_JOIN_KEYS = ("StimType", "Segment")
+
+#: Joined on as well when BOTH frames carry it. With conditions assigned, A·pre
+#: and A·post both report StimType=A and both have a Segment 1, so joining on
+#: the pair alone would match an add-on's row for one condition against the core
+#: row for the other. Optional rather than required, because an add-on written
+#: before conditions existed -- including any third-party one -- emits no such
+#: column and must still join; and where no conditions were assigned there is
+#: nothing to disambiguate. The case where its absence WOULD be wrong is
+#: detected below rather than assumed away.
+_S2_OPTIONAL_JOIN_KEYS = ("Condition",)
 
 
 def _s2_join_addon_sidecars(df, trials_csv_path, note):
@@ -56,7 +72,8 @@ def _s2_join_addon_sidecars(df, trials_csv_path, note):
     prefix   = base[: -len("_trials.csv")]
     res_dir  = os.path.dirname(trials_csv_path)
 
-    keys = [k for k in _S2_JOIN_KEYS if k in df.columns]
+    keys = [k for k in _S2_JOIN_KEYS + _S2_OPTIONAL_JOIN_KEYS
+            if k in df.columns]
     if len(keys) < len(_S2_JOIN_KEYS):
         return df
     if "File" in df.columns:
@@ -77,6 +94,20 @@ def _s2_join_addon_sidecars(df, trials_csv_path, note):
         use = [k for k in keys if k in side.columns]
         if not set(_S2_JOIN_KEYS).issubset(use):
             continue
+
+        # Refuse rather than mis-join. If the core table distinguishes trials
+        # only by Condition -- the same StimType and Segment appearing more than
+        # once -- then a sidecar without that column cannot say which row it
+        # describes, and a left join would silently attach one condition's
+        # measurements to another's trial. Re-running the add-on produces the
+        # column; guessing produces a plausible wrong number.
+        if "Condition" in df.columns and "Condition" not in use:
+            _amb = df.duplicated(subset=list(_S2_JOIN_KEYS), keep=False).any()
+            if _amb:
+                note(f"{fn}: this file has conditions assigned and the sidecar "
+                     f"carries no Condition column, so its rows cannot be "
+                     f"matched unambiguously — skipped.  Re-run the add-on.")
+                continue
 
         # Already joined? Every non-key column present means this sidecar has
         # been merged into `df` on a previous pass. Skip it, otherwise its own
@@ -168,6 +199,16 @@ class Stage2Mixin:
         if bids is not None and bids.winfo_ismapped():
             try:
                 self._bidsify_tab_refresh()
+            except Exception:
+                pass
+
+        # Conditions — populate from the loaded recording when shown. The
+        # table is built from the file's events, which do not exist until a
+        # file has been opened, so it cannot be filled when the tab is created.
+        cond = getattr(self, "tab_conditions", None)
+        if cond is not None and cond.winfo_ismapped():
+            try:
+                self._cond_tab_shown()
             except Exception:
                 pass
 

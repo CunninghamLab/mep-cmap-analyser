@@ -310,6 +310,12 @@ class PipelineConfig:
     # means either truncating the first or carrying an order of magnitude of
     # unnecessary samples through every trial of the second.
     window_map:      dict = field(default_factory=dict)
+    # {group_key: (stim_type, condition)} for keys that carry a condition.
+    # The analysis groups by one key, but the trial file reports the two
+    # separately; this is what lets it, without parsing the key apart.
+    # Absent means the key IS the stimulus type, which is every recording
+    # whose conditions were never assigned.
+    condition_map:   dict = field(default_factory=dict)
     # Per-stimulus-type correction, in ms, between the file's event marker and
     # the actual stimulus. Negative means the pulse fired BEFORE the marker.
     # Applied when epoching, so every measure defined from t=0 follows.
@@ -361,7 +367,8 @@ def _make_bids_prefix(meta_prefix, file_stem):
 
 def pipeline_load_file(file_path, channel_idx, marker_name,
                        crop_ranges=None, crop_start=None, crop_end=None,
-                       sources=None, channel_names=None, warn=None):
+                       sources=None, channel_names=None, warn=None,
+                       event_rows=None):
     """Load raw EMG, extract stim times, apply crop.
 
     ``sources`` is a list of EventSource. When given, the stimuli come from
@@ -388,7 +395,14 @@ def pipeline_load_file(file_path, channel_idx, marker_name,
     """
     emg, fs, unit = extract_emg_waveform_and_fs(file_path, channel_idx)
     time       = np.arange(len(emg)) / fs
-    if sources:
+    if event_rows is not None:
+        # Conditions assigned in the interface, from a BIDS events file. The two
+        # columns are composed into group keys HERE, by the one function that
+        # does it, so the analysis and the preview cannot disagree about which
+        # trials belong together.
+        from .conditions import group_events
+        stim_times, _decoded = group_events(event_rows)
+    elif sources:
         from .io import extract_events
         stim_times, _warnings = extract_events(file_path, sources,
                                                channel_names=channel_names)
@@ -410,20 +424,13 @@ def pipeline_load_file(file_path, channel_idx, marker_name,
             keep |= (time >= a) & (time <= b)
         emg  = emg[keep]
         time = time[keep]
-        for k in list(stim_times):
-            stim_times[k] = [t for t in stim_times[k]
-                             if any(a <= t <= b for a, b in crop_ranges)]
-            if not stim_times[k]:
-                stim_times.pop(k)
     elif crop_start is not None and crop_end is not None:
         keep = (time >= crop_start) & (time <= crop_end)
         emg  = emg[keep]
         time = time[keep]
-        for k in list(stim_times):
-            stim_times[k] = [t for t in stim_times[k]
-                             if crop_start <= t <= crop_end]
-            if not stim_times[k]:
-                stim_times.pop(k)
+
+    # One rule, shared with whatever shows the analyst a trial list.
+    stim_times = crop_stim_times(stim_times, crop_ranges, crop_start, crop_end)
 
     return emg, time, fs, unit, stim_times
 
@@ -479,6 +486,54 @@ def pipeline_prestim_rms(prestim, cfg: PipelineConfig = None, axis=None):
     # and this pair already had, by about ten percent.
     demean = True if cfg is None else bool(getattr(cfg, "prestim_rms_demean", True))
     return compute_prestim_rms(prestim, demean=demean, axis=axis)
+
+
+def crop_stim_times(stim_times, crop_ranges=None, crop_start=None,
+                    crop_end=None):
+    """Keep only the stimuli inside the selected range.
+
+    Extracted so that anything showing the analyst a trial list uses the same
+    rule the analysis does. It matters more than a display discrepancy would:
+    conditions are assigned by trial INDEX, so a list built from the whole
+    recording numbers its trials differently from one built after a crop, and
+    every assignment made against the wrong numbering lands on the wrong trial.
+
+    An empty type is dropped rather than kept empty, matching what the analysis
+    does: a stimulus type with no trials in range is not a group.
+    """
+    if not crop_ranges and (crop_start is None or crop_end is None):
+        return {k: list(v) for k, v in stim_times.items()}
+
+    def _inside(t):
+        if crop_ranges:
+            return any(a <= t <= b for a, b in crop_ranges)
+        return crop_start <= t <= crop_end
+
+    out = {}
+    for k, times in stim_times.items():
+        kept = [t for t in times if _inside(t)]
+        if kept:
+            out[k] = kept
+    return out
+
+
+def split_group_key(cfg: PipelineConfig, group_key: str):
+    """(stim_type, condition) for an analysis group key.
+
+    The analysis groups by one key because every stage downstream is keyed that
+    way; the trial file needs the two apart. This is the only place they are
+    separated, so nothing has to know how they were joined -- a key is opaque
+    everywhere else, which is what allows the composition to live entirely in
+    mep_cmap.conditions.
+
+    A key absent from the map is a stimulus type with no condition, which is
+    every recording whose conditions were never assigned.
+    """
+    pair = (cfg.condition_map or {}).get(group_key)
+    if not pair:
+        return str(group_key), ""
+    stim, cond = pair
+    return str(stim), str(cond or "")
 
 
 def resolve_window(cfg: PipelineConfig, stim_type: str):
@@ -1208,8 +1263,12 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
         _csp_mep = round(float(silent_dur) / float(man_ptp), 4) \
                    if (isinstance(silent_dur, (int, float)) and silent_dur >= 0
                        and man_ptp is not None and float(man_ptp) > 0) else None
+        # StimType reports the stimulus, not the group key: a row for A·pre
+        # says StimType=A, Condition=pre. The label still comes from the group,
+        # each condition being separately configurable on tab 1a.
+        _base_stim, _cond = split_group_key(cfg, stim_type)
         common = [
-            name, stim_type, custom_labels.get(stim_type, ""), idx + 1,  # [0-3]
+            name, _base_stim, custom_labels.get(stim_type, ""), idx + 1,  # [0-3]
             None, None, None,                                              # [4-6] timing
             cfg.limb, cfg.measure,                                        # [7-8]
             None, None, None,                                  # PTP / MEP_RMS / Latency
@@ -1261,6 +1320,7 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
         manual_row = manual_row + [""] * (_w - len(manual_row))
 
         for _row in (auto_row, manual_row):
+            _row[_C_COND]    = _cond
             _row[_C_OFF]     = mep_offset_ms
             _row[_C_DUR]     = mep_duration_ms
             _row[_C_OFF_SRC] = mep_offset_src
@@ -1554,11 +1614,22 @@ LAT_COLS = [
     "Onset_Disagreement(ms)",# max - min across members
     "Onset_IQR(ms)",         # interquartile range; robust to one stray member
     "Onset_Methods_N",       # members that returned a latency
+    # The condition this trial was assigned to, blank where none was. Appended
+    # rather than placed beside StimType because `common` above is a positional
+    # list of literals padded to this width: inserting mid-list would shift
+    # every field after it, which is the six-column misalignment this schema
+    # already learned once.
+    #
+    # A separate column rather than part of StimType, so that a timepoint is a
+    # factor the group analysis can model rather than a substring to be parsed
+    # out of a name.
+    "Condition",
 ]
 
 # Column indices resolved by name. Any code writing a single field into a row
 # must use these rather than a literal, so the row layout and the writers can
 # never disagree again.
+_C_COND    = LAT_COLS.index("Condition")
 _C_SEG_OV  = LAT_COLS.index("Segment_Overall")
 _C_STIM_T  = LAT_COLS.index("Stim_Time(s)")
 _C_TSL     = LAT_COLS.index("Time_Since_Last_Stim(s)")
@@ -2256,7 +2327,8 @@ def run_pipeline(input_path,
                  show_inspector_cb=None,
                  gui_enable_inspector=False,
                  channel_idx=0,
-                 event_sources=None, channel_names=None,
+                 event_sources=None, channel_names=None, event_rows=None,
+                 condition_map=None,
                  # Display name for the channel, used in logs and in the
                  # Data Inspector's title so a multi-channel run says which
                  # channel is being reviewed.
@@ -2359,6 +2431,7 @@ def run_pipeline(input_path,
         custom_labels=custom_labels or {},
         color_map=color_map or {},
         window_map=window_map or {},
+        condition_map=condition_map or {},
         gap_ms_map=gap_ms_map or {},
         delay_ms_map=delay_ms_map or {},
         reference_map=reference_map or {},
@@ -2487,10 +2560,18 @@ def run_pipeline(input_path,
                 crop_ranges=crop_ranges,
                 crop_start=crop_start, crop_end=crop_end,
                 sources=event_sources, channel_names=channel_names,
+                event_rows=event_rows,
                 warn=lambda m: log_callback(f"   ⚠️  {m}"))
             stim_types = sorted(stim_times)
 
             log_callback(f"📂 Processing {name}  (fs={fs} Hz, {len(stim_types)} stim type(s))")
+            if event_rows is not None:
+                _n_cond = sum(1 for k in stim_types
+                              if split_group_key(cfg, k)[1])
+                log_callback(f"   Groups from assigned conditions: "
+                             + ", ".join(sorted(stim_types))
+                             + (f"  ({_n_cond} carry a condition)" if _n_cond
+                                else ""))
             # Where the stimuli came from is part of what makes a run
             # readable months later: the same file yields different events
             # under a different threshold, and the log is the only place that

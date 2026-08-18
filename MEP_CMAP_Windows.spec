@@ -21,6 +21,7 @@ datas += [('mep_cmap', 'mep_cmap')]
 # BIDS-ify (BEP037) schema asset - explicit, in case the whole-package
 # data bundling above ever changes. The app hard-depends on this JSON.
 datas += [('mep_cmap/schema/nibs_bep037.json', 'mep_cmap/schema')]
+datas += [('mep_cmap/assets', 'mep_cmap/assets')]   # TMSMultiLab mark
 # Built-in add-ons (mepfeatx, rectified_area, __init__) - explicit so they
 # ship even if the whole-package bundling above ever changes. The add-on
 # loader discovers these by file path at runtime.

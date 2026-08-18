@@ -65,7 +65,8 @@ from tkinter import ttk, filedialog, messagebox, simpledialog, scrolledtext, fon
 from .compat import _np_trapz
 from .bids import StudyMetadata, _sanitise_bids_label, TOOL_VERSION
 from .bidsify_tab import BidsifyTabMixin
-from .tooltips import (INFO_ICON, attach_info_icon, check_with_help,
+from .conditions_tab import ConditionsTabMixin
+from .tooltips import (INFO_ICON, Tooltip, attach_info_icon, check_with_help,
                        label_with_help)
 from .preview import PreviewDetectionMixin
 from .dataset_session import (DatasetSession, FileEntry,
@@ -302,6 +303,11 @@ FIELD_HELP = {
 #: nothing chosen and this is a choice.
 ALL_MARKERS = "All"
 
+#: Shown in About. One string rather than a name typed into each window, so it
+#: cannot fall out of step with CITATION.cff -- which is the authoritative
+#: statement and the one anyone citing the tool will read.
+AUTHORS_LINE = "Justin W. Andrushko\nDavid A. Cunningham"
+
 
 #: Explanation shown by the ⓘ beside each tab 1a heading. Keyed by the exact
 #: heading text, so a column renamed without its help being revisited loses
@@ -413,7 +419,7 @@ COLUMN_HELP = {
 
 
 class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
-                     PreviewDetectionMixin):
+                     PreviewDetectionMixin, ConditionsTabMixin):
     def __init__(self, root):
         self.root = root
         # ── State that setup_gui() widgets depend on — must come first ────────
@@ -422,6 +428,11 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         # reads them: writing to pre_time or post_time before a file was ever
         # opened -- restoring a session, or any other early set -- reached a
         # table that did not exist yet.
+        # Events-file records and {group_key: (stim_type, condition)} from the
+        # Conditions tab. Empty until conditions are applied; empty means the
+        # analysis groups by stimulus type exactly as before.
+        self.condition_event_rows = []
+        self.condition_map        = {}
         self._lab_entry_pre    = {}
         self._lab_entry_post   = {}
         self.crop_start        = None
@@ -1025,15 +1036,31 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         # ── Derivatives status bar ─────────────────────────────────────────────
         # Persistent strip below tabs: red when unset, green when set.
         # Clicking it opens the folder browser directly.
+        _bar_row = tk.Frame(self.root)
+        _bar_row.pack(fill="x")
         self._deriv_status_bar = tk.Label(
-            self.root,
+            _bar_row,
             text="⚠  Derivatives folder not set — File → Set Derivatives Folder",
             **accent_button_kw("red"),
             anchor="w", padx=10, pady=3,
             font="TkDefaultFont")
-        self._deriv_status_bar.pack(fill="x")
+        self._deriv_status_bar.pack(side="left", fill="x", expand=True)
         self._deriv_status_bar.bind(
             "<Button-1>", lambda e: self.browse_derivatives_folder())
+
+        # TMSMultiLab mark, on the one strip visible from every tab. Beside the
+        # derivatives bar rather than inside it, so the bar keeps changing
+        # colour with the folder state without the logo sitting on red.
+        try:
+            from .assets import tmsmultilab_logo
+            _logo = tmsmultilab_logo(22)
+            if _logo is not None:
+                _lab = tk.Label(_bar_row, image=_logo, bd=0)
+                _lab.image = _logo          # Tk keeps only a weak reference
+                _lab.pack(side="right", padx=(6, 8))
+                Tooltip(_lab, "TMSMultiLab")
+        except Exception:
+            pass
 
         # ══ Top-level notebook: Setup | Stage 1: Single File | Stage 2: Group Level
         # self.notebook (created above) is now the TOP notebook holding three
@@ -1049,6 +1076,10 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         self.tab_session = ttk.Frame(self.nb_setup)
         self.nb_setup.add(self.tab_session, text="Dataset")
         self._build_session_tab(self.tab_session)
+
+        self.tab_conditions = ttk.Frame(self.nb_setup)
+        self.nb_setup.add(self.tab_conditions, text="Conditions")
+        self._build_conditions_tab(self.tab_conditions)
 
         self.tab_bidsify = ttk.Frame(self.nb_setup)
         self.nb_setup.add(self.tab_bidsify, text="BIDS-ify")
@@ -1433,6 +1464,12 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             event_sources     = {_c: [_s.to_dict() for _s in _lst]
                                  for _c, _lst in self.event_sources.items()
                                  if _lst},
+
+            # Conditions assigned in the interface, as BIDS events-file records.
+            # None until the Conditions tab has been applied, which is what
+            # makes an unassigned recording behave exactly as it always did.
+            event_rows        = list(self.condition_event_rows or []) or None,
+            condition_map     = dict(self.condition_map or {}),
         )
 
         # ---- CLAMP WINDOWS TO A PRE-EPOCHED FILE'S REAL EXTENT ----
@@ -1814,6 +1851,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
                     marker_name          = marker,
                     event_sources        = _own_sources,
                     channel_names        = _chan_names,
+                    event_rows           = params.get("event_rows"),
                     log_callback         = lambda txt: self.msg_q.put(("log", txt)),
                     progress_callback    = lambda p: self.msg_q.put(("progress", p)),
                     review_outliers_cb   = self._review_outliers_cb,
@@ -1885,6 +1923,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
                     custom_labels        = _own("label_map", {}),
                     color_map            = _own("color_map", {}),
                     window_map           = _own("window_map", {}),
+                    condition_map        = params.get("condition_map") or {},
                     crop_start           = params["crop_start"],
                     crop_end             = params["crop_end"],
                     crop_ranges          = params["crop_ranges"],
@@ -2488,10 +2527,10 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         self.log_box = scrolledtext.ScrolledText(self.main_frame, height=6, wrap=tk.WORD)
         self.log_box.pack(fill='both', expand=True, padx=10, pady=(0,5))
 
-        # Small author label
-        author_font = font.Font(size=12, slant="italic")
-        tk.Label(self.main_frame, text="Author: Justin Andrushko PhD",
-                 font=author_font, anchor='center').pack(pady=(0,5))
+        # The author line that stood here is gone. Authorship belongs in
+        # CITATION.cff and the Zenodo record, which is where anyone citing the
+        # tool looks; a credit on one tab of ten is an odd place for it, and it
+        # occupied space on the tab with the most settings.
 
         # ── Fixed footer: session buttons + run + progress bar ────────────────
         # Built here (after all tk vars exist) but packed into footer_frame
@@ -3463,7 +3502,16 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         tk.Label(win, text="MEP-CMAP Analyser",
                  font=("TkDefaultFont", 13, "bold")).pack(pady=(16,2))
         tk.Label(win, text=f"Version {TOOL_VERSION}").pack()
-        tk.Label(win, text="Author: Justin Andrushko PhD",
+        try:
+            from .assets import tmsmultilab_logo
+            _l = tmsmultilab_logo(64)
+            if _l is not None:
+                _w = tk.Label(win, image=_l, bd=0)
+                _w.image = _l
+                _w.pack(pady=(8, 2))
+        except Exception:
+            pass
+        tk.Label(win, text=AUTHORS_LINE,
                  justify="center", fg="grey").pack(pady=(6,4))
         tk.Label(win,
             text="BIDS-compliant TMS/EMG neurophysiology\n"
@@ -7532,10 +7580,29 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         self._labels_tab_confirmed = False
         self._confirm_btn_var.set("⚠  Setup not confirmed — click to confirm")
 
-        # Switch to Stage 1a Labels tab so user can configure stim types
+        # Go to Conditions first, not straight to the labels tab.
+        #
+        # What a stimulus type is FOR is decided before how its response is
+        # detected: twenty pulses labelled A may be two timepoints, and
+        # configuring latency windows for "A" before saying so means
+        # configuring them again for each half afterwards. The table arrives
+        # populated and correct, so a recording needing no conditions costs one
+        # click through.
+        #
+        # Rebuilding this tab is also what the Conditions tab itself does on
+        # Confirm, and jumping back to Conditions at that moment would be a
+        # loop; the flag distinguishes the two callers.
         self.root.update_idletasks()
-        self.notebook.select(self.stage1_outer)
-        self.nb_stage1.select(self.tab1b_frame)
+        if getattr(self, "_cond_confirming", False):
+            self.notebook.select(self.stage1_outer)
+            self.nb_stage1.select(self.tab1b_frame)
+        else:
+            try:
+                self.notebook.select(self.setup_outer)
+                self.nb_setup.select(self.tab_conditions)
+            except Exception:
+                self.notebook.select(self.stage1_outer)
+                self.nb_stage1.select(self.tab1b_frame)
 
     def _browse_mmax_for_var(self, string_var):
         """Interactively configure an external normalisation reference file.

@@ -1,9 +1,9 @@
 # MEP-CMAP Analyser
 
 **Version 1.4.0 | August 2026**  
-*Author:* [*Justin Andrushko PhD*](https://orcid.org/0000-0003-2258-1689)
+*Authors:* [*Justin W. Andrushko PhD*](https://orcid.org/0000-0003-2258-1689) · [*David A. Cunningham PhD*](https://orcid.org/0000-0003-2246-1548) *(*[*TMS Analysis ToolBox*](https://github.com/CunninghamLab/TMSAnalysisToolBox)*)*  —  *TMSMultiLab*
 
-*Collaborators:* [*David Cunningham PhD*](https://fescenter.org/team/investigators/cunningham-david-phd/) *(*[*TMS Analysis ToolBox*](https://github.com/CunninghamLab/TMSAnalysisToolBox)*) ·* [*Nicholas Holmes PhD*](https://www.birmingham.ac.uk/staff/profiles/sportex/holmes-nick) *·* [*TMSMultiLab*](https://github.com/TMSMultiLab/TMSMultiLab/wiki)
+*Collaborators:* [*Nicholas Holmes PhD*](https://www.birmingham.ac.uk/staff/profiles/sportex/holmes-nick) *·* [*TMSMultiLab*](https://github.com/TMSMultiLab/TMSMultiLab/wiki)
 
 [![PyPI version](https://badge.fury.io/py/mep-cmap-analyser.svg)](https://pypi.org/project/mep-cmap-analyser/)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://github.com/jandrushko/mep-cmap-analyser/blob/main/LICENSE)

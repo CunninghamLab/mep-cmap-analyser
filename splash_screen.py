@@ -16,7 +16,7 @@ class SplashScreen:
         
         # Splash dimensions
         splash_width = 400
-        splash_height = 200
+        splash_height = 280
         
         # Center the splash screen
         x = (screen_width - splash_width) // 2
@@ -29,6 +29,18 @@ class SplashScreen:
         frame = tk.Frame(self.root, bg='#2C3E50')
         frame.pack(expand=True, fill='both', padx=20, pady=20)
         
+        # TMSMultiLab mark. Guarded: a splash screen that fails to draw an
+        # image must not stop the application it is announcing.
+        try:
+            from mep_cmap.assets import tmsmultilab_logo
+            logo = tmsmultilab_logo(64)
+            if logo is not None:
+                badge = tk.Label(frame, image=logo, bg='#2C3E50', bd=0)
+                badge.image = logo      # Tk keeps only a weak reference
+                badge.pack(pady=(0, 6))
+        except Exception:
+            pass
+
         # Title
         title = tk.Label(
             frame, 

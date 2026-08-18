@@ -336,6 +336,11 @@ class PreviewDetectionMixin:
             crop_end=params.get("crop_end"),
             sources=_sources,
             channel_names=params.get("channel_names"),
+            # Assigned conditions, when there are any. Passed through the same
+            # argument the analysis uses, so both compose the two columns into
+            # group keys by the same call -- a preview that grouped trials
+            # differently would offer a set the run does not analyse.
+            event_rows=params.get("event_rows"),
             warn=lambda m: self.log(f"   ⚠️  {m}"))
 
         cfg = PipelineConfig(**{f: params[f] for f in FILTER_CFG_FIELDS})

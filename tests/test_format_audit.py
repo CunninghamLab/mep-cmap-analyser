@@ -105,3 +105,34 @@ def test_both_sentinels_stop_the_load():
 def test_the_declining_message_says_which_problem_it_is():
     """'Not in a format the tool can read' is true of a corrupt export too."""
     assert "text file with no data rows" in IO
+
+
+def test_a_reader_with_no_dispatch_is_caught():
+    """kinemg_csv shipped with the full three-function contract and
+    detect_format never returned it, so the format was supported by every
+    measure except being reachable: a KinEMG export fell through to the
+    generic TSV path or the Spike2 fallback depending on its punctuation.
+
+    Every module in formats/ that implements the contract must be dispatched.
+    """
+    import pathlib
+
+    pkg = pathlib.Path(__file__).resolve().parent.parent / "mep_cmap" / "formats"
+    unreachable = []
+    for path in sorted(pkg.glob("*.py")):
+        if path.name.startswith("_"):
+            continue
+        src = path.read_text(encoding="utf-8")
+        implements = all(f"def {fn}" in src for fn in
+                         ("list_waveform_channels", "extract_emg_waveform_and_fs",
+                          "extract_stim_times"))
+        if not implements:
+            continue
+        stem = path.stem
+        # mne_bridge is dispatched under the name 'mne'; spike2 is the fallback.
+        alias = {"mne_bridge": "mne"}.get(stem, stem)
+        if f"'{alias}'" not in IO and alias != "spike2":
+            unreachable.append(path.name)
+    assert not unreachable, (
+        "these readers implement the contract and detect_format never returns "
+        "them: " + ", ".join(unreachable))

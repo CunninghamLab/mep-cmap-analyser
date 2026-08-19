@@ -176,6 +176,50 @@ def _load(file_path: str):
     return seg, analogue_names
 
 
+def _load_all(file_path: str):
+    """Every segment in the file, and the analogue channel names.
+
+    Spike2 records in SAMPLING BLOCKS. A file paused and restarted between
+    trials -- a common way to run a session -- arrives as one segment per
+    block, each with its own start time, its own samples and its own events.
+
+    :func:`_load` returns block 0 and nothing else, which is right for the
+    questions it is asked (what channels exist, what are they called) and
+    catastrophic for the two that matter: on a ten-block recording it read
+    twelve per cent of the data and one stimulus of ten, silently, with the
+    analysis reporting a clean result for the fraction it had seen.
+
+    Returned in file order, which is time order.
+    """
+    _require_neo()
+    import warnings
+
+    import neo
+
+    try:
+        reader = neo.io.Spike2IO(filename=file_path, try_signal_grouping=False)
+    except TypeError:
+        reader = neo.io.Spike2IO(filename=file_path)
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*can not be converted.*")
+        warnings.filterwarnings("ignore", message=".*UnitWarning.*")
+        block = reader.read_block(lazy=False)
+    if not block.segments:
+        raise ValueError(f"No segments found in {file_path}")
+
+    _seg0, names = _load(file_path)
+    return list(block.segments), names
+
+
+def segment_count(file_path: str) -> int:
+    """How many sampling blocks the recording holds. One for a continuous run."""
+    try:
+        return len(_load_all(file_path)[0])
+    except Exception:
+        return 1
+
+
 def clear_cache():
     with _cache_lock:
         _cached_path[0]  = None
@@ -206,7 +250,28 @@ def _decode_marker_code(raw) -> str:
     if len(s) == 1 and 32 <= ord(s[0]) <= 126:
         return s
     # Multi-char: return as-is (e.g. already decoded)
-    return s if s else "?"
+    #
+    # An EMPTY label returns empty, not "?". A plain trigger channel labels
+    # none of its events, and turning that into "?" made every event look
+    # decoded-but-unreadable: _get_event_codes tests `any(lb != "")` before
+    # falling back to the channel name, so a list of "?" satisfied it and the
+    # fallback the docstring describes was never reached. The stimulus type
+    # then read "?" on the setup table and in the trial file -- a question the
+    # analyst cannot answer, carried into their results.
+    return s
+
+
+def _channel_fallback_label(channel_name: str) -> str:
+    """What to call events on a channel that labels none of them.
+
+    Spike2 event channels need not carry marker codes: a plain trigger channel
+    reports empty labels, and every event on it is the same kind of thing. The
+    channel's own name says what they are, and shows up legibly on the setup
+    table and in the trial file -- where '?' is a question the analyst cannot
+    answer and will carry into their results.
+    """
+    name = (channel_name or "").strip()
+    return name if name else "stim"
 
 
 def _get_event_codes(evt) -> list:
@@ -306,11 +371,8 @@ def list_event_channels(file_path: str) -> list:
         return []
 
 
-def extract_emg_waveform_and_fs(file_path: str, channel_idx: int = 0) -> tuple:
-    seg, analogue_names = _load(file_path)
-    if not seg.analogsignals:
-        raise ValueError(f"No analogue signals found in {file_path}")
-
+def _pick_signal(seg, analogue_names, file_path, channel_idx):
+    """The requested channel within one segment, by sidecar name or by index."""
     sig = None
 
     # Only resolve by sidecar name when channel_idx == 0 (the primary EMG).
@@ -328,16 +390,47 @@ def extract_emg_waveform_and_fs(file_path: str, channel_idx: int = 0) -> tuple:
     if sig is None:
         idx = min(channel_idx, len(seg.analogsignals) - 1)
         sig = seg.analogsignals[idx]
+    return sig
 
-    emg  = np.asarray(sig).flatten().astype(float)
-    fs   = int(round(float(sig.sampling_rate.rescale("Hz").magnitude)))
+
+def extract_emg_waveform_and_fs(file_path: str, channel_idx: int = 0) -> tuple:
+    """The whole recording, across every sampling block.
+
+    Blocks are placed at their real start times and the gaps between them
+    zero-filled, so a stimulus timestamp means the same thing here as it does
+    in the file. Reading block 0 alone -- which is what this did -- returned
+    twelve per cent of a ten-block recording without saying so.
+    """
+    segments, analogue_names = _load_all(file_path)
+    usable = [sg for sg in segments if sg.analogsignals]
+    if not usable:
+        raise ValueError(f"No analogue signals found in {file_path}")
+
+    first = _pick_signal(usable[0], analogue_names, file_path, channel_idx)
+    fs = int(round(float(first.sampling_rate.rescale("Hz").magnitude)))
     unit = None
     try:
-        u = str(sig.units.dimensionality).strip().split()
+        u = str(first.units.dimensionality).strip().split()
         unit = u[-1] if u else None
     except Exception:
         pass
-    return emg, fs, unit
+
+    if len(usable) == 1:
+        return np.asarray(first).flatten().astype(float), fs, unit
+
+    t0 = float(usable[0].t_start.rescale("s").magnitude)
+    pieces = []
+    for sg in usable:
+        sig = _pick_signal(sg, analogue_names, file_path, channel_idx)
+        start = int(round(
+            (float(sg.t_start.rescale("s").magnitude) - t0) * fs))
+        pieces.append((start, np.asarray(sig).flatten().astype(float)))
+
+    total = max(start + len(a) for start, a in pieces)
+    out = np.zeros(total, dtype=float)
+    for start, arr in pieces:
+        out[start:start + len(arr)] = arr
+    return out, fs, unit
 
 
 def extract_stim_times(file_path: str, marker_name: str = "A",
@@ -350,8 +443,14 @@ def extract_stim_times(file_path: str, marker_name: str = "A",
     If marker_name matches the channel name itself (e.g. 'DigMark'),
     all codes are returned grouped: {"A": [...], "B": [...], ...}.
     """
-    seg, analogue_names = _load(file_path)
+    segments, analogue_names = _load_all(file_path)
+    seg = segments[0]
 
+    # Times are relative to the START OF THE RECORDING, not the start of each
+    # block, because the waveform this pairs with is one continuous trace built
+    # the same way. Reading block 0 alone returned one stimulus of ten on a
+    # ten-block file, and reading each block from its own zero would put every
+    # stimulus at the same place.
     t0 = (float(seg.analogsignals[0].t_start.rescale("s").magnitude)
           if seg.analogsignals
           else float(seg.t_start.rescale("s").magnitude))
@@ -381,8 +480,16 @@ def extract_stim_times(file_path: str, marker_name: str = "A",
             target = evt_all[0]
 
     if target is not None:
-        codes     = _get_event_codes(target)
-        times_abs = target.times.rescale("s").magnitude
+        # The same channel in every block, not only the first.
+        codes, times_abs = [], []
+        for sg in segments:
+            _all = list(sg.events) + list(sg.epochs) + list(sg.spiketrains)
+            _t = next((c for c in _all if c.name == target.name), None)
+            if _t is None:
+                continue
+            codes.extend(_get_event_codes(_t))
+            times_abs.extend(list(_t.times.rescale("s").magnitude))
+        times_abs = np.asarray(times_abs, dtype=float)
         times_rel = times_abs - t0
 
         # Group by code
@@ -423,6 +530,53 @@ def extract_stim_times(file_path: str, marker_name: str = "A",
     times = ((edges + 1) / fs_trig + t0_trig - t0).tolist()
     return {label: [t for t in times if t >= 0]} if times else {}
 
+
+def get_epoch_bounds(file_path: str):
+    """The largest window every stimulus can supply, or None for one block.
+
+    Spike2 records in blocks, and a stimulus cannot be epoched past the edges
+    of the block it sits in: beyond that lies the zero-fill this reader inserts
+    between blocks, and then the next trial. Each stimulus therefore has its
+    own hard limit, and the file-wide bound is the smallest of them -- the
+    window no trial exceeds.
+
+    Deliberately not conditional on the blocks being stimulus-centred. An
+    earlier version reported bounds only when every stimulus sat at the same
+    offset within its block, and declined otherwise; but a recording whose
+    blocks are merely paused-and-restarted has limits too, and declining left
+    the analysis free to read a second of padding as though it were signal.
+    Where the blocks ARE cut around the stimulus this returns exactly the
+    stored epoch, which is the same answer by a more general route.
+
+    None for a single-block recording, which is continuous and has no bounds.
+    """
+    try:
+        segments, _names = _load_all(file_path)
+    except Exception:
+        return None
+    if len(segments) < 2:
+        return None
+
+    pres, posts = [], []
+    for sg in segments:
+        try:
+            a = float(sg.t_start.rescale("s").magnitude)
+            b = float(sg.t_stop.rescale("s").magnitude)
+        except Exception:
+            continue
+        for ch in list(sg.events) + list(sg.epochs):
+            try:
+                for t in ch.times.rescale("s").magnitude:
+                    t = float(t)
+                    if a <= t <= b:
+                        pres.append((t - a) * 1000.0)
+                        posts.append((b - t) * 1000.0)
+            except Exception:
+                continue
+
+    if not pres:
+        return None
+    return (min(pres), min(posts))
 
 def list_event_codes(file_path: str) -> dict:
     """Return {channel_name: {code: count}} for every event channel in the file.

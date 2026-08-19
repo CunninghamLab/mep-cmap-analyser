@@ -143,6 +143,10 @@ def _load_chain_formats():
 # Not a format: a sentinel meaning "no reader recognises this file". It has no
 # load branch by design -- the load stops and says so, rather than continuing
 # into a reader that cannot help.
+# Not real formats: values detect_format returns to say "this is not a
+# recording". unsupported_text covers text with no data rows in it -- a
+# README or a settings file dropped in by mistake, which the Spike2 text
+# fallback used to claim and fail on much later.
 SENTINEL_FORMATS = {"unsupported_binary", "unsupported_text"}
 
 
@@ -152,7 +156,7 @@ def test_detect_format_returns_known_set():
         "spike2", "spike2_smr", "labchart", "labchart_mat", "cfwb",
         "generic_tsv", "edf", "brainvision", "brainsight",
         "acqknowledge_acq", "acqknowledge_mat", "mne",
-        "epoched_mat", "signal_mat",
+        "epoched_mat", "signal_mat", "kinemg_csv",
     }
 
 

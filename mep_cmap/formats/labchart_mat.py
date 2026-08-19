@@ -210,6 +210,80 @@ def extract_emg_waveform_and_fs(file_path: str, channel_idx: int = 0):
     return output, fs, unit
 
 
+def get_epoch_bounds(file_path: str):
+    """The largest window every stimulus can supply, or None for one block.
+
+    LabChart records in blocks, and this reader places them at their absolute
+    positions with the gaps zero-filled. A stimulus therefore cannot be epoched
+    past the edges of its own block: beyond lies that padding, and then the
+    next trial. Each stimulus has its own limit and the file-wide bound is the
+    smallest of them -- the window no trial exceeds.
+
+    The same rule as the Spike2 reader applies, for the same reason: a block is
+    a hard edge whether or not the blocks happen to be cut around the stimulus.
+
+    None for a single-block recording, which is continuous.
+    """
+    try:
+        mat = _load(file_path)
+        blocktimes = np.asarray(mat['blocktimes'], dtype=float).ravel()
+        datastart = np.asarray(mat['datastart'], dtype=float)
+        dataend = np.asarray(mat['dataend'], dtype=float)
+        samplerate = np.asarray(mat['samplerate'], dtype=float)
+    except Exception:
+        return None
+    nchan, nblocks = datastart.shape
+    if nblocks < 2:
+        return None
+
+    # Channel 0: block boundaries are a property of the recording, not of
+    # a channel, and every channel shares them. Its first populated
+    # block gives the sampling rate to measure them with.
+    try:
+        ch = 0
+        b0 = _first_block(mat, ch)
+        fs = float(samplerate[ch, b0])
+    except Exception:
+        return None
+    if fs <= 0:
+        return None
+    t0 = blocktimes[b0] if b0 < len(blocktimes) else 0.0
+
+    # Each block's span in seconds from the start of the recording.
+    spans = []
+    for b in range(nblocks):
+        if samplerate[ch, b] <= 0:
+            continue
+        st, en = int(datastart[ch, b]), int(dataend[ch, b])
+        if st <= 0 or en < st:
+            continue
+        bt = blocktimes[b] if b < len(blocktimes) else t0
+        a = (bt - t0) * _DAY_SECONDS
+        spans.append((a, a + (en - st + 1) / fs))
+    if len(spans) < 2:
+        return None
+
+    events = []
+    try:
+        for times in (extract_stim_times(file_path, '') or {}).values():
+            events.extend(float(t) for t in times)
+    except Exception:
+        return None
+    if not events:
+        return None
+
+    pres, posts = [], []
+    for t in events:
+        for a, b in spans:
+            if a <= t <= b:
+                pres.append((t - a) * 1000.0)
+                posts.append((b - t) * 1000.0)
+                break
+    if not pres:
+        return None
+    return (min(pres), min(posts))
+
+
 def extract_stim_times(file_path: str, marker_name: str = '') -> dict:
     """
     Return stimulation times from the ``com`` comment table, grouped by the

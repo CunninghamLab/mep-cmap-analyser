@@ -2394,6 +2394,15 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             row=2, column=0, sticky='e', padx=6)
         tk.Entry(time_frame, textvariable=self.prestim_ms, width=6).grid(
             row=2, column=1, sticky='w')
+        # What the recording can actually supply, when that is less than what
+        # is typed. The clamp has always reduced this at run time; the box went
+        # on saying 100 and the analyst had no way to know the analysis would
+        # use less.
+        self._prestim_limit_note = tk.Label(time_frame, fg="#B03A2E",
+                                            anchor="w", justify="left",
+                                            wraplength=560, text="")
+        self._prestim_limit_note.grid(row=2, column=2, columnspan=2,
+                                      sticky='w', padx=6)
 
         # Row 3 — say plainly what these bounds do and do not control, and show
         # when PTP anchoring has taken the start over.
@@ -6016,6 +6025,15 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             else:
                 self.log("   ⚠️  No frames found in this file")
 
+        elif _fmt == 'kinemg_csv':
+            # No trigger channel and no embedded markers: the format carries
+            # waveforms and a sampling rate and nothing else. Stimuli come from
+            # an event source configured against one of its channels, which the
+            # assignment dialogue now reaches for every format.
+            self.marker_choice.set(ALL_MARKERS)
+            self.log("📋 KinEMG CSV — waveforms only; configure a trigger "
+                     "channel under Event sources to identify stimuli")
+
         elif _fmt in ('acqknowledge_acq', 'acqknowledge_mat', 'brainsight'):
             # Trigger/marker-channel formats: one stim type, labelled by
             # marker_choice — same contract as labchart / cfwb.
@@ -6408,6 +6426,10 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         self._seen_detection_tab = False
         try:
             self._refresh_run_button()
+        except Exception:
+            pass
+        try:
+            self._apply_epoch_limit_to_prestim(fpath)
         except Exception:
             pass
 
@@ -7472,6 +7494,40 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
                     "setup to all channels' if they should share one."))
 
     # ──────────────────────────────────────────────────────────────────────
+    def _apply_epoch_limit_to_prestim(self, fpath):
+        """Cap the baseline at what the recording holds, and say so.
+
+        Not greyed out: asking for LESS baseline than the file can supply is a
+        legitimate choice, and disabling the box would prevent it. What is
+        wrong is the box promising more than exists, so the value is reduced
+        and the reason stated beside it.
+        """
+        note = getattr(self, "_prestim_limit_note", None)
+        if note is None:
+            return
+        bounds = None
+        try:
+            from .io import get_epoch_bounds as _geb
+            bounds = _geb(fpath)
+        except Exception:
+            bounds = None
+        if not bounds:
+            note.config(text="")
+            return
+        avail = float(bounds[0])
+        try:
+            current = float(self.prestim_ms.get())
+        except Exception:
+            current = avail
+        if current > avail:
+            self.prestim_ms.set(int(avail))
+            self.log(f"   Pre-stim for analysis reduced to {avail:.0f} ms — "
+                     f"the recording holds no more before the stimulus")
+        note.config(
+            text=(f"limited to {avail:.0f} ms: this recording is stored in "
+                  f"blocks and no trial has more than that before its "
+                  f"stimulus"))
+
     def _default_window_ms(self):
         """The file-wide window from tab 1c, as floats.
 

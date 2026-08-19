@@ -59,6 +59,7 @@ import os as _os
 
 from .formats import spike2      as _spike2
 from .formats import spike2_smr  as _spike2_smr
+from .formats import kinemg_csv  as _kinemg_csv
 from .formats import labchart    as _labchart
 from .formats import labchart_mat as _labchart_mat
 from .formats import brainsight  as _brainsight
@@ -251,6 +252,14 @@ def detect_format(file_path: str) -> str:
             or '"Waveform"' in first_line or '"Waveform"' in second_line):
         return 'spike2'
 
+    # KinEMG CSV: named in its first line. Checked here because the reader
+    # existed with the full three-function contract and detect_format never
+    # returned it -- so the format was supported by every measure except being
+    # reachable, and a KinEMG export fell through to the generic TSV path or to
+    # the Spike2 fallback depending on its punctuation.
+    if first_line.strip().lower().startswith("author,kinemg"):
+        return 'kinemg_csv'
+
     # Heuristic: if the first non-empty line parses as all-numeric fields,
     # treat as a generic headerless TSV.
     test_line = first_line.strip()
@@ -398,6 +407,8 @@ def list_waveform_channels(file_path: str) -> list:
         return _acqknowledge_acq.list_waveform_channels(file_path)
     if fmt == 'acqknowledge_mat':
         return _acqknowledge_mat.list_waveform_channels(file_path)
+    if fmt == 'kinemg_csv':
+        return _kinemg_csv.list_waveform_channels(file_path)
     if fmt == 'signal_mat':
         return _signal_mat.list_waveform_channels(file_path)
     if fmt == 'epoched_mat':
@@ -529,6 +540,8 @@ def _extract_emg_native(file_path: str, channel_idx: int = 0):
         return _acqknowledge_acq.extract_emg_waveform_and_fs(file_path, channel_idx)
     if fmt == 'acqknowledge_mat':
         return _acqknowledge_mat.extract_emg_waveform_and_fs(file_path, channel_idx)
+    if fmt == 'kinemg_csv':
+        return _kinemg_csv.extract_emg_waveform_and_fs(file_path, channel_idx)
     if fmt == 'signal_mat':
         return _signal_mat.extract_emg_waveform_and_fs(file_path, channel_idx)
     if fmt == 'epoched_mat':
@@ -573,6 +586,15 @@ def get_epoch_bounds(file_path: str):
     """
     file_path = _resolve_path(file_path)
     _fmt = detect_format(file_path)
+    if _fmt == 'spike2_smr':
+        # A Spike2 session paused and restarted around each stimulus is
+        # pre-epoched without saying so. Returns None for a continuous run.
+        return _spike2_smr.get_epoch_bounds(file_path)
+    if _fmt == 'labchart_mat':
+        # LabChart MATLAB exports are block-structured too; the reader
+        # concatenates them with zero-filled gaps, so the same block edge
+        # limits apply.
+        return _labchart_mat.get_epoch_bounds(file_path)
     if _fmt == 'labchart':
         # A LabChart block export is pre-epoched without saying so: each block
         # is a trial cut about the stimulus. Returns None for a continuous
@@ -641,6 +663,8 @@ def extract_stim_times(file_path: str, marker_name: str, stim_channel: str = Non
         return _acqknowledge_acq.extract_stim_times(file_path, marker_name)
     if fmt == 'acqknowledge_mat':
         return _acqknowledge_mat.extract_stim_times(file_path, marker_name)
+    if fmt == 'kinemg_csv':
+        return _kinemg_csv.extract_stim_times(file_path, marker_name)
     if fmt == 'signal_mat':
         return _signal_mat.extract_stim_times(file_path, marker_name)
     if fmt == 'epoched_mat':

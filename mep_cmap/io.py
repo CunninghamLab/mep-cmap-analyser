@@ -267,7 +267,18 @@ def detect_format(file_path: str) -> str:
                 except ValueError:
                     pass
 
-    # Default fallback
+    # Default fallback: Spike2 text exports vary enough that the checks
+    # above cannot be made exhaustive, so anything textual reaching here is
+    # given to that reader.
+    #
+    # Anything, however, included a README, a pyproject.toml and any other
+    # text a person might drop in by mistake -- each claimed as a recording
+    # and failing several steps later with a bare ValueError from inside a
+    # parser. A file with no numeric data at all in its opening lines is not
+    # a recording in any format, and saying so here costs nothing: a real
+    # export has numbers within the first few dozen lines by definition.
+    if not _has_numeric_rows(file_path):
+        return 'unsupported_text'
     return 'spike2'
 
 
@@ -293,6 +304,37 @@ def needs_wizard(file_path: str) -> bool:
 # Public API — dispatches to the correct format reader
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _has_numeric_rows(file_path: str, scan_lines: int = 80) -> bool:
+    """True if any of the opening lines looks like a row of numbers.
+
+    Deliberately generous: two numeric fields on one line anywhere in the
+    first eighty is enough. The question is "could this be a recording at
+    all", not "which format is it", and a false yes merely restores the
+    previous behaviour rather than introducing a new failure.
+    """
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as fh:
+            for _i, line in enumerate(fh):
+                if _i >= scan_lines:
+                    break
+                for sep in ("\t", ",", ";", " "):
+                    parts = [p.strip() for p in line.split(sep) if p.strip()]
+                    if len(parts) < 2:
+                        continue
+                    numeric = 0
+                    for p in parts[:8]:
+                        try:
+                            float(p)
+                            numeric += 1
+                        except ValueError:
+                            pass
+                    if numeric >= 2:
+                        return True
+    except Exception:
+        return True   # unreadable here is not the same as not a recording
+    return False
+
+
 def _unreadable_reason(file_path: str) -> str:
     """Why this file cannot be read, in words the analyst can act on."""
     ext = _os.path.splitext(file_path)[1].lower()
@@ -313,6 +355,9 @@ def _unreadable_reason(file_path: str) -> str:
                 "CFS container rather than the sweeps. In Signal, use "
                 "File \u2192 Export As \u2192 MATLAB instead, which writes the "
                 "frame data this tool reads.")
+    if detect_format(file_path) == 'unsupported_text':
+        return ("This is a text file with no data rows in it. If it should be "
+                "a recording, check it exported completely.")
     return UNREADABLE_FORMATS.get(
         ext,
         "This file is not in a format the tool can read. The readable formats "
@@ -333,6 +378,11 @@ def list_waveform_channels(file_path: str) -> list:
     """Return channel names for display in the channel selector."""
     file_path = _resolve_path(file_path)
     fmt = detect_format(file_path)
+    if fmt == 'unsupported_text':
+        raise ValueError(
+            f"{_os.path.basename(file_path)}: this is a text file with no "
+            f"data rows in it, so it is not a recording this tool can "
+            f"read. The readable formats are listed in File \u2192 Open.")
     if fmt == 'unsupported_binary':
         # Raised here rather than left to a reader further down. This function
         # is what the file queue calls to warm a file up, before
@@ -523,6 +573,11 @@ def get_epoch_bounds(file_path: str):
     """
     file_path = _resolve_path(file_path)
     _fmt = detect_format(file_path)
+    if _fmt == 'labchart':
+        # A LabChart block export is pre-epoched without saying so: each block
+        # is a trial cut about the stimulus. Returns None for a continuous
+        # export, which is the ordinary case for this format.
+        return _labchart.get_epoch_bounds(file_path)
     if _fmt == 'signal_mat':
         return _signal_mat.get_epoch_bounds(file_path)
     if _fmt == 'epoched_mat':

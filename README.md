@@ -33,6 +33,70 @@ The tool is not limited to any single measure or paradigm. It handles motor evok
 
 ## What's New in 1.4.0
 
+### Conditions
+
+A recording's markers say what kind of stimulus fired, not what it was for.
+Twenty pulses labelled `A` may be ten before an intervention and ten after, and
+nothing in the file distinguishes them.
+
+**Setup ▸ Conditions** assigns trials to named conditions. The table opens
+populated from the recording's own events, so a file needing no conditions costs
+one click through. Select a row to see its epochs drawn as an overlay, an
+average, or both; select ten of twenty trials and split them into a new
+condition. Several conditions can be drawn together in different colours, which
+is how a split is checked before it is applied.
+
+A condition is a second axis alongside the stimulus type, not a replacement.
+`A` decides how a response is detected — its latency window, its muscle, whether
+a silent period applies. `pre` and `post` decide what the trial means. The trial
+file reports the two in separate columns, so a timepoint is a factor the group
+analysis can model rather than a substring to be parsed out of a name.
+
+Each condition may be given its own epoch, decided while looking at the
+waveforms rather than typed blind on a settings tab. Epochs are held per
+channel, since a hand muscle and a leg muscle want different windows, while the
+conditions themselves are shared: a trial belongs to the same condition whichever
+channel it is viewed on. Every edit is undoable.
+
+Conditions are written to a BIDS `_events.tsv` beside the recording, with a
+documented `condition` column, and read back on the next load. Not a private
+format: an assignment should survive being read by something other than the
+program that wrote it. Every event must belong to a condition or be explicitly
+excluded, and an excluded trial is written as `n/a` rather than dropped, so the
+file accounts for every event in the recording.
+
+### Channel assignment for every format
+
+The channel and event-marker dialogue used to run for Spike2 text exports
+alone, so a LabChart export of six named channels was analysed on whichever came
+first, with no route to Event sources at all. It now runs for every format, and
+is not skipped when a file appears to offer no choice — a recording whose
+embedded markers are wrong needs a threshold source, and that decision is only
+reachable there. Reopen it from tab 1a or from **File ▸ Reassign channels** to
+correct a choice without reloading.
+
+### One session per recording
+
+**Save Session** wrote wherever you pointed it, defaulting beside the raw data,
+while the automatic save wrote a BIDS-named file under `derivatives/`. A
+recording could carry two sessions that knew nothing of each other. There is now
+one, in `derivatives/`; **File ▸ Save session copy** covers a named variant.
+
+Save, Load, Preview and Run appear on every First Level tab rather than only on
+1c, and moving between tabs saves — preparing a set of recordings before running
+any of them is a workflow this tool supports. Run Analysis stays disabled until
+the detection settings have been seen for that recording.
+
+### Reading
+
+**LabChart block exports** are recognised as pre-epoched. Each block is a trial
+already cut about the stimulus, and nothing announced it: an over-long window ran
+off the end of a block into the padding between them and then into the following
+trial. Analysis windows are now clamped to what a block contains.
+
+**Text files with no data rows are declined** when opened, rather than being
+claimed as a Spike2 export and failing several steps later inside a parser.
+
 > **The epoch window moved.** Pre- and post-stimulus extents are now set per
 > stimulus type on tab 1a, not once for the file on tab 1c. A recording where
 > every type should share a window behaves as before; a file mixing an M-wave
@@ -181,9 +245,14 @@ There is deliberately no primary channel: every selected channel is analysed
 identically with its own setup, so a primary would imply a hierarchy that does
 not exist. The first selected is where configuration starts.
 
-Both dialogues were changed. Multi-channel analysis is not a Spike2 feature, and
-leaving the other as a single choice made the capability reachable for one
-format out of ten.
+The dialogue runs for **every format**, and is not skipped when a file appears to
+offer no choice: a recording whose embedded markers are wrong needs a threshold
+source configured against a trigger channel, and that decision is only reachable
+there. It had run for Spike2 text exports alone, so a LabChart export of six
+named channels was analysed on whichever came first.
+
+Reopen it from **Channel assignment…** on tab 1a, or from **File ▸ Reassign
+channels…**, to correct a choice without reloading the recording.
 
 ### Files no reader can open
 
@@ -580,16 +649,23 @@ with a test that fails if any consumer drifts from it.
 ## The Interface
 
 ```
-Setup                         First Level: Single File                  Second Level: Group
-├── Dataset                   ├── 1a  Labels & Analysis Setup      ├── Group Analysis (LME)
-└── BIDS-ify                  ├── 1b  Data Filtering                  └── Add-ons
-                               ├── 1c  Feature Detection Setup
-                               │       (+ ▶ Run Analysis)
-                               ├── 1d  Normalisation (optional)
-                               └── Add-ons
+Setup                    First Level: Single File        Second Level: Group
+├── Dataset              ├── 1a  Labels & Analysis Setup   ├── Group Analysis (LME)
+├── Conditions           ├── 1b  Data Filtering            └── Add-ons
+└── BIDS-ify             ├── 1c  Feature Detection Setup
+                         ├── 1d  Normalisation (optional)
+                         └── Add-ons
+                         [ Save · Load · Preview · Run ]
 ```
 
-The active file, channel, and event marker are shown in a persistent header above the First-Level sub-tabs, so context stays visible as you move between steps.
+The active file, channel, and event marker are shown in a persistent header above
+the First-Level sub-tabs, and Save Session, Load Session, Preview detection and
+Run Analysis in a footer below them, so both stay reachable as you move between
+steps. Run is disabled until the detection settings have been seen for the
+recording.
+
+Opening a file lands on **Setup ▸ Conditions**: what a stimulus type is *for* is
+decided before how its response is detected.
 
 ---
 
@@ -610,6 +686,8 @@ Exported via **File → Export → Text**. Waveform channels are read along with
 #### LabChart text export (`.txt`)
 
 Auto-detected from the `Interval=` header. Each recording block is treated as a pre-aligned trial; no trigger channel is required. Rust-accelerated.
+
+A block export is a **pre-epoched** recording: each block is a trial already cut about the stimulus, its time column running from a negative value to a positive one and restarting for the next. The stored extent is reported, so analysis and viewing windows are clamped to what a block actually contains rather than running past its end into the padding between blocks and then into the following trial.
 
 #### LabChart MATLAB export (`.mat`)
 
@@ -684,7 +762,9 @@ New formats are easy to add: a single `formats/<name>.py` module with three publ
 
 ### Trial Segmentation
 
-* Configurable pre-stimulus and post-stimulus windows (ms)
+* Pre- and post-stimulus windows set **per stimulus type** on tab 1a, or per condition in the Conditions tab; a type left alone uses the file-wide default
+* **Conditions**: trials assigned to named groups when the recording cannot distinguish them — two timepoints, three intensities, a block design — written to a BIDS `_events.tsv` and analysed as separate groups while `StimType` and `Condition` stay separate columns in the trial file
+* Windows are clamped to what a pre-epoched recording contains, and the shortening is reported rather than applied silently
 * Per stimulus-type gap parameter to skip the TMS artefact period before onset search
 * Multi-stimulus support within a single recording: every marker/event label gets its own settings, colour, and output columns
 * Stim times sourced from DigMark timestamps (Spike-2), interval resets (LabChart), TTL/trigger rising edges (CFWB, generic TTL rows), event markers (BIOPAC, BrainVision, Brainsight), or manual entry

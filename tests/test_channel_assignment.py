@@ -158,10 +158,29 @@ def test_reassigning_confirms_before_discarding():
     assert body.index("askyesno") < body.index("os.remove")
 
 
-def test_reassigning_explains_when_the_format_has_no_assignment():
+def test_reassigning_works_for_every_format():
+    """It reported "nothing to reassign" for every format but Spike2 SMR.
+
+    Which mechanism recorded the previous answer -- a sidecar, or the session
+    -- is an implementation detail. The analyst wants to change which channel
+    is analysed, and the message read as the command being unavailable rather
+    than as it being aimed elsewhere.
+    """
     a = APP.index("def _reassign_channels")
     b = APP.index("\n    def ", a + 10)
-    assert "Nothing to reassign" in APP[a:b]
+    body = APP[a:b]
+    assert "Nothing to reassign" not in body
+    assert "self.reopen_channel_assignment()" in body
+
+
+def test_reassigning_still_clears_the_sidecar_where_there_is_one():
+    """Spike2 SMR saves its assignment to disk; reopening the dialogue alone
+    would leave the saved answer to reappear on the next load."""
+    a = APP.index("def _reassign_channels")
+    b = APP.index("\n    def ", a + 10)
+    body = APP[a:b]
+    assert "os.remove(str(side))" in body
+    assert "_browse_file_path(fpath)" in body
 
 
 # ── The dialogue appears every time ──────────────────────────────────────────

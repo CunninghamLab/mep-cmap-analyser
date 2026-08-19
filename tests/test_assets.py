@@ -221,3 +221,44 @@ def test_opening_a_link_cannot_raise():
             assert "try:" in body and "except Exception:" in body
             return
     raise AssertionError("_open_url not found")
+
+
+# ── the About window ─────────────────────────────────────────────────────────
+
+def _about():
+    i = APP.index("def _show_about")
+    j = APP.index("\n    # ", i)
+    return APP[i:j]
+
+
+def test_the_description_names_what_the_tool_measures():
+    """It said MEP and cSP, which is two of the several evoked responses this
+    quantifies: M-waves, H-reflexes and CMAPs are not MEPs."""
+    body = _about()
+    assert "BIDS-compliant EMG neurophysiology" in body
+    assert "CMAP" in body and "cSP" in body
+
+
+def test_the_mark_in_about_links_out_like_the_one_in_the_header():
+    """The same mark behaving differently in two places is a small puzzle for
+    no reason."""
+    body = _about()
+    assert "_open_url(_TMSML_URL)" in body
+    assert 'cursor="hand2"' in body
+
+
+def test_the_mark_in_about_is_labelled():
+    body = _about()
+    assert 'text="TMSMultiLab"' in body
+
+
+def test_the_address_is_written_once():
+    """Three widgets now link to it; three copies is how one of them ends up
+    pointing somewhere that has moved."""
+    assert APP.count('"https://github.com/TMSMultiLab/TMSMultiLab/wiki"') == 1
+    assert APP.count("_TMSML_URL") >= 4
+
+
+def test_the_about_mark_keeps_its_reference():
+    body = _about()
+    assert "_w.image = _l" in body

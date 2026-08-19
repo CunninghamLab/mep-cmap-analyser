@@ -143,7 +143,7 @@ def _load_chain_formats():
 # Not a format: a sentinel meaning "no reader recognises this file". It has no
 # load branch by design -- the load stops and says so, rather than continuing
 # into a reader that cannot help.
-SENTINEL_FORMATS = {"unsupported_binary"}
+SENTINEL_FORMATS = {"unsupported_binary", "unsupported_text"}
 
 
 def test_detect_format_returns_known_set():

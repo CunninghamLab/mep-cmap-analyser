@@ -392,11 +392,24 @@ def validate(rows, stim_times, allow_unassigned=False):
     if not allow_unassigned:
         loose = unassigned(rows, stim_times)
         if loose:
-            where = "; ".join(f"{k}: {format_trials(v)}" for k, v in loose.items())
+            # Name the stimulus type first. The commonest cause is a type with
+            # no row at all -- a recording carrying Trigger and Start Task,
+            # every Trigger assigned, and Start Task never mentioned -- and
+            # "these trials are in no condition" sends the analyst looking at
+            # the rows that are there rather than at the one that is missing.
+            missing = [k for k, v in loose.items()
+                       if len(v) == len(stim_times.get(k) or [])]
+            if missing:
+                head = (f"{', '.join(missing)} has no condition at all"
+                        if len(missing) == 1
+                        else f"{', '.join(missing)} have no conditions at all")
+            else:
+                head = "some trials are in no condition"
+            where = "; ".join(f"{k}: {format_trials(v)}"
+                              for k, v in sorted(loose.items()))
             raise ConditionError(
-                f"these trials are in no condition and would be dropped "
-                f"without appearing anywhere — {where}.  Assign them, or tick "
-                f"the option to exclude them explicitly.")
+                f"{head} — {where}.  Give them one, or tick the option to "
+                f"exclude them.")
 
     named = deduplicate_names([(r.stim_type, r.condition) for r in rows])
     settled = [replace(r, condition=sanitise_name(c))

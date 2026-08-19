@@ -615,3 +615,43 @@ def test_the_button_label_reads_the_last_element():
     naming the epoch book instead of the action."""
     body = _method("_cond_refresh_history_buttons")
     assert "[-1][-1]" in body
+
+
+# ── why Confirm is unavailable ───────────────────────────────────────────────
+
+def test_the_reason_has_its_own_label():
+    """It shared the review pane's label, which the drawing code rewrites on
+    every selection -- so the reason appeared and was overwritten by
+    "10 trial(s) from 1 condition(s)" before it could be read, leaving a
+    disabled button with no explanation anywhere on the tab.
+    """
+    body = _method("_cond_refresh_status")
+    assert "_cond_block.config" in body
+    assert "_cond_note.config" not in body
+
+
+def test_the_reason_sits_beside_the_button_it_explains():
+    """Which is where anyone looks when a button will not click."""
+    body = _method("_build_conditions_tab")
+    i = body.index("_cond_apply_btn")
+    j = body.index("_cond_block")
+    assert abs(body[i:j].count("\\n")) < 20, \
+        "the explanation should be built with the button, not elsewhere"
+
+
+def test_an_empty_table_says_so_too():
+    body = _method("_cond_refresh_status")
+    assert "No conditions to apply" in body
+
+
+def test_loose_trials_can_be_given_rows():
+    """Reporting the problem and offering no way to act on it means retyping
+    trial ranges the tool already knows."""
+    body = _method("_cond_add_unassigned")
+    assert "C.unassigned(" in body
+    assert "_cond_commit(" in body
+    assert "Add unassigned" in TAB
+
+
+def test_adding_when_nothing_is_loose_says_so():
+    assert "already belongs to a condition" in _method("_cond_add_unassigned")

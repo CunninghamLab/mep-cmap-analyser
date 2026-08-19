@@ -184,6 +184,7 @@ class ConditionsTabMixin:
                          ("Auto fill…", self._cond_autofill),
                          ("Set epoch from view", self._cond_set_epoch),
                          ("Clear epoch", self._cond_clear_epoch),
+                         ("Add unassigned", self._cond_add_unassigned),
                          ("Exclude", self._cond_toggle_exclude),
                          ("Delete", self._cond_delete)):
             tk.Button(btns, text=txt, command=cmd).pack(side="left", padx=(0, 4))
@@ -308,6 +309,15 @@ class ConditionsTabMixin:
             foot, text="✔  Confirm events & continue",
             command=self._cond_apply)
         self._cond_apply_btn.pack(side="right")
+        # Why Confirm is unavailable, beside Confirm.
+        #
+        # It shared the review pane's label, which the drawing code rewrites on
+        # every selection -- so the reason appeared and was overwritten by
+        # "10 trial(s) from 1 condition(s)" before it could be read, leaving a
+        # disabled button with no explanation anywhere on the tab.
+        self._cond_block = tk.Label(foot, text="", fg="#B03A2E", anchor="e",
+                                    justify="right", wraplength=900)
+        self._cond_block.pack(side="right", padx=(0, 10))
 
     # ── loading ──────────────────────────────────────────────────────────────
 
@@ -520,7 +530,7 @@ class ConditionsTabMixin:
         self._cond_tree.delete(*self._cond_tree.get_children())
         for i, row in enumerate(self._cond_rows):
             self._cond_tree.insert(
-                "", "end", iid=str(i),
+                "", "end", iid=str(i), tags=(),
                 values=(row.stim_type,
                         ("— excluded —" if row.excluded
                          else (row.condition or "")),
@@ -544,19 +554,21 @@ class ConditionsTabMixin:
         """Say whether the table can be applied, and why not when it cannot."""
         if not self._cond_rows:
             self._cond_apply_btn.config(state="disabled")
+            self._cond_block.config(text="No conditions to apply.",
+                                    fg="#B03A2E")
             return
         try:
             C.validate(self._cond_rows, self._cond_stim_times,
                        allow_unassigned=bool(self._cond_allow_unassigned.get()))
         except C.ConditionError as exc:
-            self._cond_note.config(text=str(exc), fg="#B03A2E")
+            self._cond_block.config(text=str(exc))
             self._cond_apply_btn.config(state="disabled")
             return
         self._cond_apply_btn.config(state="normal")
         n = sum(r.n for r in self._cond_rows if not r.excluded)
-        self._cond_note.config(
-            text=f"{len(self._cond_rows)} condition(s), {n} trial(s) — ready to "
-                 f"apply", fg="#1E8449")
+        self._cond_block.config(
+            text=f"{len(self._cond_rows)} condition(s), {n} trial(s) — ready",
+            fg="#1E8449")
 
     def _cond_selected_indices(self):
         return tuple(int(i) for i in self._cond_tree.selection()
@@ -866,6 +878,26 @@ class ConditionsTabMixin:
             for ri in rows:
                 book.pop(self._cond_rows[ri].group_key, None)
         self._cond_refresh_table()
+
+    def _cond_add_unassigned(self):
+        """Give every loose trial a row of its own.
+
+        The commonest way to arrive at a table that cannot be applied is a
+        stimulus type nobody split, left with no row after the others were
+        edited. Reporting that and offering no way to act on it means retyping
+        trial ranges the tool already knows.
+        """
+        loose = C.unassigned(self._cond_rows, self._cond_stim_times)
+        if not loose:
+            messagebox.showinfo("Conditions",
+                                "Every trial already belongs to a condition.",
+                                parent=self.root)
+            return
+        new_rows = list(self._cond_rows)
+        for stim, trials in sorted(loose.items()):
+            new_rows.append(C.ConditionRow(stim_type=stim, condition="",
+                                           trials=tuple(trials)))
+        self._cond_commit(new_rows, "add unassigned")
 
     def _cond_toggle_exclude(self):
         rows = self._cond_selected_indices()

@@ -322,6 +322,9 @@ ALL_MARKERS = "All"
 #: statement and the one anyone citing the tool will read.
 AUTHORS_LINE = "Justin W. Andrushko\nDavid A. Cunningham"
 
+#: Where the TMSMultiLab mark links to, wherever it appears.
+_TMSML_URL = "https://github.com/TMSMultiLab/TMSMultiLab/wiki"
+
 
 #: Explanation shown by the ⓘ beside each tab 1a heading. Keyed by the exact
 #: heading text, so a column renamed without its help being revisited loses
@@ -839,12 +842,18 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         return token["id"]
 
     def _reassign_channels(self):
-        """Discard the saved channel assignment and ask again.
+        """Choose the channels and event marker again, for any format.
 
-        The assignment dialogue appears only when no sidecar exists, so a file
-        set up before multi-channel support keeps its single channel with no
-        way to add more. Without this the only route is finding and deleting a
-        JSON by hand, which is the sort of thing that gets done wrong.
+        Spike2 SMR stores its assignment in a sidecar, so reassigning means
+        discarding that and reloading. Every other format holds the answer for
+        the session, and reassigning means reopening the dialogue.
+
+        Both routes exist under one menu item because the distinction is an
+        implementation detail: the analyst wants to change which channel is
+        being analysed, and which of two mechanisms recorded the previous
+        answer is not something they should have to know. It reported "nothing
+        to reassign" for every format but one, which read as the command being
+        unavailable rather than as it being aimed elsewhere.
         """
         fpath = self.file_path.get()
         if not fpath or not os.path.isfile(fpath):
@@ -857,12 +866,9 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         except Exception:
             side = None
         if side is None or not os.path.isfile(str(side)):
-            messagebox.showinfo(
-                "Nothing to reassign",
-                "This file has no saved channel assignment. Only Spike2 SMR "
-                "recordings use one; other formats choose their channels when "
-                "the file is read.",
-                parent=self.root)
+            # No sidecar: the assignment for this format lives in the session,
+            # and the dialogue itself is the way to change it.
+            self.reopen_channel_assignment()
             return
         if not messagebox.askyesno(
                 "Reassign channels",
@@ -882,6 +888,27 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             return
         self.log("🔁 Channel assignment cleared — choose again.")
         self._browse_file_path(fpath)
+
+    def reopen_channel_assignment(self):
+        """Show the Channel Assignment dialogue again for the loaded file."""
+        fn = getattr(self, "_reopen_assignment", None)
+        if fn is None:
+            messagebox.showinfo(
+                "Channel assignment",
+                "Open a recording first.  Spike2 .smr files have their own "
+                "channel dialogue, reached from the file queue.",
+                parent=self.root)
+            return
+        try:
+            fn()
+        except Exception as exc:                      # noqa: BLE001 — reported
+            self.log(f"   ⚠️  Channel assignment could not be reopened: {exc}")
+            return
+        try:
+            self._build_labels_tab(sorted(self.available_markers
+                                          or self.label_map or ["A"]))
+        except Exception:
+            pass
 
     def _open_event_sources(self):
         """Configure where stimulus events come from.
@@ -1043,14 +1070,12 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
                 _mw.image = _mark          # Tk keeps only a weak reference
                 _mw.pack(side="right", padx=(6, 12), pady=(5, 2))
                 Tooltip(_mw, "TMSMultiLab", pin_on_click=False)
-                _mw.bind("<Button-1>", lambda _e: _open_url(
-                    "https://github.com/TMSMultiLab/TMSMultiLab/wiki"))
+                _mw.bind("<Button-1>", lambda _e: _open_url(_TMSML_URL))
                 _tx = tk.Label(_brand, text="TMSMultiLab", fg="#1F3864",
                                cursor="hand2",
                                font=("TkDefaultFont", 9))
                 _tx.pack(side="right", pady=(5, 2))
-                _tx.bind("<Button-1>", lambda _e: _open_url(
-                    "https://github.com/TMSMultiLab/TMSMultiLab/wiki"))
+                _tx.bind("<Button-1>", lambda _e: _open_url(_TMSML_URL))
         except Exception:
             pass
 
@@ -1124,6 +1149,9 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         self._stage1_header = ttk.Frame(self.stage1_outer)
         self._stage1_header.pack(side="top", fill="x")
         ttk.Separator(self.stage1_outer, orient="horizontal").pack(side="top", fill="x")
+        self.footer_frame = tk.Frame(self.stage1_outer, bd=1, relief="raised")
+        self.footer_frame.pack(side="bottom", fill="x")
+
         self.nb_stage1 = ttk.Notebook(self.stage1_outer, style="Sub.TNotebook")
         self.nb_stage1.pack(fill="both", expand=True)
 
@@ -1141,9 +1169,16 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         # Stage 1c — Feature Detection Setup  (detection/analysis + Run footer)
         self.tab_detect = ttk.Frame(self.nb_stage1)
         self.nb_stage1.add(self.tab_detect, text="1c – Feature Detection Setup")
-        # Fixed footer (▶ Run Analysis) pinned at the bottom of 1c
-        self.footer_frame = tk.Frame(self.tab_detect, bd=1, relief="raised")
-        self.footer_frame.pack(side="bottom", fill="x")
+        # The footer belongs to the whole of First Level, not to 1c.
+        #
+        # Save Session, Load Session, Preview and Run were reachable from one
+        # sub-tab of four. Preparing a recording without running it -- setting
+        # labels, conditions, windows, filters, then moving to the next file --
+        # is a workflow this tool supports, and it required navigating to 1c to
+        # record the work whichever tab that work had been done on.
+        #
+        # Packed before the notebook, so Tk gives it its height first and the
+        # scrolling bodies take what is left.
         self._detect_body, self.canvas_detect = self._make_scroll_body(self.tab_detect)
 
         # setup_gui() builds the Filter section into the 1b body, then swaps
@@ -2010,6 +2045,8 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         file_menu.add_command(label="Set Derivatives Folder…", command=lambda: self.browse_derivatives_folder())
         file_menu.add_separator()
         file_menu.add_command(label="Save Session",  command=lambda: self.save_session())
+        file_menu.add_command(label="Save session copy\u2026",
+                              command=lambda: self.save_session_copy())
         file_menu.add_command(label="Load Session",  command=lambda: self.load_session())
         file_menu.add_separator()
         file_menu.add_command(label="Reassign channels…",
@@ -2578,8 +2615,25 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         # parameters, same code path" obvious without being explained.
         tk.Button(footer_inner, text="🔎 Preview detection", width=18,
                   command=self.preview_detection_start).pack(side="left", padx=(12,4))
-        tk.Button(footer_inner, text="▶  Run Analysis", width=14,
-                  command=self.run_analysis_start).pack(side="left", padx=(4,4))
+        # Disabled until the detection tab has been seen for this recording.
+        #
+        # The footer used to belong to 1c, so reaching this button meant having
+        # passed the detection settings. Moving it to the whole of First Level
+        # made Run clickable from the labels tab, where an analyst who had not
+        # yet looked at the amplitude window, the onset method or the silent
+        # period criteria could start a run on whatever those happened to be.
+        #
+        # Preview is deliberately NOT gated: trying the settings is how one
+        # finds out whether they need looking at, and it writes nothing.
+        self._run_btn = tk.Button(footer_inner, text="▶  Run Analysis", width=14,
+                                  state="disabled",
+                                  command=self.run_analysis_start)
+        self._run_btn.pack(side="left", padx=(4,4))
+        Tooltip(self._run_btn,
+                "Open 1c \u2014 Feature Detection Setup first.\n\n"
+                "Running without having seen the detection settings means "
+                "running on whatever they were left at, which may be the "
+                "previous recording's.", pin_on_click=False)
         self.progress_bar = ttk.Progressbar(footer_inner, variable=self.progress,
                                             maximum=100)
         self.progress_bar.pack(side="left", fill="x", expand=True, padx=(8,6))
@@ -2738,6 +2792,38 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         }
         return session
 
+    def session_path(self):
+        """Where this recording's session is saved, or None with no file open.
+
+        One rule, used by the autosave and by Save Session alike. They used to
+        disagree: the autosave wrote a BIDS-named file under derivatives while
+        Save Session opened a dialogue beside the raw data, so a recording
+        could carry two sessions that knew nothing of each other and the one
+        that won was whichever the analyst happened to pick on the way back in.
+
+        Derivatives rather than beside the recording, because a session is
+        something the tool produced. Raw data is what the scanner and the
+        stimulator wrote, and is better left as they wrote it.
+        """
+        fp = self.file_path.get()
+        if not fp:
+            return None
+        meta = getattr(self, "study_metadata", None)
+        bids_prefix = _make_bids_prefix(meta.bids_prefix() if meta else "",
+                                        pathlib.Path(fp).stem)
+        source_dir = os.path.dirname(fp)
+        deriv_root = (self.derivatives_path.get()
+                      if hasattr(self, "derivatives_path")
+                      and self.derivatives_path.get() else source_dir)
+        sub_ses = (meta.sub_ses_path() if meta
+                   else os.path.join("sub-unknown", "ses-01"))
+        # Avoid derivatives/derivatives/ — same fix as in pipeline.py
+        if os.path.basename(os.path.normpath(deriv_root)).lower() == "derivatives":
+            save_dir = os.path.join(deriv_root, sub_ses)
+        else:
+            save_dir = os.path.join(deriv_root, "derivatives", sub_ses)
+        return os.path.join(save_dir, f"{bids_prefix}_session.json")
+
     def _autosave_session(self):
         """Silently save the session to the BIDS derivatives folder.
 
@@ -2772,13 +2858,11 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
 
             sub_ses     = meta.sub_ses_path() if meta else os.path.join("sub-unknown", "ses-01")
             # Avoid derivatives/derivatives/ — same fix as in pipeline.py
-            _deriv_base = os.path.basename(os.path.normpath(deriv_root)).lower()
-            if _deriv_base == "derivatives":
-                save_dir = os.path.join(deriv_root, sub_ses)
-            else:
-                save_dir = os.path.join(deriv_root, "derivatives", sub_ses)
+            save_path = self.session_path()
+            if not save_path:
+                return
+            save_dir = os.path.dirname(save_path)
             os.makedirs(save_dir, exist_ok=True)
-            save_path   = os.path.join(save_dir, f"{bids_prefix}_session.json")
 
             # ── Serialise (same logic as save_session, no dialog) ─────────────
             def _j(v):
@@ -2823,11 +2907,19 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
     def save_session(self):
         """Serialise all GUI settings, file context, and inspector metadata."""
         fp = self.file_path.get()
-        ddir = os.path.dirname(fp) if fp else os.getcwd()
-        dname = (pathlib.Path(fp).stem+"_session.json") if fp else "mep_cmap_session.json"
-        sp = filedialog.asksaveasfilename(title="Save session",initialdir=ddir,initialfile=dname,
-            defaultextension=".json",filetypes=[("MEP-CMAP session","*.json"),("All files","*.*")],parent=self.root)
-        if not sp: return
+        # No dialogue: a recording has ONE session, and this writes it.
+        #
+        # It used to ask where to put it, defaulting beside the raw data, while
+        # the automatic save wrote a BIDS-named file under derivatives. A
+        # recording could therefore carry two sessions that knew nothing of
+        # each other, and which one took effect depended on what the analyst
+        # picked on the way back in.
+        sp = self.session_path()
+        if not sp:
+            messagebox.showinfo("Save session", "Open a recording first.",
+                                parent=self.root)
+            return
+        os.makedirs(os.path.dirname(sp), exist_ok=True)
         def _j(v):
             if isinstance(v,(np.integer,)): return int(v)
             if isinstance(v,(np.floating,)): return float(v)
@@ -3055,6 +3147,38 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             self.segments_metadata = _unpack_meta(sess.get("segments_metadata"))
         try: self.toggle_bandpass_fields(); self.toggle_bp_order_fields(); self.toggle_notch_fields(); self._toggle_humbug_fields()
         except Exception: pass
+
+    def save_session_copy(self):
+        """Write the session somewhere of the analyst's choosing.
+
+        Kept for the case Save Session no longer covers: a named variant set
+        aside before changing something, which is a different intention from
+        recording where the work has got to.
+        """
+        sp = self.session_path()
+        if not sp:
+            messagebox.showinfo("Save a copy", "Open a recording first.",
+                                parent=self.root)
+            return
+        if not os.path.isfile(sp):
+            self.save_session()
+        if not os.path.isfile(sp):
+            return
+        dest = filedialog.asksaveasfilename(
+            title="Save a copy of the session",
+            initialdir=os.path.dirname(sp),
+            initialfile=os.path.basename(sp),
+            defaultextension=".json",
+            filetypes=[("MEP-CMAP session", "*.json"), ("All files", "*.*")],
+            parent=self.root)
+        if not dest:
+            return
+        try:
+            import shutil
+            shutil.copyfile(sp, dest)
+            self.log(f"\U0001F4BE Copy saved: {os.path.basename(dest)}")
+        except Exception as exc:
+            messagebox.showerror("Save a copy", str(exc), parent=self.root)
 
     def load_session(self):
         """Restore a previously saved JSON session."""
@@ -3547,16 +3671,21 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             from .assets import tmsmultilab_logo
             _l = tmsmultilab_logo(64)
             if _l is not None:
-                _w = tk.Label(win, image=_l, bd=0)
-                _w.image = _l
-                _w.pack(pady=(8, 2))
+                _w = tk.Label(win, image=_l, bd=0, cursor="hand2")
+                _w.image = _l          # Tk keeps only a weak reference
+                _w.pack(pady=(8, 0))
+                _w.bind("<Button-1>", lambda _e: _open_url(_TMSML_URL))
+                _t = tk.Label(win, text="TMSMultiLab", fg="#1F3864",
+                              cursor="hand2", font=("TkDefaultFont", 9))
+                _t.pack(pady=(0, 2))
+                _t.bind("<Button-1>", lambda _e: _open_url(_TMSML_URL))
         except Exception:
             pass
         tk.Label(win, text=AUTHORS_LINE,
                  justify="center", fg="grey").pack(pady=(6,4))
         tk.Label(win,
-            text="BIDS-compliant TMS/EMG neurophysiology\n"
-                 "analysis tool for MEP and cSP quantification.",
+            text="BIDS-compliant EMG neurophysiology analysis tool\n"
+                 "for evoked CMAP/TMS and cSP quantification.",
             justify="center").pack(padx=20, pady=(0,8))
         tk.Button(win, text="Close", width=10, command=win.destroy).pack(pady=(0,14))
         win.update_idletasks()
@@ -4907,6 +5036,27 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         if not confirmed:
             return
 
+        # Asked separately, because it is the one thing here that is the
+        # analyst's own work rather than something the tool produced and can
+        # produce again.
+        _also_events = False
+        try:
+            from .conditions_tab import events_tsv_path
+            _has_ev = [f for _f, fe in fids_to_reset
+                       if os.path.isfile(events_tsv_path(fe.path))
+                       for f in [fe]]
+        except Exception:
+            _has_ev = []
+        if _has_ev:
+            _also_events = messagebox.askyesno(
+                "Conditions",
+                f"{len(_has_ev)} of these also have an events file holding the "
+                f"conditions you assigned.\n\n"
+                f"Delete those too?\n\n"
+                f"Kept, they will govern the next run: the reader prefers an "
+                f"events file to the recording's own markers.",
+                parent=self.root)
+
         deleted, skipped = [], []
         for fid, fe in fids_to_reset:
             p = pathlib.Path(fe.path)
@@ -4949,6 +5099,40 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
                     deleted.append(tsv_cfg.name)
                 except Exception as exc:
                     skipped.append(f"{tsv_cfg.name}: {exc}")
+
+            # 4b. Pre-epoched MATLAB sidecar, and the saved session for this
+            # file. Both were left behind, so "from scratch" reused the epoch
+            # bounds and the settings from the run being discarded.
+            for _extra in (p.with_suffix(".epoched_config.json"),
+                           p.with_suffix("").parent /
+                           (p.stem + "_session.json")):
+                if _extra.exists():
+                    try:
+                        _extra.unlink()
+                        deleted.append(_extra.name)
+                    except Exception as exc:
+                        skipped.append(f"{_extra.name}: {exc}")
+
+            # 4c. The conditions assigned to this recording.
+            #
+            # Separately, and only when the analyst has said so: an events file
+            # is work rather than cached output, and the reader PREFERS it to
+            # the recording's own markers. Left behind it silently governs the
+            # next run; deleted without asking it takes an afternoon of
+            # condition assignment with it.
+            if _also_events:
+                try:
+                    from .conditions_tab import events_tsv_path
+                    _ev = pathlib.Path(events_tsv_path(str(p)))
+                except Exception:
+                    _ev = None
+                for _e in ([_ev, _ev.with_suffix(".json")] if _ev else []):
+                    if _e.exists():
+                        try:
+                            _e.unlink()
+                            deleted.append(_e.name)
+                        except Exception as exc:
+                            skipped.append(f"{_e.name}: {exc}")
 
             # 5. Reset FileEntry state completely
             fe.derivatives_json = ""
@@ -5620,6 +5804,17 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         # is far more use than the parse error from whichever reader was tried
         # last: until now an unsupported file was assumed to be a Spike2 text
         # export and failed with a message about Spike2.
+        if _fmt == "unsupported_text":
+            # A README or a settings file dropped in by mistake. It used to
+            # be claimed as a Spike2 export -- the unconditional fallback
+            # for anything textual -- and failed several steps later with a
+            # bare ValueError from inside a parser.
+            from .io import _unreadable_reason as _why_for
+            _why = _why_for(fpath)
+            self.log(f"\u274c Cannot read {os.path.basename(fpath)} \u2014 {_why}")
+            messagebox.showerror("Not a recording", _why, parent=self.root)
+            return
+
         if _fmt == "unsupported_binary":
             _ext = os.path.splitext(fpath)[1].lower()
             _why = UNREADABLE_FORMATS.get(
@@ -6201,6 +6396,21 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
                 f"https://github.com/jandrushko/mep-cmap-analyser/issues",
                 parent=self.root)
         
+        # Dropped here rather than left from the previous file: reopening the
+        # assignment for a recording that is no longer loaded would set the
+        # channel from one file's names against another's data.
+        self._reopen_assignment = None
+
+        # Each recording earns Run for itself. Left set from the previous file,
+        # the gate would apply to the first recording of a session and to no
+        # other -- which is worse than not having it, because it would look
+        # like it was working.
+        self._seen_detection_tab = False
+        try:
+            self._refresh_run_button()
+        except Exception:
+            pass
+
         # ── populate inline channel dropdown
         chan_list = list_waveform_channels(fpath)
         self._populate_channel_dropdown(chan_list)
@@ -6245,14 +6455,24 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             except Exception as _e:
                 self.log(f"   ⚠️  Event sources could not be opened: {_e}")
 
-        # ── Unified channel + event marker assignment dialog (Spike2 text exports only)
-        # SMR files have their own dialog. Generic TSV/LabChart/CFWB use the
-        # Format Wizard or have no event marker concept — exclude them here.
+        # ── Unified channel + event marker assignment ────────────────────────
+        # Every format reaches this. It used to be Spike2 text exports only,
+        # on the reasoning that other formats "use the Format Wizard or have no
+        # event marker concept" -- which left a LabChart export of six named
+        # channels silently analysing the first of them, and left no route to
+        # Event sources at all.
+        #
+        # Nor is it skipped when the file appears to offer no choice. A
+        # recording whose embedded markers are wrong needs a threshold source
+        # configured against a trigger channel, and that decision is only
+        # reachable through this dialogue: "there is nothing to choose" is a
+        # statement about the file, not about what the analyst may need to do
+        # with it.
+        #
+        # SMR keeps its own dialogue, which does the same job with the extra
+        # marker-channel step that format requires.
         markers = self.available_markers or []
-        _needs_assign_dlg = (
-            _fmt not in ('spike2_smr', 'generic_tsv', 'labchart', 'cfwb')
-            and (len(chan_list) > 1 or len(markers) > 1)
-        )
+        _needs_assign_dlg = (_fmt != 'spike2_smr')
         if _needs_assign_dlg:
             _chosen = {}
 
@@ -6428,6 +6648,12 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
                 if _chosen.get("stim"):
                     self.marker_choice.set(_chosen["stim"])
                     self.available_markers = markers
+
+            # Kept so the choice can be corrected without reloading the file.
+            # A remembered answer that can only be changed by opening the file
+            # again is a remembered answer the analyst has to work around.
+            self._reopen_assignment = lambda: (_show_assign_dlg(),
+                                               _apply_choice())
 
             _show_assign_dlg()
 
@@ -7058,6 +7284,23 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             return sorted(self.analyse_channels)
         return [self.channel_idx]
 
+    def _refresh_run_button(self):
+        """Enable Run once the detection tab has been seen for this recording.
+
+        Once seen it stays enabled: re-disabling on a trip back to the filter
+        tab would be pedantry rather than protection, since the settings have
+        been looked at.
+        """
+        btn = getattr(self, "_run_btn", None)
+        if btn is None:
+            return
+        try:
+            btn.config(state=("normal"
+                              if getattr(self, "_seen_detection_tab", False)
+                              else "disabled"))
+        except Exception:
+            pass
+
     def _refresh_analyse_button(self):
         names = list(self.channel_dd["values"]) if hasattr(self, "channel_dd") else []
         n = len(self._analysis_channel_indices())
@@ -7603,6 +7846,9 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         tk.Button(footer, text="Copy this setup to all channels",
                   command=self._copy_setup_to_all_channels)\
             .pack(side="left", padx=(12, 4), pady=6)
+        tk.Button(footer, text="🎛 Channel assignment…",
+                  command=self.reopen_channel_assignment).pack(side="left",
+                                                               padx=(0, 6))
         tk.Button(footer, text="🔗 Event sources…",
                   command=self._open_event_sources)\
             .pack(side="left", padx=(4, 4), pady=6)

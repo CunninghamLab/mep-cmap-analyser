@@ -51,6 +51,46 @@ except ImportError:
     _RUST_AVAILABLE = False
 
 
+def get_epoch_bounds(file_path: str):
+    """(pre_ms, post_ms) for a block export, or None for a continuous one.
+
+    A LabChart block export is a pre-epoched recording that does not announce
+    itself as one: each block is a trial already cut about the stimulus, its
+    time column running from a negative value to a positive one and restarting
+    for the next. ``TimeFormat=StartOfBlock`` names that convention.
+
+    Reporting the bounds is what lets the ordinary clamp apply. Without them a
+    window longer than a block runs off the end of the trial into the zero-fill
+    this reader inserts between blocks, and then into the following trial --
+    measured as though it were a continuation of the response rather than the
+    next stimulus.
+
+    None when there is one block, which is an ordinary continuous recording
+    and has no bounds to clamp to.
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+            lines = f.readlines()
+        blocks = _parse_blocks(lines)
+    except Exception:
+        return None
+    if len(blocks) < 2:
+        return None
+
+    b = blocks[0]
+    try:
+        first = float(lines[b["data_start"]].split("\t")[0])
+        last = float(lines[b["data_end"] - 1].split("\t")[0])
+    except Exception:
+        return None
+    # Block-relative time runs from negative to positive about the stimulus.
+    # A block whose time column does not start before zero is not centred on
+    # anything, so there is no pre-stimulus extent to report.
+    if first >= 0:
+        return None
+    return (abs(first) * 1000.0, abs(last) * 1000.0)
+
+
 def list_waveform_channels(file_path: str) -> list:
     """Return channel names from the first block header."""
     if _RUST_AVAILABLE:

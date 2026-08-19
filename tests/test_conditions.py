@@ -530,3 +530,30 @@ def test_one_side_only_is_carried_through():
     rows = [C.ConditionRow("A", "x", (0,), post_ms=500.0)]
     assert C.window_map_from_rows(rows) == {"A" + C.SEPARATOR + "x":
                                             (None, 500.0)}
+
+
+def test_a_stimulus_type_with_no_row_is_named_first():
+    """A recording carrying Trigger and Start Task, every Trigger assigned and
+    Start Task never mentioned: "these trials are in no condition" sends the
+    analyst looking at the rows that are there rather than the one missing.
+    """
+    stim = {"Trigger": [float(i) for i in range(20)],
+            "Start Task": [float(i) for i in range(6)]}
+    rows = [C.ConditionRow("Trigger", "all", tuple(range(20)))]
+    with pytest.raises(C.ConditionError, match="Start Task has no condition"):
+        C.validate(rows, stim)
+
+
+def test_a_partly_assigned_type_reads_differently():
+    """It is a different mistake and should not claim the type is missing."""
+    stim = {"A": [float(i) for i in range(10)]}
+    rows = [C.ConditionRow("A", "x", tuple(range(5)))]
+    with pytest.raises(C.ConditionError, match="some trials are in no condition"):
+        C.validate(rows, stim)
+
+
+def test_the_message_still_lists_the_trials():
+    stim = {"A": [float(i) for i in range(10)]}
+    rows = [C.ConditionRow("A", "x", tuple(range(5)))]
+    with pytest.raises(C.ConditionError, match="6-10"):
+        C.validate(rows, stim)

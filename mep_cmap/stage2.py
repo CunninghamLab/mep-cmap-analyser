@@ -202,6 +202,29 @@ class Stage2Mixin:
             except Exception:
                 pass
 
+        # Run Analysis becomes available once the detection settings have been
+        # seen for this recording. The footer is visible from every First Level
+        # tab, so without this a run could be started from the labels tab on
+        # whatever those settings were left at.
+        try:
+            _dt = getattr(self, "tab_detect", None)
+            if _dt is not None and _dt.winfo_ismapped():
+                self._seen_detection_tab = True
+                self._refresh_run_button()
+        except Exception:
+            pass
+
+        # Save on the way out of a tab, so preparation is never held only in
+        # memory. A recording set up and then left for the next file used to
+        # keep its labels, conditions and windows nowhere but the session that
+        # had not been written yet.
+        try:
+            if self.file_path.get() and getattr(self, "_session_dirty", True):
+                self._autosave_session()
+                self._session_dirty = False
+        except Exception:
+            pass
+
         # Conditions — populate from the loaded recording when shown. The
         # table is built from the file's events, which do not exist until a
         # file has been opened, so it cannot be filled when the tab is created.

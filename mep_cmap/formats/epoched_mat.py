@@ -117,8 +117,21 @@ def is_epoched_mat(file_path: str) -> bool:
 
 # ── Sidecar config helpers (pattern mirrors spike2_smr.py) ────────────────────
 
+#: This reader's sidecar suffix. Held here so the shared locator
+#: and the reset path name the same file.
+SIDECAR_SUFFIX = ".epoched_config.json"
+
 def _sidecar_path(file_path: str) -> Path:
-    return Path(file_path).with_suffix('.epoched_config.json')
+    """Where this recording's configuration lives.
+
+    Under derivatives, not beside the recording: rawdata is what the
+    acquisition system wrote, and one program's settings do not belong
+    in it. A sidecar still sitting in the old place is moved the first
+    time it is looked for, so a study configured before this change is
+    not asked to configure itself again.
+    """
+    from ..sidecars import resolve
+    return resolve(file_path, SIDECAR_SUFFIX)
 
 
 def has_config(file_path: str) -> bool:
@@ -145,8 +158,9 @@ def save_config(file_path: str, unit: str) -> None:
     if unit not in _UNIT_CHOICES:
         raise ValueError(
             f"unit must be one of {_UNIT_CHOICES}, got {unit!r}")
-    _sidecar_path(file_path).write_text(
-        json.dumps({'unit': unit}, indent=2), encoding='utf-8')
+    _p = _sidecar_path(file_path)
+    _p.parent.mkdir(parents=True, exist_ok=True)
+    _p.write_text(json.dumps({'unit': unit}, indent=2), encoding='utf-8')
 
 
 # ── Load + cache (LRU-1, mirrors spike2_smr.py) ───────────────────────────────

@@ -51,8 +51,21 @@ def _require_neo():
 # Sidecar config helpers
 # ---------------------------------------------------------------------------
 
+#: This reader's sidecar suffix. Held here so the shared locator
+#: and the reset path name the same file.
+SIDECAR_SUFFIX = ".smr_config.json"
+
 def _sidecar_path(file_path: str) -> Path:
-    return Path(file_path).with_suffix(".smr_config.json")
+    """Where this recording's configuration lives.
+
+    Under derivatives, not beside the recording: rawdata is what the
+    acquisition system wrote, and one program's settings do not belong
+    in it. A sidecar still sitting in the old place is moved the first
+    time it is looked for, so a study configured before this change is
+    not asked to configure itself again.
+    """
+    from ..sidecars import resolve
+    return resolve(file_path, SIDECAR_SUFFIX)
 
 
 def has_config(file_path: str) -> bool:
@@ -90,6 +103,7 @@ def save_config(file_path: str, emg_channel: str, stim_channel: str,
     names = [str(c) for c in (analysis_channels or []) if str(c).strip()]
     if names:
         cfg["analysis_channels"] = names
+    p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 
 

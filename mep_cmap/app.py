@@ -474,6 +474,11 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         # because _build_session_tab references them directly
         self.file_path          = tk.StringVar()
         self.derivatives_path   = tk.StringVar()
+        # Every setter syncs, rather than four call sites having to
+        # remember: the sidecar layer needs to know where derivatives are
+        # before any reader asks it for a configuration.
+        self.derivatives_path.trace_add(
+            "write", lambda *_a: self._sync_sidecar_root())
         self._rawdata_path      = tk.StringVar()
         self._dataset           = None
         self._bidsify_state      = None
@@ -5091,36 +5096,26 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
                         except Exception:
                             pass
 
-            # 3. Delete SMR channel assignment sidecar
-            smr_cfg = p.with_suffix(".smr_config.json")
-            if smr_cfg.exists():
-                try:
-                    smr_cfg.unlink()
-                    deleted.append(smr_cfg.name)
-                except Exception as exc:
-                    skipped.append(f"{smr_cfg.name}: {exc}")
+            # 3. Format sidecars, from BOTH locations.
+            #
+            # They live under derivatives now, but a study configured before
+            # that change still has them beside the recording until each is
+            # migrated. Clearing only the new place would leave the old one to
+            # be found and migrated straight back on the next open, so "from
+            # scratch" would restore the configuration it had just discarded.
+            from .sidecars import remove as _rm_sidecar
+            for _suffix in (".smr_config.json", ".tsv_config.json",
+                            ".epoched_config.json"):
+                deleted.extend(_rm_sidecar(str(p), _suffix))
 
-            # 4. Delete generic TSV / LabChart TXT wizard sidecar
-            tsv_cfg = p.with_suffix(".tsv_config.json")
-            if tsv_cfg.exists():
+            # 4. The saved session for this file.
+            _sess = p.with_suffix("").parent / (p.stem + "_session.json")
+            if _sess.exists():
                 try:
-                    tsv_cfg.unlink()
-                    deleted.append(tsv_cfg.name)
+                    _sess.unlink()
+                    deleted.append(_sess.name)
                 except Exception as exc:
-                    skipped.append(f"{tsv_cfg.name}: {exc}")
-
-            # 4b. Pre-epoched MATLAB sidecar, and the saved session for this
-            # file. Both were left behind, so "from scratch" reused the epoch
-            # bounds and the settings from the run being discarded.
-            for _extra in (p.with_suffix(".epoched_config.json"),
-                           p.with_suffix("").parent /
-                           (p.stem + "_session.json")):
-                if _extra.exists():
-                    try:
-                        _extra.unlink()
-                        deleted.append(_extra.name)
-                    except Exception as exc:
-                        skipped.append(f"{_extra.name}: {exc}")
+                    skipped.append(f"{_sess.name}: {exc}")
 
             # 4c. The conditions assigned to this recording.
             #
@@ -7494,6 +7489,22 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
                     "setup to all channels' if they should share one."))
 
     # ──────────────────────────────────────────────────────────────────────
+
+    def _sync_sidecar_root(self):
+        """Point the sidecar layer at the derivatives folder.
+
+        Called wherever that folder is set or restored. With none set the
+        readers fall back to writing beside the recording, which is what every
+        earlier version did -- so a study that has not chosen a derivatives
+        folder is not silently deprived of its configuration.
+        """
+        try:
+            from .sidecars import set_derivatives_root
+            set_derivatives_root(self.derivatives_path.get()
+                                 if hasattr(self, "derivatives_path") else None)
+        except Exception:
+            pass
+
     def _apply_epoch_limit_to_prestim(self, fpath):
         """Cap the baseline at what the recording holds, and say so.
 

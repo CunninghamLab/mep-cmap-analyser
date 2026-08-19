@@ -76,8 +76,21 @@ except ImportError:
 # Sidecar helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+#: This reader's sidecar suffix. Held here so the shared locator
+#: and the reset path name the same file.
+SIDECAR_SUFFIX = ".tsv_config.json"
+
 def _sidecar_path(file_path: str) -> Path:
-    return Path(file_path).with_suffix('.tsv_config.json')
+    """Where this recording's configuration lives.
+
+    Under derivatives, not beside the recording: rawdata is what the
+    acquisition system wrote, and one program's settings do not belong
+    in it. A sidecar still sitting in the old place is moved the first
+    time it is looked for, so a study configured before this change is
+    not asked to configure itself again.
+    """
+    from ..sidecars import resolve
+    return resolve(file_path, SIDECAR_SUFFIX)
 
 
 def has_config(file_path: str) -> bool:
@@ -106,6 +119,7 @@ def load_config(file_path: str) -> dict:
 def save_config(file_path: str, cfg: dict) -> None:
     """Write the sidecar config dict next to the data file."""
     p = _sidecar_path(file_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(cfg, indent=2), encoding='utf-8')
 
 

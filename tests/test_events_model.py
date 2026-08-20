@@ -139,7 +139,7 @@ def test_an_excluded_trial_is_still_accounted_for():
 
 def _write_session(tmp_path, rows, stem="rec"):
     """A session JSON exactly where session_path_for says it goes."""
-    from mep_cmap.app import session_path_for
+    from mep_cmap.bids import session_path_for
     src = os.path.join(str(tmp_path), "raw", f"{stem}.smr")
     os.makedirs(os.path.dirname(src), exist_ok=True)
     path = session_path_for(src, None, os.path.join(str(tmp_path), "deriv"))
@@ -186,7 +186,7 @@ def test_a_recording_with_no_session_has_no_conditions(tmp_path):
 
 
 def test_an_unreadable_session_does_not_stop_a_conversion(tmp_path):
-    from mep_cmap.app import session_path_for
+    from mep_cmap.bids import session_path_for
     src = os.path.join(str(tmp_path), "raw", "broken.smr")
     os.makedirs(os.path.dirname(src), exist_ok=True)
     path = session_path_for(src, None, os.path.join(str(tmp_path), "deriv"))

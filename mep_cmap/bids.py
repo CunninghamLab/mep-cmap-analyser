@@ -12,7 +12,7 @@ import re
 import datetime
 from dataclasses import dataclass, field, asdict
 
-TOOL_VERSION = "1.4.0"
+TOOL_VERSION = "1.4.1"
 
 
 @dataclass
@@ -109,3 +109,92 @@ def _sanitise_bids_label(text: str) -> str:
     text = text.strip()
     text = re.sub(r"[^\w\-]", "", text)
     return text or "unknown"
+
+
+# ── Where a recording's derivatives live ─────────────────────────────────────
+#
+# These live here rather than in app.py because things that are NOT the GUI
+# need them: the converter has to find a recording's session, and so do the
+# tests. app.py imports pywt, matplotlib and Tk, so importing it to compute a
+# filename drags the whole application in -- which is exactly what broke CI,
+# where the optional analysis dependencies are not installed. A path rule
+# should not require a working display.
+
+def make_bids_prefix(meta_prefix: str, file_stem: str) -> str:
+    """Build a unique, clean BIDS prefix from metadata and source file stem.
+
+    Strategy
+    --------
+    1. No metadata → use file stem as-is.
+    2. File stem is a substring of the metadata prefix → use prefix as-is.
+    3. Strip universally redundant tokens from the stem:
+         - sub-XX / ses-XX  (always encoded in the directory path)
+         - bare noise words: "session", "data", "raw"
+         - "emg" when the stem is BIDS-originated (starts with "sub-")
+    4. Keep only tokens not already present in the metadata prefix
+       (token-level exact match — avoids false positives like "01" matching
+       inside "ses-01").
+    5. No novel tokens → return prefix as-is.
+       Novel tokens exist → append them.
+    """
+    if not meta_prefix:
+        return file_stem
+    if file_stem in meta_prefix:
+        return meta_prefix
+
+    _is_bids_stem = bool(re.match(r"^sub-", file_stem, re.I))
+    _NOISE = {"session", "data", "raw"}
+    if _is_bids_stem:
+        _NOISE.add("emg")
+
+    meta_tokens = set(meta_prefix.split("_"))
+    stem_tokens = [t for t in file_stem.split("_")
+                   if not re.match(r"^(sub|ses)-", t, re.I)
+                   and t.lower() not in _NOISE]
+
+    novel = [t for t in stem_tokens if t not in meta_tokens]
+
+    if not novel:
+        return meta_prefix
+    return f"{meta_prefix}_{'_'.join(novel)}"
+
+
+def session_path_for(source_path: str, metadata=None,
+                     derivatives_root: str = "") -> str:
+    """Where a recording's session JSON lives.
+
+        <derivatives_root>/derivatives/<sub>/<ses>/<bids_prefix>_session.json
+
+    falling back to the source file's own folder when no derivatives root is
+    configured.
+
+    Derivatives rather than beside the recording, because a session is
+    something the tool produced; raw data is what the amplifier and the
+    stimulator wrote and is better left as they wrote it. The autosave and Save
+    Session used to disagree about this -- one wrote a BIDS-named file under
+    derivatives, the other opened a dialogue beside the raw data -- so a
+    recording could carry two sessions that knew nothing of each other, and
+    whichever the analyst happened to pick on the way back in was the one that
+    won.
+
+    A FUNCTION OF ITS ARGUMENTS, not of the app. The app method reads the open
+    file's metadata off self, which answers only for the file currently loaded;
+    anything working over a list of recordings has none of them loaded. Two
+    builders would drift, and the one that drifted would delete or fail to find
+    files silently.
+    """
+    if not source_path:
+        return ""
+    bids_prefix = make_bids_prefix(
+        metadata.bids_prefix() if metadata else "",
+        os.path.splitext(os.path.basename(source_path))[0])
+    source_dir = os.path.dirname(source_path)
+    deriv_root = derivatives_root or source_dir
+    sub_ses = (metadata.sub_ses_path() if metadata
+               else os.path.join("sub-unknown", "ses-01"))
+    # Avoid derivatives/derivatives/ — same fix as in pipeline.py
+    if os.path.basename(os.path.normpath(deriv_root)).lower() == "derivatives":
+        save_dir = os.path.join(deriv_root, sub_ses)
+    else:
+        save_dir = os.path.join(deriv_root, "derivatives", sub_ses)
+    return os.path.join(save_dir, f"{bids_prefix}_session.json")

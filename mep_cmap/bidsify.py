@@ -554,7 +554,7 @@ def find_session_for(source_path: str, metadata=None,
     participant id was corrected, leaving the old one orphaned -- the most
     recently written wins, since that is the one the analyst last worked in.
     """
-    from .app import session_path_for
+    from .bids import session_path_for
 
     direct = session_path_for(source_path, metadata, derivatives_root)
     if direct and os.path.isfile(direct):

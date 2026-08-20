@@ -1,6 +1,6 @@
 # MEP-CMAP Analyser
 
-**Version 1.4.0 | August 2026**  
+**Version 1.4.1 | August 2026**  
 *Authors:* [*Justin W. Andrushko PhD*](https://orcid.org/0000-0003-2258-1689) · [*David A. Cunningham PhD*](https://orcid.org/0000-0003-2246-1548) *(*[*TMS Analysis ToolBox*](https://github.com/CunninghamLab/TMSAnalysisToolBox)*)*  —  *TMSMultiLab*
 
 *Collaborators:* [*Nicholas Holmes PhD*](https://www.birmingham.ac.uk/staff/profiles/sportex/holmes-nick) *·* [*TMSMultiLab*](https://github.com/TMSMultiLab/TMSMultiLab/wiki)
@@ -110,6 +110,8 @@ overwritten in place rather than deleted first.
 
 Studies that do not use parameter sets still convert exactly as before, writing
 the flat sidecar rather than an empty table.
+
+**Point releases in the 1.4 series:** 1.4.1 keeps the continuous integration suite in step with the project’s declared dependencies, and moves the derivatives path rules out of the application module so that converting a file no longer imports the graphical interface. No change an analyst will see.
 
 ### Channel assignment for every format
 
@@ -1476,7 +1478,7 @@ The optional Rust extension `mep_cmap_io` provides accelerated I/O for the Spike
 
 If you use MEP-CMAP Analyser in published research, please cite:
 
-> Justin W. Andrushko. (2026). jandrushko/mep-cmap-analyser: MEP-CMAP Analyser (Version v1.4.0) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.21810844
+> Justin W. Andrushko. (2026). jandrushko/mep-cmap-analyser: MEP-CMAP Analyser (Version v1.4.1) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.21810844
 > https://github.com/jandrushko/mep-cmap-analyser
 
 ---

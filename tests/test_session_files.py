@@ -32,7 +32,7 @@ def test_there_is_one_rule_for_where_a_session_lives():
     method broke on that move while the behaviour was unchanged, which is a
     test reporting on where code sits rather than what it does.
     """
-    from mep_cmap.app import session_path_for
+    from mep_cmap.bids import session_path_for
     p = session_path_for(os.path.join("study", "raw", "rec.smr"),
                          None, os.path.join("study", "deriv"))
     assert p.endswith("_session.json")
@@ -42,7 +42,7 @@ def test_there_is_one_rule_for_where_a_session_lives():
 def test_the_session_goes_to_derivatives_not_beside_the_raw_data():
     """Raw data is what the amplifier and the stimulator wrote; a session is
     something this tool produced."""
-    from mep_cmap.app import session_path_for
+    from mep_cmap.bids import session_path_for
     raw = os.path.join("study", "raw")
     p = session_path_for(os.path.join(raw, "rec.smr"), None,
                          os.path.join("study", "deriv"))
@@ -53,7 +53,7 @@ def test_the_session_goes_to_derivatives_not_beside_the_raw_data():
 
 
 def test_derivatives_is_not_nested_twice():
-    from mep_cmap.app import session_path_for
+    from mep_cmap.bids import session_path_for
     p = session_path_for(os.path.join("study", "rec.smr"), None,
                          os.path.join("study", "derivatives"))
     assert "derivatives" + os.sep + "derivatives" not in p
@@ -62,7 +62,7 @@ def test_derivatives_is_not_nested_twice():
 def test_every_recording_gets_its_own_session():
     """Two recordings in one session folder must not share a file, or the
     second silently overwrites the first."""
-    from mep_cmap.app import session_path_for
+    from mep_cmap.bids import session_path_for
     a = session_path_for(os.path.join("s", "sub-004_run-1.smr"), None, "d")
     b = session_path_for(os.path.join("s", "sub-004_run-2.smr"), None, "d")
     assert a != b
@@ -110,7 +110,7 @@ def test_the_session_goes_to_derivatives_not_beside_the_raw_data_source():
 
 
 def test_derivatives_is_not_nested_twice_in_the_rule():
-    from mep_cmap.app import session_path_for
+    from mep_cmap.bids import session_path_for
     p = session_path_for("rec.smr", None, os.path.join("a", "DERIVATIVES"))
     assert p.lower().count("derivatives") == 1
 

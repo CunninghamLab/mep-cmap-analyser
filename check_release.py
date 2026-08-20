@@ -53,8 +53,16 @@ STRIP_NOISE = re.compile(
     # about the past, not a version string that needs bumping -- and rewriting
     # it to say 1.4.0 would make it false. Narrow on purpose: it matches the
     # phrasing, not any mention of a number near the word licence.
+    #
+    # Both spellings, and both cases. The abbreviated form ("from v1.4.0",
+    # "v1.3.3 and earlier") and a sentence-initial "From version" were missed,
+    # so 1.4.0 -> 1.4.1 reported the licence history in pyproject.toml and the
+    # README as out of sync and failed the release gate on facts that were
+    # correct.
     r"|[Vv]ersions? \d[\d.]* and earlier"
-    r"|from [Vv]ersion \d[\d.]*"
+    r"|v\d[\d.]* and earlier"
+    r"|[Ff]rom [Vv]ersions? \d[\d.]*"
+    r"|[Ff]rom v\d[\d.]*"
 )
 
 # Matches 1.2.7 and v1.2.7 alike — \b fails after 'v', since both are word

@@ -919,7 +919,7 @@ class BidsifyTabMixin:
             state.rawdata_root = rawroot
             state.save()
 
-        from .app import _make_bids_prefix
+        from .bids import make_bids_prefix as _make_bids_prefix
         from pathlib import Path
         items = []
         for p in ready:

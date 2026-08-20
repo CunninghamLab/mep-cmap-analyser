@@ -92,10 +92,23 @@ def test_offset_marker_is_included_in_the_stale_index_cleanup():
     longer would be reused against a shorter segment, and scatter() raises
     mid-draw so the Inspector never opens at all. The existing markers are
     already screened; a new one has to be screened too.
+
+    The list moved into a _LANDMARKS constant when a second screen was added
+    (for landmarks the geometry has moved under), so both screens work from one
+    list rather than two that can disagree about which markers exist.
     """
-    a = SRC.index("_stale = [f for f in (")
-    b = SRC.index("]", a)
-    assert "mep_offset_idx" in SRC[a:b]
+    a = SRC.index("_LANDMARKS = (")
+    b = SRC.index(")", a)
+    names = SRC[a:b]
+    for marker in ("mep_offset_idx", "ptp_min_idx", "ptp_max_idx",
+                   "onset_idx", "silent_start_idx", "silent_end_idx"):
+        assert marker in names, f"{marker} is not screened"
+
+
+def test_both_screens_use_the_one_list():
+    """Two lists of the same markers is how one of them ends up short."""
+    assert SRC.count("_LANDMARKS = (") == 1
+    assert SRC.count("for f in _LANDMARKS") >= 2
 
 
 def test_toggling_csp_clears_a_stale_offset_marker():

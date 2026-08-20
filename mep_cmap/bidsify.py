@@ -177,7 +177,23 @@ class FileResult:
 
 # ── Planning (pure; cheap) ────────────────────────────────────────────────────
 def _suffix_for_modality(modality: str) -> str:
-    return {"TMS": "tms", "tES": "tes", "TUS": "tus"}.get(modality, "nibs")
+    """Always ``nibs``. The modality is a COLUMN, not a filename.
+
+    This returned tms/tes/tus, so a TMS study produced *_tms.tsv and *_tms.json.
+    The spec uses *_nibs.tsv throughout -- every worked example, including the
+    TMS ones -- and carries the modality in the `nibs_type` column of that file.
+    A per-modality suffix is not an alternative spelling of that: a validator, or
+    anyone else's script, looks for *_nibs.tsv and simply does not find the
+    stimulation description, which defeats most of the point of writing it.
+
+    (v6.2 did distinguish the system in the filename, through a `stimsys-<label>`
+    entity and a `StimulationSystem` field. v6.3 removed both in favour of the
+    column, so the per-modality suffix is not that either.)
+
+    Kept as a function rather than inlined so the one place this is decided
+    stays findable, and so the reasoning above travels with it.
+    """
+    return "nibs"
 
 
 def plan_bidsify(items: list,
@@ -714,7 +730,7 @@ def write_events_tsv(pf: PlannedFile, rec: Recording) -> None:
     })
 
 
-def write_nibs_sidecar(pf: PlannedFile, schema) -> None:
+def write_nibs_sidecar(pf: PlannedFile, schema, log_callback=None) -> None:
     """Write the NIBS-BIDS v6.3 stimulation description.
 
     Four files, not one. The old single flat *_nibs.json could hold exactly one
@@ -749,6 +765,56 @@ def write_nibs_sidecar(pf: PlannedFile, schema) -> None:
     _write_nibs_tsv(pf, schema, sets)
     _write_markers(pf, schema, sets)
     _write_nibs_json(pf, schema, sets)
+
+    # Two spellings of one device is a typo, not a second stimulator, and it
+    # splits the rows between two entries describing the same box. Said here
+    # because it is only visible once every parameter set has been resolved.
+    if log_callback:
+        for _msg in _vocabulary_problems(sets, schema):
+            log_callback(_msg)
+        _p, _stims, _elems = _device_ids(pf, schema, sets)
+        for _label, _entries, _key in (("stimulator", _stims, "StimulatorID"),
+                                       ("element", _elems, "ElementID")):
+            for _lower, _spellings in _near_duplicate_devices(_entries, _key).items():
+                log_callback(
+                    f"   \u26a0\ufe0f  Two {_label} entries differ only by case "
+                    f"or spacing: {', '.join(repr(s) for s in sorted(set(_spellings)))}. "
+                    f"They are written as separate devices. If they are the "
+                    f"same one, make the spelling match in the parameter sets.")
+
+
+def _vocabulary_problems(sets, schema):
+    """Values outside a field's closed vocabulary, as messages.
+
+    coerce_value checks TYPES, not vocabularies, so a value stored before a
+    vocabulary changed is written verbatim. The spec's closed sets are the
+    whole point of a closed set: `current_direction` took PA/AP/LM/ML while
+    the tool offered them, and after the field was corrected to the v6.3
+    winding vocabulary the old values stayed in the saved parameter sets and
+    went into *_nibs.tsv unremarked, where a reader following the spec would
+    misread them.
+
+    Reported, not corrected. PA cannot be translated into a winding direction
+    -- they describe different things -- so the tool cannot fix this without
+    inventing a measurement. Naming the field, the value and what is allowed is
+    everything the analyst needs to fix it themselves.
+    """
+    out = []
+    for s in sets:
+        for key, raw in (s.values or {}).items():
+            if raw in (None, "") or str(raw).strip() == "":
+                continue
+            fld = schema.field(key)
+            if not fld or not fld.enum:
+                continue
+            if str(raw) in [str(v) for v in fld.enum]:
+                continue
+            out.append(
+                f"   \u26a0\ufe0f  '{s.name}': {key} is {raw!r}, which is not "
+                f"one of {', '.join(repr(str(v)) for v in fld.enum)}. It is "
+                f"written as entered; re-pick it in the parameter set to make "
+                f"the file valid.")
+    return out
 
 
 def _resolved(pf, schema, block, s, modality=None):
@@ -838,6 +904,25 @@ def _device_ids(pf, schema, sets):
     return per_set, stimulators, elements
 
 
+def _near_duplicate_devices(entries, id_key):
+    """Ids that differ only by case or surrounding space.
+
+    'Magstim' and 'magstim' are two devices to a dictionary and one device to
+    everyone else, so a typo in one parameter set silently doubles the
+    StimulatorSet and splits the rows between two entries describing the same
+    box. Reported rather than merged: the tool cannot know which spelling was
+    meant, and quietly picking one would rewrite what the analyst entered.
+    """
+    seen = {}
+    for e in entries:
+        raw = str(e.get(id_key, ""))
+        key = raw.strip().lower()
+        if not key:
+            continue
+        seen.setdefault(key, []).append(raw)
+    return {k: v for k, v in seen.items() if len(set(v)) > 1}
+
+
 def _write_nibs_tsv(pf: PlannedFile, schema, sets) -> None:
     from . import stim_params as _sp
     columns, rows = _sp.nibs_rows(sets, schema)
@@ -861,6 +946,39 @@ def _write_nibs_tsv(pf: PlannedFile, schema, sets) -> None:
     _write_tsv(pf.nibs_tsv_path, columns, rows)
 
 
+def _placement_values(pf, schema, s):
+    """One placement's markers.tsv columns, per set with session fallback.
+
+    `position_description` is free text and THREE fields emit into it: the
+    target region, the montage description, and the induced current direction.
+    Keyed by `emits` alone they overwrite each other and whichever the schema
+    happens to list last silently wins. Free text is the one case where more
+    than one contributor is not a conflict, so they are joined instead --
+    "M1 hand hotspot; PA-induced current" says both things, which is what the
+    analyst entered.
+
+    Joined in schema order so the wording is stable between runs rather than
+    depending on dict iteration.
+    """
+    out, parts = {}, []
+    for fld in schema.fields_for(s.nibs_type, block="markers.tsv"):
+        raw = s.values.get(fld.key)
+        if raw in (None, "") or str(raw).strip() == "":
+            raw = pf.item.sidecar_values.get(fld.key)
+        if raw in (None, "") or str(raw).strip() == "":
+            continue
+        name = fld.emits or fld.key
+        coerced, err = schema.coerce_value(fld, raw)
+        val = raw if err else coerced
+        if name == "position_description":
+            parts.append(str(val).strip())
+        else:
+            out[name] = val
+    if parts:
+        out["position_description"] = "; ".join(parts)
+    return out
+
+
 def _write_markers(pf: PlannedFile, schema, sets) -> None:
     """One row per element placement, referenced from *_events.tsv.
 
@@ -870,14 +988,17 @@ def _write_markers(pf: PlannedFile, schema, sets) -> None:
     non-navigated work and exactly what the spec's own motor example does.
     """
     seen, rows = {}, []
-    shared = _blocked_values(pf, schema, "markers.tsv")
     for s in sets:
         pos = s.position or f"{s.name}_position"
         if pos in seen:
             continue
         seen[pos] = True
         row = {"nibs_position_id": pos, "nibs_element_id": s.name}
-        row.update(shared)
+        # Resolved PER SET, with the session values underneath, exactly as the
+        # device blocks are. Reading only session values meant a placement
+        # entered against one protocol -- a coil moved to a second site
+        # mid-recording -- was never written.
+        row.update(_placement_values(pf, schema, s))
         rows.append(row)
 
     columns = ["nibs_position_id", "nibs_element_id"]
@@ -1138,7 +1259,7 @@ def execute_plan(plan: Plan,
             write_emg_sidecar(pf, rec, plan.powerline_hz)
             write_channels_tsv(pf, rec, ctypes, cunits)
             write_events_tsv(pf, rec)
-            write_nibs_sidecar(pf, schema)
+            write_nibs_sidecar(pf, schema, log)
 
             # 6) dataset-level files
             upsert_participant(plan.layout, pf.item.metadata.participant_id or

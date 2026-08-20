@@ -320,10 +320,24 @@ def test_no_segment_loop_hardcodes_the_file_wide_window():
 
 
 def test_the_preview_takes_its_window_from_the_run_snapshot():
-    """Not from the Tk variables directly, which the run may not be using."""
+    """Not from the Tk variables directly, which the run may not be using.
+
+    Tightened since: window_map and delay_ms_map are PER CHANNEL, held in
+    chan_settings, and the flat copy in params belongs to whichever channel was
+    last harvested. Reading the flat one made the preview cut with no delay
+    while the run cut with 17.5 ms, so the response fell outside the latency
+    window and the preview reported that no onsets would be found while the run
+    found every one. The flat map remains the fallback for a channel with no
+    snapshot yet.
+    """
     prev = (PKG / "preview.py").read_text(encoding="utf-8")
-    assert 'params.get("window_map")' in prev
     assert 'params["pre_ms"]' in prev
+    # Resolved per channel, with params as the fallback.
+    assert "_pv_own(" in prev
+    assert "params.get(key, default)" in prev
+    # Never the flat map directly for the per-channel ones.
+    assert 'params.get("window_map")' not in prev
+    assert 'params.get("delay_ms_map")' not in prev
 
 
 # ── the boxes are seeded, and stay linked to the default ─────────────────────

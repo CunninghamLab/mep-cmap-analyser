@@ -205,6 +205,7 @@ class DataInspectorWindow:
                  label_map=None, color_map=None, emg_unit=None,
                  ptp_start_ms=10, ptp_end_ms=50,
                  ptp_windows_by_type=None,
+                 delay_ms_map=None,
                  visible_pre_ms=None,
                  onset_method="peak_fraction",
                  onset_bootstrap_crit=1.96, onset_bootstrap_n=500,
@@ -265,6 +266,11 @@ class DataInspectorWindow:
         # window anchoring the window is per stimulus type, and the file-wide
         # pair above is only a fallback.
         self.ptp_windows_by_type  = dict(ptp_windows_by_type or {})
+        # Part of what positions a landmark (see _segment_geometry). Applying a
+        # delay cuts the epoch elsewhere in the recording WITHOUT changing the
+        # axis, so nothing else on this object can tell that the response has
+        # moved under a stored index.
+        self.delay_ms_map         = dict(delay_ms_map or {})
         # visible_pre_ms: how much pre-stim to SHOW (xlim)
         # _analysis_pre_ms: full pre-stim used for detection (may be larger)
         # May be one number, or {stim_type: pre_ms} where types are epoched
@@ -371,6 +377,13 @@ class DataInspectorWindow:
 
         # --------- status bar -------------------------------------------
         self.status = tk.Label(self.top, anchor="w")
+        # Whatever the theme gives a label, captured once so the status line
+        # can be turned red for a fault and put back afterwards without
+        # hardcoding a colour that would be wrong on another platform.
+        try:
+            self._status_fg_default = self.status.cget("fg")
+        except Exception:               # noqa: BLE001 — stubbed Tk in tests
+            self._status_fg_default = "black"
         self.status.pack(fill="x", padx=10, pady=4)
 
         # --------- toggles ----------------------------------------------
@@ -610,6 +623,42 @@ class DataInspectorWindow:
         # exclusion change invalidates it.
         self._template_cache.pop(self.cur_type, None)
         self._refresh_status()
+
+    def _segment_geometry(self, stim_type=None):
+        """What positions a landmark within a segment, as a comparable string.
+
+        A stored index means nothing on its own: it is a position, and it is
+        only the same position while the segment is cut the same way and the
+        amplitude window falls in the same place. Three things move it --
+
+          * the EVENT DELAY, which shifts where t=0 sits in the recording, so
+            the whole response moves against the axis;
+          * the EPOCH WINDOW, which changes how much precedes the stimulus and
+            therefore renumbers every sample;
+          * the AMPLITUDE WINDOW, which is where the peaks were searched for.
+
+        Recorded per stimulus type, because all three are per type.
+
+        Deliberately not a hash: the value is written into the session JSON and
+        read by a human when something looks wrong, and "d=17.5,e=100.0/300.0,
+        a=12.0/50.0" says what changed while a digest says only that something
+        did. Rounded so that float noise does not read as a change.
+        """
+        st = self.cur_type if stim_type is None else stim_type
+        # getattr, because this must not depend on a caller remembering to
+        # pass the map. Absent, the delay reads as 0.0 -- which is wrong in
+        # exactly the case this exists for, so it is passed at both call sites
+        # and the default is a fallback rather than the normal path.
+        try:
+            delay = float((getattr(self, "delay_ms_map", None) or {})
+                          .get(st, 0.0) or 0.0)
+        except Exception:                   # noqa: BLE001 — odd map contents
+            delay = 0.0
+        pre = float(self.t[0]) if len(self.t) else 0.0
+        post = float(self.t[-1]) if len(self.t) else 0.0
+        a0, a1 = self._ptp_window_ms(st)
+        return (f"d={delay:.2f},e={pre:.1f}/{post:.1f},"
+                f"a={float(a0 or 0):.1f}/{float(a1 or 0):.1f}")
 
     def _ptp_window_ms(self, stim_type=None):
         """Amplitude window for a stimulus type, in ms relative to the stimulus.
@@ -915,6 +964,37 @@ class DataInspectorWindow:
         onset    = stim_idx if onset_ms is None else stim_idx + int(round(onset_ms / dt_ms))
         onset    = max(onset, stim_idx)
 
+        # Why detection found nothing, when it found nothing.
+        #
+        # min_peak_amplitude gates all seven detectors: a trial whose response
+        # is smaller than it is rejected before an onset is looked for. That is
+        # the gate doing its job -- it is what stops an onset being fitted to
+        # noise -- but a rejected trial and a trial whose search window was
+        # wrong both read "not detected", and telling them apart took two
+        # rounds of looking at waveforms.
+        #
+        # Measured here rather than returned by the detectors: they each apply
+        # the gate against their own window and returning a reason from all
+        # seven, through the median dispatcher, would be a much larger change
+        # for the same sentence. Reported as "below the minimum" only when it
+        # actually is, so the ordinary "no onset found" is not diluted.
+        _fail_reason = None
+        if onset_ms is None:
+            try:
+                _gate = float((self.detection_params or {})
+                              .get("min_peak_amplitude", 0.0) or 0.0)
+                _mask = (self.t >= _min_lat) & (self.t <= _max_lat)
+                if _gate > 0 and np.any(_mask):
+                    _p2p = float(np.ptp(emg[_mask]))
+                    if _p2p < _gate:
+                        _fail_reason = (
+                            f"response {_p2p:.3f} mV is below the "
+                            f"{_gate:.3f} mV minimum — lower 'Min peak "
+                            f"amplitude' in Settings ▸ Preferences ▸ "
+                            f"Detection, then re-run")
+            except Exception:               # noqa: BLE001 — never block a draw
+                _fail_reason = None
+
         # ---------- discard stale landmark indices --------------------------
         # Metadata persists across runs and is honoured by the setdefault calls
         # below, so an index stored when the analysis window was longer would be
@@ -926,9 +1006,10 @@ class DataInspectorWindow:
         # the segment edge instead would be worse: it silently plants a landmark
         # at a boundary the analyst never chose and reports it as a measurement.
         _seg_len = len(emg)
-        _stale = [f for f in ('ptp_min_idx', 'ptp_max_idx', 'onset_idx',
-                              'silent_start_idx', 'silent_end_idx',
-                              'mep_offset_idx')
+        _LANDMARKS = ('ptp_min_idx', 'ptp_max_idx', 'onset_idx',
+                      'silent_start_idx', 'silent_end_idx',
+                      'mep_offset_idx', 'auc_start_idx', 'auc_end_idx')
+        _stale = [f for f in _LANDMARKS
                   if m.get(f) is not None
                   and not (0 <= int(m[f]) < _seg_len)]
         if _stale:
@@ -940,6 +1021,40 @@ class DataInspectorWindow:
                       f"stored outside the current {_seg_len}-sample segment "
                       f"(analysis window changed since they were saved); "
                       f"re-detecting.")
+
+        # ---------- discard landmarks the geometry has moved under ----------
+        #
+        # An index is a position in a segment, and it only means anything while
+        # the segment is cut the same way. The check above catches an index that
+        # no longer FITS. It does not catch one that still fits but no longer
+        # points at what it was placed on -- and that is the commoner case.
+        #
+        # Applying a 17.5 ms event delay cuts the epoch 35 samples later, so the
+        # response moves 17.5 ms earlier against the same axis while every
+        # stored index stays put. On one real recording that put PTP min at
+        # +0.013 mV and PTP max at -0.028 mV, and the status bar reported
+        # "PTP: -0.04 mV": the labels had swapped over and a negative
+        # peak-to-peak amplitude was presented as a measurement. Changing the
+        # epoch window or the amplitude window moves things the same way.
+        #
+        # So the geometry that positions a landmark is recorded WITH it, and a
+        # landmark whose geometry has changed is dropped rather than reused.
+        # Manual edits go too, which is unavoidable: an edit is a position, and
+        # the position no longer refers to what the analyst was looking at.
+        _geom = self._segment_geometry()
+        if m.get('_geometry') not in (None, _geom):
+            _moved = [f for f in _LANDMARKS if f in m]
+            for f in _moved:
+                m.pop(f, None)
+            m.pop('onset_auto_failed', None)
+            if _moved and not getattr(self, '_geom_meta_warned', False):
+                self._geom_meta_warned = True
+                print(f"[inspector] Re-detecting landmarks for "
+                      f"'{self.cur_type}': the event delay or the analysis "
+                      f"window has changed since they were saved, so the "
+                      f"stored positions no longer point at the same part of "
+                      f"the response.")
+        m['_geometry'] = _geom
 
         # ---------- seed metadata defaults ----------------------------------
         m.setdefault('ptp_min_idx', p_min)
@@ -956,8 +1071,15 @@ class DataInspectorWindow:
         # the analyst drags the marker, which is a real decision.
         if onset_ms is None and 'onset_idx' not in m:
             m['onset_auto_failed'] = True
+            # Kept beside the flag so the status line can say WHY rather than
+            # only that nothing was found.
+            if _fail_reason:
+                m['onset_fail_reason'] = _fail_reason
+            else:
+                m.pop('onset_fail_reason', None)
         elif onset_ms is not None:
             m.pop('onset_auto_failed', None)
+            m.pop('onset_fail_reason', None)
         m.setdefault('onset_idx',   onset)
 
         # ---------- decide whether to run CSP detection ---------------------
@@ -1250,6 +1372,14 @@ class DataInspectorWindow:
                     # Sync onset if linked
                     if getattr(self, "link_onset_auc", None)                             and self.link_onset_auc.get():
                         m["onset_idx"] = new_idx
+                        # A placed marker is a measurement, whatever the
+                        # detector managed -- and this is a second way to place
+                        # one. _update_meta clears the flag for the onset dot,
+                        # but dragging the AUC START with linking on moves the
+                        # onset without going through it, so the marker moved,
+                        # the latency became computable, and the status still
+                        # read "not detected".
+                        m.pop("onset_auto_failed", None)
                         for dp in self._dpts:
                             if dp.role == "onset_idx":
                                 dp.idx = new_idx
@@ -1525,6 +1655,10 @@ class DataInspectorWindow:
                            'auc_start_idx', 'auc_end_idx'):
                     _m.pop(_f, None)
             _m.pop('onset_auto_failed', None)
+            # Explanatory text for the status line, not a measurement. It is
+            # re-derived on every draw, so keeping it would only mean stale
+            # prose in the session file.
+            _m.pop('onset_fail_reason', None)
 
         self.top.destroy()
 
@@ -1537,11 +1671,35 @@ class DataInspectorWindow:
         # ---------- status‑bar text -----------------------------------------
         seg     = self.segments[self.cur_type][self.cur_idx]
         ptp_amp = seg[m['ptp_max_idx']] - seg[m['ptp_min_idx']]
+        # A negative peak-to-peak cannot exist, so it is reported as a fault.
+        #
+        # ptp_max below ptp_min means the two landmarks are not the maximum and
+        # minimum of one response: they have swapped over, or they are sitting
+        # on something that is not the response at all. The value has a sign
+        # only because of the order they are subtracted in, and printing it as
+        # "PTP: -0.04 mV" presents an impossibility as a measurement.
+        #
+        # Seen when stored landmarks outlived the geometry that positioned
+        # them: an event delay moved the response 17.5 ms while the indices
+        # stayed put, leaving PTP min at +0.013 mV and PTP max at -0.028 mV.
+        # That is now prevented upstream, but this is the check that would have
+        # caught it in one glance, and it is independent of the cause -- it
+        # holds for any future reason the two markers end up the wrong way
+        # round, including an analyst dragging them there.
+        _ptp_inverted = bool(ptp_amp < 0)
+        ptp_txt = (f"PTP:{ptp_amp:.2f} mV" if not _ptp_inverted
+                   else f"PTP: max is BELOW min ({ptp_amp:.2f} mV) — "
+                        f"the markers are the wrong way round")
         lat_ms  = (m['onset_idx'] - stim_idx) * dt_ms
         _no_onset = bool(m.get('onset_auto_failed'))
-        # A non-detection is reported as such, not as 0.0 ms.
+        # A non-detection is reported as such, not as 0.0 ms -- and with the
+        # reason where there is one, because "not detected" alone does not
+        # distinguish a response below the amplitude gate from a search window
+        # that was looking in the wrong place, and those need opposite fixes.
+        _why = m.get('onset_fail_reason') if _no_onset else None
         lat_txt = (f"Latency:{lat_ms:.1f} ms" if not _no_onset
-                   else "Latency: not detected")
+                   else (f"Latency: not detected — {_why}" if _why
+                         else "Latency: not detected"))
 
 
         # cSP duration and absolute EMG return time relative to stim
@@ -1572,12 +1730,26 @@ class DataInspectorWindow:
         if "auc_start_idx" in m and "auc_end_idx" in m:
             auc_val = _np_trapz(np.abs(seg[m["auc_start_idx"]:m["auc_end_idx"]]),
                             dx=dt_ms / 1000)
-            auc_txt = f"    |AUC|:{auc_val:.3f} mV·s"
+            # In µV·s, because mV·s at three decimals reads 0.000 for
+            # every MEP. A 0.1 mV response over 15 ms integrates to about
+            # 3e-4 mV·s, so the whole plausible range for one MEP --
+            # roughly 1e-4 to 2e-3 -- rounds to 0.000 or 0.001. The number
+            # was on screen, told the analyst nothing, and looked like a
+            # failed calculation. The same values in µV·s are 130
+            # to 790, which read at a glance and compare between trials.
+            #
+            # Display only: AUC(mV*s) in the results file is unchanged, so
+            # nothing downstream and no published value moves.
+            auc_txt = f"    |AUC|:{auc_val * 1000.0:.1f} µV·s"
 
-        self.status.config(text=(
-            f"PTP:{ptp_amp:.2f} mV    "
-            f"{lat_txt}"
-            f"{offset_txt}{silent_txt}{auc_txt}{csp_note}"
-        ))
+        self.status.config(
+            text=(f"{ptp_txt}    "
+                  f"{lat_txt}"
+                  f"{offset_txt}{silent_txt}{auc_txt}{csp_note}"),
+            # Coloured too: the status line is read at a glance and a
+            # sentence among numbers is easy to slide past. Restored to
+            # the normal colour when it is fine, so a fault on one trial
+            # does not leave every later one looking wrong.
+            fg=("#B03A2E" if _ptp_inverted else self._status_fg_default))
 
 

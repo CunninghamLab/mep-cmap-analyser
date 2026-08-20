@@ -1655,6 +1655,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             # measures the same interval. Falls back to the two values above
             # for any type not present.
             ptp_windows_by_type = ptp_windows_by_type,
+            delay_ms_map        = dict(getattr(self, "delay_ms_map", None) or {}),
             analysis_pre_ms     = _analysis_pre,
             visible_pre_ms      = _visible_pre,
             extra_segs          = extra_segs or {},
@@ -1770,6 +1771,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             # true only while the preview did not detect. Empty still falls
             # back to the file-wide pair above.
             ptp_windows_by_type = dict(ptp_windows_by_type or {}),
+            delay_ms_map        = dict(getattr(self, "delay_ms_map", None) or {}),
             analysis_pre_ms     = pre_ms,
             visible_pre_ms      = self._visible_pre_by_type(),
             extra_segs          = {},
@@ -8352,13 +8354,38 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             self.log(line)
 
         applied = 0
+        # A delay measured on 'A' belongs to every row 'A' became.
+        #
+        # The scan measures against the CONFIGURED EVENTS, keyed by the
+        # recording's own stim code. The setup table is keyed by its rows, and
+        # applying conditions splits one code into several -- 'A' becomes
+        # 'A.first' and 'A.last'. So the lookup missed on every conditioned
+        # recording: a delay was measured, reported as proposed, then dropped
+        # because no row was called 'A', while the summary line said no delay
+        # had been proposed at all.
+        #
+        # Filled in on every row sharing the code rather than scanned per row:
+        # the offset between a trigger and the artefact is a property of the
+        # stimulator and the signal path, not of which half of the session a
+        # trial fell in. Scanning per condition would also halve n and make the
+        # spread -- which is what decides whether a delay is proposed -- worse
+        # for no reason.
+        from .conditions import decompose as _decompose
+        _rows_for_code = {}
+        for _key in self._lab_entry_delay:
+            _base, _cond = _decompose(_key)
+            _rows_for_code.setdefault(_base, []).append(_key)
+
         for stim, r in results.items():
-            var = self._lab_entry_delay.get(stim)
-            if var is None or not r.proposed:
+            if not r.proposed:
                 continue
-            var.set(round(r.delay_ms, 2))
-            self.delay_source_map[stim] = "detected"
-            applied += 1
+            for _key in _rows_for_code.get(stim, []):
+                var = self._lab_entry_delay.get(_key)
+                if var is None:
+                    continue
+                var.set(round(r.delay_ms, 2))
+                self.delay_source_map[_key] = "detected"
+                applied += 1
 
         n_types = len(results)
         if applied:

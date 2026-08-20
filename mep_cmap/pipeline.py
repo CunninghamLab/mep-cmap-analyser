@@ -581,14 +581,24 @@ def time_axis_for(cfg: PipelineConfig, stim_type: str, fs: float):
     return np.linspace(-pre, post, before + after, endpoint=False)
 
 
+#: How much of the requested pre-stimulus window must exist before a trial is
+#: kept. Above this the baseline is trimmed and the trial survives; below it,
+#: the window is a baseline in name only and the trial is dropped instead.
+MIN_BASELINE_FRACTION = 0.5
+
+
 def pipeline_extract_segments(time, emg, stim_times, stim_types, fs,
-                               cfg: PipelineConfig):
+                               cfg: PipelineConfig, log_callback=None):
     """Extract per-trial EMG and pre-stim segments for every stim type.
 
     Returns
     -------
     dict mapping stim_type -> list of (seg_emg, seg_pre, stim_time_s) tuples.
-    Only complete segments (exact pre+post window) are included.
+    Only trials with a complete analysis window are included. Pre-stimulus
+    baselines are all the same length within a stim type: where a stimulus sits
+    too close to the start of the recording for the full window, every baseline
+    of that type is trimmed to the shortest, so the outlier test compares like
+    with like. ``log_callback`` is optional and reports any trimming.
     stim_time_s is the stimulus timestamp in seconds (from the raw time axis),
     preserved so downstream stages can reconstruct chronological trial order
     across stim types for session-level detrending and other analyses.
@@ -611,6 +621,7 @@ def pipeline_extract_segments(time, emg, stim_times, stim_types, fs,
         # 3 ms before the pulse).
         pre_offset = max(gap_samples, guard_samples)
         segs = []
+        short_prestim = 0
         # Shift t=0 onto the actual stimulus. One line, but everything
         # downstream is defined relative to this index -- the pre-stimulus
         # window, the amplitude window, onset, offset, AUC and the Inspector's
@@ -632,7 +643,62 @@ def pipeline_extract_segments(time, emg, stim_times, stim_types, fs,
             pre_end   = max(0, idx - pre_offset)
             pre_start = max(0, pre_end - prestim_samples)
             seg_pre   = emg[pre_start:pre_end]
+            # A short baseline is kept and the rest are trimmed to match, not
+            # dropped and not padded.
+            #
+            # The analysis window above is checked and an incomplete one skips
+            # the trial. This one was not, and max(0, ...) clamps it silently at
+            # the start of the recording, so a stimulus with less room before it
+            # than the baseline needs produced a SHORT array beside full-length
+            # ones. np.array() over the mixture raised "inhomogeneous shape"
+            # three stages later, where nothing pointed back here.
+            #
+            # Only the BASELINE is short in this case -- the epoch is complete,
+            # and the response is perfectly measurable -- because the baseline
+            # additionally clears the artefact gap. A stimulus 100 ms into a
+            # recording with a 100 ms baseline and a 5 ms gap is short by 5%.
+            # Dropping the trial to protect 10 samples of baseline costs more
+            # than it saves, and the trial it costs is systematically the first
+            # one, which is not random with respect to anything measured across
+            # a session.
+            #
+            # So the length is recorded and every baseline is trimmed to the
+            # shortest AFTER the loop. Equal length is what matters: the outlier
+            # test compares one trial's baseline RMS against the others', and an
+            # RMS over 190 samples is not strictly comparable with one over 200.
+            # Padding would put fabricated signal into that comparison.
             segs.append((seg_emg, seg_pre, stim_time))
+
+        # The floor. Trimming is cheap when a baseline is a few per cent short
+        # and unacceptable when it is a tenth of what was asked for, so below
+        # half the requested window the trial is dropped after all -- that is a
+        # baseline in name only, and silently measuring one would be worse than
+        # losing the trial.
+        if segs:
+            _floor = max(1, int(prestim_samples * MIN_BASELINE_FRACTION))
+            _kept = [s for s in segs if len(s[1]) >= _floor]
+            short_prestim = len(segs) - len(_kept)
+            segs = _kept
+        if segs:
+            _n_pre = min(len(s[1]) for s in segs)
+            if _n_pre < prestim_samples:
+                # Trimmed from the FRONT: the end of the baseline is fixed
+                # relative to the stimulus, and it is the far end that is
+                # missing on the clamped trial.
+                segs = [(e, p[len(p) - _n_pre:], t) for e, p, t in segs]
+                if log_callback:
+                    log_callback(
+                        f"   \u2139\ufe0f  '{stim_type}': pre-stimulus window "
+                        f"trimmed to {_n_pre * 1000.0 / fs:.0f} ms (asked for "
+                        f"{cfg.prestim_ms:g} ms) — one or more stimuli sit too "
+                        f"close to the start of the recording. Every trial of "
+                        f"this type uses the same window, so baselines stay "
+                        f"comparable.")
+        if short_prestim and log_callback:
+            log_callback(
+                f"   \u26a0\ufe0f  '{stim_type}': {short_prestim} trial(s) "
+                f"skipped — less than half the requested "
+                f"{cfg.prestim_ms:g} ms pre-stimulus window was available.")
         if segs:
             result[stim_type] = segs
     return result
@@ -735,7 +801,8 @@ def onset_search_window(cfg, min_lat, max_lat):
     return lo, hi
 
 
-def _detect_onset_dispatch(signal, fs, cfg, min_lat, max_lat, template=None):
+def _detect_onset_dispatch(signal, fs, cfg, min_lat, max_lat,
+                           template=None, stim_type=None):
     """Run the configured onset detector on a single trace and return onset (ms).
 
     Thin wrapper over ``detection.dispatch_onset``, which is the single place
@@ -744,16 +811,29 @@ def _detect_onset_dispatch(signal, fs, cfg, min_lat, max_lat, template=None):
     which parameters it used -- see detection/dispatch.py for the drift this
     replaced.
 
-    NOTE: ``pre_ms`` MUST be ``cfg.pre_ms`` here -- segs_all are extracted with
-    ``samples_before = cfg.pre_ms`` of pre-stim (pipeline_extract_segments), so
-    the stimulus sits at ``cfg.pre_ms``*fs/1000, NOT ``cfg.prestim_ms``. Passing
-    prestim_ms mislocates the stimulus and the detector searches the wrong
-    region (returns None even when a clear MEP is present).
+    ``pre_ms`` MUST match how the trace in front of it was cut: it is what
+    tells the detector where the stimulus sits. Get it wrong and the detector
+    searches the wrong region and returns None even when a clear MEP is
+    present.
+
+    That was ``cfg.pre_ms`` unconditionally, and this note said it had to be.
+    It stopped being true when epochs became per stimulus type:
+    pipeline_extract_segments cuts with ``window_samples(cfg, stim_type)``, so a
+    type given a 100 ms epoch against a file-wide 20 ms has its stimulus at
+    100 ms while ``cfg.pre_ms`` says 20. The preview, which trims to the same
+    per-type window, then found no onset on ANY trial -- exactly the symptom
+    this note predicted -- and reported that the run would find none either.
+
+    Passing ``stim_type`` resolves that type's own pre. Omitting it keeps the
+    old behaviour, for a caller whose trace really is cut to the file-wide
+    window.
     """
+    _pre_ms = (resolve_window(cfg, stim_type)[0] if stim_type is not None
+               else cfg.pre_ms)
     _lo, _hi = onset_search_window(cfg, min_lat, max_lat)
     return dispatch_onset(
         signal, fs, detector_params(cfg),
-        pre_ms=cfg.pre_ms,
+        pre_ms=_pre_ms,
         search_start_ms=_lo,
         search_end_ms=_hi,
         min_latency_ms=min_lat,
@@ -829,7 +909,7 @@ def pipeline_detect_onsets(stim_type, segs_all, out_set,
                 try:
                     _anchor = _detect_onset_dispatch(
                         _median, fs, cfg, _min_lat0, _max_lat0,
-                        template=_median)
+                        template=_median, stim_type=stim_type)
                 except Exception:
                     _anchor = None
                 if _anchor is not None and _min_lat0 <= _anchor <= _max_lat0:
@@ -860,7 +940,8 @@ def pipeline_detect_onsets(stim_type, segs_all, out_set,
 
     for idx, seg in enumerate(segs_all):
         onsets[idx] = _detect_onset_dispatch(seg, fs, cfg, _eff_min_lat,
-                                             _eff_max_lat, template=_template)
+                                             _eff_max_lat, template=_template,
+                                             stim_type=stim_type)
 
     _warn_if_onsets_pinned_to_a_bound(
         stim_type, onsets, fs, _eff_min_lat, _eff_max_lat, log_callback)
@@ -1060,15 +1141,41 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
         )
 
     for idx, seg in enumerate(segs_all):
+        # This stim type's OWN epoch, in ms. Every helper below is handed a
+        # segment cut to THIS window, so passing cfg.pre_ms/cfg.post_ms -- the
+        # file-wide pair -- tells them the epoch begins somewhere it does not.
+        #
+        # Same fault as the index conversion below, in three more places. On a
+        # recording whose conditions used a 100 ms epoch against a file-wide
+        # 20 ms, the offset detector was told the segment started at -20 ms and
+        # returned 82 ms for a response the Inspector put at 53 ms, with the
+        # duration wrong to match. The Inspector was right: it works in the
+        # segment's own coordinates.
+        _pre_type_ms, _post_type_ms = resolve_window(cfg, stim_type)
+
         # ── automatic metrics ────────────────────────────────────────────
         auto_ptp = compute_ptp(seg, ptp_start_idx, ptp_end_idx)
         auto_lat = auto_onsets.get(idx)
 
         # ── manual overrides from inspector ──────────────────────────────
-        # Inspector segments start at -prestim_ms; segs_all start at -pre_ms.
+        # Inspector segments start at -prestim_ms; segs_all start at this stim
+        # type's OWN pre, which is not necessarily the file-wide one.
         # Convert inspector-space indices to segs_all-space before applying.
+        #
+        # This used cfg.pre_ms, the file-wide value. That was right while every
+        # type shared one window and wrong the moment epochs became per type: a
+        # condition given a 100 ms epoch against a file-wide 20 ms shifted every
+        # index by 160 samples at 2 kHz, putting the peak markers 80 ms early,
+        # in the pre-stimulus baseline. Peak-to-peak across noise reads as
+        # roughly zero and, the two indices now being arbitrary points rather
+        # than a max and a min, sometimes NEGATIVE -- which is how it was found.
+        #
+        # Latency hid it: man_lat is computed from _insp_sb alone, so latencies
+        # stayed correct while amplitudes collapsed, and a results file with
+        # plausible latencies and impossible amplitudes looks like an amplitude
+        # problem rather than a coordinate one.
         _insp_sb = int(cfg.prestim_ms * fs / 1000)  # stim @ inspector idx
-        _segs_sb = int(cfg.pre_ms     * fs / 1000)  # stim @ segs_all idx
+        _segs_sb = window_samples(cfg, stim_type, fs)[0]  # stim @ segs_all idx
         _offset  = _insp_sb - _segs_sb
         _n       = len(seg)
         def _ci(i): return min(max(0, i - _offset), _n - 1)
@@ -1083,6 +1190,18 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
             # exactly as auto (single source of truth) rather than raising.
             if "ptp_max_idx" in m and "ptp_min_idx" in m:
                 man_ptp = seg[_ci(m["ptp_max_idx"])] - seg[_ci(m["ptp_min_idx"])]
+                # Peak-to-peak is a magnitude and cannot be negative. The other
+                # writer of this column already guards it; this one did not, so
+                # the coordinate bug above reached trials.csv as -0.01 mV and
+                # propagated into z-scores, normalisation and the group table
+                # as though it meant something.
+                #
+                # The magnitude is still WRONG when the indices are wrong. This
+                # is a floor, not a repair: it stops an impossible number being
+                # published, and the disagreement warning below is what says the
+                # value should not be trusted.
+                if man_ptp < 0:
+                    man_ptp = abs(man_ptp)
             else:
                 man_ptp = auto_ptp
             if "onset_idx" in m:
@@ -1139,7 +1258,7 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
                     cfg, _ag_min_lat, _ag_max_lat)
                 agreement = compute_onset_agreement(
                     seg, fs,
-                    pre_ms=cfg.pre_ms,
+                    pre_ms=_pre_type_ms,
                     search_start_ms=_ag_lo,
                     search_end_ms=_ag_hi,
                     min_latency_ms=_ag_min_lat,
@@ -1185,8 +1304,8 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
                     csp_start_ms=sp_mep_offset_ms,
                     csp_enabled=(stim_type in cfg.csp_types),
                     manual_offset_ms=_man_off,
-                    pre_ms=cfg.pre_ms,
-                    search_end_ms=cfg.post_ms,
+                    pre_ms=_pre_type_ms,
+                    search_end_ms=_post_type_ms,
                     min_duration_ms=cfg.mep_offset_min_duration_ms,
                     max_duration_ms=cfg.mep_offset_max_duration_ms,
                     min_return_ms=cfg.mep_offset_min_return_ms,
@@ -1251,9 +1370,9 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
                                             np.argmax(_seg_ptp)))
                 _peak2ms = (_peak2 - _segs_sb) * 1000 / fs
                 _csp = _dcsp(seg, fs,
-                             np.linspace(-cfg.pre_ms, cfg.post_ms,
+                             np.linspace(-_pre_type_ms, _post_type_ms,
                                          len(seg), endpoint=False),
-                             pre_ms=cfg.pre_ms,
+                             pre_ms=_pre_type_ms,
                              search_start_ms=_peak2ms,
                              search_end_ms=cfg.csp_search_end_ms,
                              min_silence_ms=cfg.csp_min_silence_ms,
@@ -2107,7 +2226,8 @@ def pipeline_quantify_averaged(means, segments_metadata, fs, cfg,
         else:
             _min, _max = cfg.latency_map.get(stim_type,
                                              (cfg.ptp_start, cfg.ptp_end))
-            lat = _detect_onset_dispatch(seg, fs, cfg, _min, _max)
+            lat = _detect_onset_dispatch(seg, fs, cfg, _min, _max,
+                                         stim_type=stim_type)
             if lat is not None:
                 onset_idx = insp_sb + int(round(lat * fs / 1000))
         if lat is not None and lat <= 0:
@@ -2636,7 +2756,7 @@ def run_pipeline(input_path,
                         _b + int(ptp_end   * fs / 1000))
 
             all_segments = pipeline_extract_segments(
-                time, emg, stim_times, stim_types, fs, cfg)
+                time, emg, stim_times, stim_types, fs, cfg, log_callback)
 
             # ── Stage 4: Save "with-outliers" CSVs and figures ────────────────
             for stim_type, segs in all_segments.items():
@@ -2827,7 +2947,7 @@ def run_pipeline(input_path,
                     _mn, _mx = cfg.latency_map.get(
                         _st, (cfg.ptp_start, cfg.ptp_end))
                     _oms = _detect_onset_dispatch(
-                        _mi["mean"], fs, cfg, _mn, _mx)
+                        _mi["mean"], fs, cfg, _mn, _mx, stim_type=_st)
                     if _oms is not None and _oms > 0:
                         _avg_seed[(_st, 0)] = {
                             "onset_idx": _insp_sb_seed

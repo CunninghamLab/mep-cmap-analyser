@@ -427,11 +427,29 @@ class PreviewDetectionMixin:
         # Pre stays prestim_ms, matching what the pipeline hands the Inspector:
         # the review deliberately shows a wider lead-in than the analysis
         # window. Only post varies by type.
+        # Per-type maps come from THIS CHANNEL's snapshot, with the flat map as
+        # a fallback -- the same rule the detection config below already uses.
+        #
+        # These two read the flat map only. window_map and delay_ms_map are per
+        # channel, held in chan_settings, and the flat copy belongs to whichever
+        # channel was last harvested. On this study the delay was 17.5 ms in the
+        # snapshot and absent from the flat map, so the preview cut its segments
+        # with NO delay while the run cut with it: the response sat at ~50 ms
+        # against a 28-45 ms latency window, no onset was found on any trial,
+        # and the preview reported "No onsets were pre-detected" while the run
+        # detected all 21. A warning that says the opposite of what happens is
+        # worse than none.
+        _pv_setup = (params.get("chan_settings") or {}).get(
+            params.get("channel_idx", getattr(self, "channel_idx", 0))) or {}
+
+        def _pv_own(key, default=None):
+            return _pv_setup.get(key, params.get(key, default))
+
         _wincfg = PipelineConfig(pre_ms=float(params["pre_ms"]),
                                  post_ms=post_ms,
-                                 window_map=params.get("window_map") or {})
+                                 window_map=_pv_own("window_map", {}) or {})
         samples_before = int(prestim_ms * fs / 1000)
-        delay_map = params.get("delay_ms_map") or {}
+        delay_map = _pv_own("delay_ms_map", {}) or {}
 
         # Two sets are cut: the chosen trials, which the Inspector draws, and
         # EVERY trial, which detection runs over.
@@ -478,6 +496,10 @@ class PreviewDetectionMixin:
 
         return dict(segments=segments, picked=picked, dropped=dropped,
                     every=every,
+                    # Carried so the "no onsets" report can name the delay it
+                    # actually cut with, which is the commonest reason the
+                    # preview and the run disagree.
+                    delay_map=dict(delay_map),
                     fs=fs, unit=loaded["unit"], prestim_ms=prestim_ms,
                     post_ms=post_ms)
 
@@ -641,16 +663,88 @@ class PreviewDetectionMixin:
             _by_type = {}
             for (_st, _i) in _seed:
                 _by_type[_st] = _by_type.get(_st, 0) + 1
+            # Out of how many, and how many the analyst has already placed.
+            #
+            # "A·first 4" reads as a shortfall against a run that reports a
+            # latency for every trial, and looks like the preview and the run
+            # disagreeing. They need not: the run honours saved manual onsets,
+            # which detection neither produces nor counts. Four detected and
+            # two placed by hand is six trials with a latency, and no
+            # disagreement at all -- but only the numerator was ever shown, so
+            # the two cases were indistinguishable.
+            _saved = getattr(self, "segments_metadata", None) or {}
+            _parts = []
+            for _st in sorted(_by_type):
+                _n_shown = len((payload.get("picked") or {}).get(_st)
+                               or (payload.get("segments") or {}).get(_st) or ())
+                # Only the ones detection MISSED. A trial both detected and
+                # hand-placed is one trial, and counting it twice would make
+                # the total exceed the trials shown.
+                _found = {_i for (_s, _i) in _seed if _s == _st}
+                _n_manual = sum(
+                    1 for (_mst, _mi), _m in _saved.items()
+                    if _mst == _st and _mi not in _found
+                    and isinstance(_m, dict) and "onset_idx" in _m
+                    and not _m.get("onset_auto_failed"))
+                _txt = f"{_st} {_by_type[_st]}/{_n_shown}"
+                if _n_manual:
+                    _txt += f" (+{_n_manual} you placed)"
+                _parts.append(_txt)
             self.log("   Onsets pre-detected with the analysis settings: "
-                     + ", ".join(f"{k} {v}" for k, v in sorted(_by_type.items())))
+                     + ", ".join(_parts))
+            if any("you placed" in _p for _p in _parts):
+                self.log("      A trial detection missed may still carry an "
+                         "onset you placed, and the run uses those. This count "
+                         "is detection only, so it can read lower than the "
+                         "results without the two disagreeing.")
             if _ptp_ms:
-                self.log("   Amplitude window per type: "
-                         + ", ".join(f"{k} {v[0]:.1f}-{v[1]:.1f} ms"
-                                     for k, v in sorted(_ptp_ms.items())))
+                # Say when a window is the file-wide fallback rather than one
+                # anchored to that type's median onset. They look identical --
+                # two numbers in ms -- but an anchored window follows the
+                # response and the fallback does not, and the difference is
+                # exactly what the run reports separately. Anchoring declines
+                # when too few trials were detected to give a reliable median,
+                # so an unanchored window here usually means the count above is
+                # low, and the two lines explain each other.
+                _fallback = (float(_cfg.ptp_start), float(_cfg.ptp_end))
+                _bits = []
+                for k, v in sorted(_ptp_ms.items()):
+                    _bits.append(
+                        f"{k} {v[0]:.1f}-{v[1]:.1f} ms"
+                        + (" (file-wide, not anchored)"
+                           if (round(v[0], 1), round(v[1], 1))
+                           == (round(_fallback[0], 1), round(_fallback[1], 1))
+                           else ""))
+                self.log("   Amplitude window per type: " + ", ".join(_bits))
         else:
+            # Say what it looked with, not only that it found nothing.
+            #
+            # "No onsets were pre-detected" names a symptom shared by every
+            # possible cause: a latency window that excludes the response, a
+            # delay applied here but not by the run (or the reverse), an
+            # amplitude gate above the response, a profile that never reached
+            # this channel. Distinguishing them meant reading waveforms. The
+            # settings actually used are the shortest route to the answer, and
+            # the run prints the same three, so the two logs can be compared
+            # line for line.
             self.log("   ⚠️  No onsets were pre-detected — the Inspector will "
                      "detect each trial on its own, which may not match the "
                      "run.")
+            try:
+                _lat = _cfg.latency_map or {}
+                _dly = payload.get("delay_map") or {}
+                for _st in sorted((payload.get("segments") or {})):
+                    _w = _lat.get(_st)
+                    self.log(
+                        f"      {_st}: latency window "
+                        + (f"{_w[0]:.0f}-{_w[1]:.0f} ms" if _w
+                           else "NOT SET (falls back to the amplitude window)")
+                        + f", delay {float(_dly.get(_st, 0.0)):+.1f} ms"
+                        + f", min amplitude {float(_cfg.min_peak_amplitude):.3f} mV")
+                self.log("      Compare these with the run's — a difference "
+                         "here is why the preview and the analysis disagree.")
+            except Exception:               # noqa: BLE001 — diagnostics only
+                pass
 
         self.log("   ℹ️  Outlier decisions do not exist yet — every chosen "
                  "trial is shown. Markers are fixed and nothing is saved.")

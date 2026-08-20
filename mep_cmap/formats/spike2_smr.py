@@ -407,6 +407,36 @@ def _pick_signal(seg, analogue_names, file_path, channel_idx):
     return sig
 
 
+def _raw_channel_unit(file_path: str, channel_idx: int):
+    """The unit string as the FILE wrote it, or None.
+
+    Neo builds its AnalogSignals through `quantities`, which parses the unit
+    text and substitutes 'dimensionless' for anything it does not recognise --
+    printing 'Units "Nm" can not be converted to a quantity' as it goes. A
+    torque channel therefore arrived here already stripped of its unit, and
+    channels.tsv recorded it as dimensionless.
+
+    The raw header keeps the original string, so it is read from there. The
+    unit is carried as a LABEL and never parsed: this tool does no unit
+    arithmetic, and a units library is precisely what lost 'Nm' in the first
+    place. Whitespace is trimmed because the header pads some entries (' Volt'),
+    and nothing else is normalised -- 'Volt' stays 'Volt'.
+
+    Returns None on any failure, leaving the caller's existing path in place.
+    """
+    try:
+        import neo
+        raw = neo.rawio.Spike2RawIO(filename=file_path)
+        raw.parse_header()
+        chans = raw.header["signal_channels"]
+        if channel_idx is None or not (0 <= int(channel_idx) < len(chans)):
+            return None
+        txt = str(chans[int(channel_idx)]["units"]).strip()
+        return txt or None
+    except Exception:                       # noqa: BLE001 — fall back below
+        return None
+
+
 def extract_emg_waveform_and_fs(file_path: str, channel_idx: int = 0) -> tuple:
     """The whole recording, across every sampling block.
 
@@ -422,12 +452,13 @@ def extract_emg_waveform_and_fs(file_path: str, channel_idx: int = 0) -> tuple:
 
     first = _pick_signal(usable[0], analogue_names, file_path, channel_idx)
     fs = int(round(float(first.sampling_rate.rescale("Hz").magnitude)))
-    unit = None
-    try:
-        u = str(first.units.dimensionality).strip().split()
-        unit = u[-1] if u else None
-    except Exception:
-        pass
+    unit = _raw_channel_unit(file_path, channel_idx)
+    if unit is None:
+        try:
+            u = str(first.units.dimensionality).strip().split()
+            unit = u[-1] if u else None
+        except Exception:
+            pass
 
     if len(usable) == 1:
         return np.asarray(first).flatten().astype(float), fs, unit

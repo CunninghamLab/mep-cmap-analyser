@@ -247,6 +247,28 @@
         "TMS"
       ],
       "group": "device",
+      "level": "optional",
+      "type": "string",
+      "units": null,
+      "enum": [
+        "cl",
+        "co",
+        "cl-co",
+        "co-cl",
+        "other"
+      ],
+      "advanced": false,
+      "description": "Direction of current flow in the coil winding, from the closed vocabulary in NIBS-BIDS v6.3. Read in a fixed viewing frame: hold the coil with its stimulating face away from you and the handle pointing away, then report the flow in each wing as seen from the top face. 'cl' and 'co' describe a circular coil, clockwise and counterclockwise; 'cl-co' and 'co-cl' describe a figure-of-eight, naming the left wing then the right. Leave blank unless you know it — for the PA/AP convention reported in most TMS work, use InducedCurrentDirection.",
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "current_direction"
+    },
+    {
+      "key": "InducedCurrentDirection",
+      "modalities": [
+        "TMS"
+      ],
+      "group": "targeting",
       "level": "recommended",
       "type": "string",
       "units": null,
@@ -258,10 +280,10 @@
         "other"
       ],
       "advanced": false,
-      "description": "Direction of the induced current in the cortex relative to the central sulcus (posterior-anterior, etc.).",
+      "description": "Direction of the current induced in the brain, the convention normally reported in TMS work. This is a consequence of coil geometry, handle orientation and winding direction rather than an independent setting, so v6.3 has no column for it: it is written into the placement description in *_markers.tsv. Not the same as CurrentDirection, which is the current in the coil winding.",
       "scope": "parameter_set",
-      "block": "nibs.tsv",
-      "emits": "current_direction"
+      "block": "markers.tsv",
+      "emits": "position_description"
     },
     {
       "key": "PulseConfiguration",
@@ -339,9 +361,9 @@
         "V"
       ],
       "advanced": false,
-      "description": "Units of the delivered amplitude in StimulationIntensity. This is the unit only: what the intensity was dosed against goes in IntensityReference, and the multiplier in IntensityScaling. So 120% of a resting motor threshold of 50 %MSO is recorded as intensity 60, units %MSO, reference rMT, scaling 1.2.",
+      "description": "Units of the delivered amplitude in StimulationIntensity. Declared in *_nibs.json against the stimulus_intensity column, never written as a column of its own: the spec states units in the sidecar so a number in the table is never ambiguous. What the intensity was dosed against goes in IntensityReference, and the multiplier in IntensityScaling.",
       "scope": "parameter_set",
-      "block": "nibs.tsv",
+      "block": "",
       "emits": ""
     },
     {

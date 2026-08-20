@@ -18,6 +18,7 @@ process and avoids re-decoding the same file for every window that wants it.
 from __future__ import annotations
 
 import os
+import sys
 
 #: Kept alive: Tk does not hold a strong reference to a PhotoImage, and an
 #: image that is garbage collected leaves the widget blank with no error.
@@ -27,7 +28,23 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def asset_path(name: str) -> str:
-    """Absolute path to a bundled asset, whether installed or frozen."""
+    """Absolute path to a bundled asset, whether installed or frozen.
+
+    __file__ is not enough on its own. In a PyInstaller build this module is
+    imported from the archive, so its __file__ points inside that archive while
+    the PNGs are unpacked under sys._MEIPASS -- the path exists as a string,
+    os.path.isfile says no, load_photo returns None, and the logo is silently
+    absent from the release build while working perfectly from source.
+
+    _MEIPASS is checked FIRST and only when set, matching bids_schema and
+    addons, which resolve the schema and the built-in add-ons the same way.
+    This module was the one that never got the same treatment.
+    """
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        frozen = os.path.join(meipass, "mep_cmap", "assets", name)
+        if os.path.isfile(frozen):
+            return frozen
     return os.path.join(_HERE, name)
 
 

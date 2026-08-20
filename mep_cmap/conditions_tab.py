@@ -1118,19 +1118,45 @@ class ConditionsTabMixin:
         # self.window_map alone reaches only the channel currently selected,
         # which is why an epoch set here appeared on one channel and not the
         # other. Each channel's book is written into that channel's snapshot.
+        # Every channel's book goes into that channel's SNAPSHOT, including the
+        # channel currently on screen.
+        #
+        # The current channel used to be special-cased: its epochs were merged
+        # into the live window_map while the others went into their snapshots.
+        # But _restore_chan_settings, called a few lines below to select the
+        # first analysed channel, loads that channel's snapshot over the live
+        # map -- so on the usual path, where the channel in the Conditions tab
+        # IS the first analysed one, the epochs were written to the live map and
+        # then immediately overwritten by a snapshot that never received them.
+        # Tab 1a fell back to the file-wide window and the analyst's epochs were
+        # silently gone. It appeared to work whenever those two channels
+        # happened to differ.
+        #
+        # One direction of travel now: conditions write snapshots,
+        # _restore_chan_settings loads the live map from a snapshot, and the
+        # special case is gone.
         _cur = getattr(self, "channel_idx", 0)
+        if _cur is not None and _cur not in self._chan_settings:
+            # A channel edited but never left has no snapshot yet, and writing
+            # epochs into a snapshot that does not exist would lose the rest of
+            # its setup when the restore reads it back.
+            try:
+                self._snapshot_chan_settings(_cur)
+            except Exception:               # noqa: BLE001 — best effort
+                pass
         for ch, book in (self._cond_epochs or {}).items():
             if not book:
                 continue
+            snap = self._chan_settings.setdefault(ch, {})
+            merged = dict(snap.get("window_map") or {})
+            merged.update(book)
+            snap["window_map"] = merged
             if ch == _cur:
-                merged = dict(getattr(self, "window_map", None) or {})
-                merged.update(book)
-                self.window_map = merged
-            else:
-                snap = self._chan_settings.setdefault(ch, {})
-                merged = dict(snap.get("window_map") or {})
-                merged.update(book)
-                snap["window_map"] = merged
+                # The live map too, so the table is right even if nothing
+                # restores before it is drawn.
+                _live = dict(getattr(self, "window_map", None) or {})
+                _live.update(book)
+                self.window_map = _live
             self.log(f"   Epochs for channel {ch + 1}: "
                      + ", ".join(f"{k} {p if p is not None else 'default'}"
                                  f"/{q if q is not None else 'default'} ms"

@@ -1,0 +1,74 @@
+Correct the analysis window on per-type epochs, and say what is measured
+
+Since epoch windows became per stimulus type, five places in the analysis were
+handed the file-wide window while working on a segment cut to a type's own.
+Where a condition used a different epoch from the file-wide setting -- which is
+what applying conditions does -- this displaced the peak-to-peak markers, the
+MEP offset and duration, the onset search, the onset-agreement columns, and the
+cSP auto-detect branch.
+
+Latency was computed from a different quantity and stayed correct throughout,
+which is what made this hard to see: a results file carried plausible latencies
+beside amplitudes measured over the wrong interval. On one recording the peak
+markers landed 80 ms early, in the pre-stimulus baseline, and peak-to-peak came
+out at -0.01 mV -- a value that cannot exist, written to trials.csv without
+complaint and carried into z-scores and normalisation.
+
+Studies whose stimulus types all share one epoch are NOT affected: the two
+windows were the same number, so every call site was already passing the right
+one. A study with a per-condition or per-type epoch should be reprocessed.
+
+All five now resolve the type's own window. A test walks the module and fails
+if a sixth appears, because five were found one at a time by chasing symptoms
+rather than the pattern.
+
+Landmarks no longer outlive the geometry that placed them. A peak, onset or
+offset marker is a position in a segment, and applying a 17.5 ms event delay
+cuts the epoch 35 samples later -- the response moves while the stored index
+does not. The existing screen caught an index that no longer FITS; it did not
+catch one that still fits and no longer points at the same thing, which is the
+commoner case. Each segment now records the delay, epoch and amplitude window
+that positioned its landmarks, and re-detects when any of them changes.
+
+Reporting, throughout:
+
+  - a non-detection caused by the minimum-amplitude gate names the measured
+    amplitude, the threshold, the setting and where to change it, instead of
+    "not detected" -- which is also what a wrong latency window says
+  - the preview reports detected onsets as a fraction and counts hand-placed
+    ones separately, so a lower count than the results file is legible rather
+    than alarming
+  - an amplitude window that is the file-wide fallback rather than anchored to
+    a median onset says which it is; the two print identically otherwise
+  - a negative peak-to-peak is reported as markers the wrong way round
+  - a value outside a closed NIBS-BIDS vocabulary is named at conversion,
+    reported rather than corrected: PA is not translatable to a coil winding
+    direction, and guessing would invent a measurement
+  - when detection finds nothing at all, the preview prints the latency window,
+    delay and amplitude gate it used, so it can be compared with the run's
+
+Also:
+
+  - the TMSMultiLab mark appears in compiled builds again. The asset resolver
+    worked from __file__ alone, which points inside the PyInstaller archive
+    while the PNGs are unpacked under sys._MEIPASS -- so the path existed as a
+    string, isfile() said no, and the image was silently omitted. bids_schema
+    and addons already resolved their bundled files this way; this module never
+    got the same treatment. The mark is also redrawn from a high-resolution
+    original, with alpha preserved so it composites on any background.
+  - a Spike2 channel unit the quantities library cannot parse -- Nm on a torque
+    channel -- is read from the raw header instead of arriving as
+    'dimensionless'. Carried as a label and never parsed: a units library is
+    what lost it.
+  - the stimulation description is written as *_nibs.tsv, not a per-modality
+    filename. The spec uses *_nibs throughout and carries the modality in the
+    nibs_type column; a validator looks for *_nibs.tsv and would not find the
+    description at all.
+  - CurrentDirection takes the v6.3 coil-winding vocabulary, and a new
+    InducedCurrentDirection holds the PA/AP convention TMS work reports,
+    written into the placement description where it belongs.
+  - StimulationIntensityUnits is a sidecar declaration again rather than a
+    column, and two device entries differing only by case are reported instead
+    of silently becoming two devices.
+
+Tests: 1649 -> 1785.

@@ -650,10 +650,20 @@ def test_confirming_writes_every_channels_epochs():
 
 def test_the_hand_off_merges_rather_than_replaces():
     """A window set on the labels tab for a stimulus type this table did not
-    give one to is still the analyst's setting."""
+    give one to is still the analyst's setting.
+
+    Counted occurrences of the merge before, one per branch, when the current
+    channel was special-cased. That special case was the bug -- its epochs went
+    to the live map and were then overwritten by a snapshot restore -- so there
+    is one branch now, writing the snapshot for every channel and the live map
+    as well. The rule tested is that neither destination is REPLACED.
+    """
     body = _method("_cond_apply")
-    assert body.count("merged.update(book)") == 2, \
-        "both the current channel and the others must merge, not overwrite"
+    assert "merged.update(book)" in body, "snapshots must merge, not overwrite"
+    assert "_live.update(book)" in body, "the live map must merge, not overwrite"
+    # A bare assignment of either from `book` alone would discard the rest.
+    assert "= dict(book)" not in body
+    assert "window_map = book" not in body
 
 
 def test_setting_an_epoch_is_undoable():

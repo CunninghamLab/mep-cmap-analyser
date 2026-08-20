@@ -65,6 +65,52 @@ program that wrote it. Every event must belong to a condition or be explicitly
 excluded, and an excluded trial is written as `n/a` rather than dropped, so the
 file accounts for every event in the recording.
 
+Conditions are carried into BIDS-ify, so a grouping made here describes the
+converted recording too, and survives being written out and read back in.
+
+### Stimulation described per protocol (NIBS-BIDS v6.3)
+
+A recording can contain more than one kind of stimulation. A peripheral M-wave
+on one stim code and a TMS MEP on another are two protocols, two intensities,
+often two stimulators, and BIDS-ify had one intensity box and one modality for
+the whole file — so it could describe neither.
+
+Stimulation is now defined as a **parameter set**: named once per session, with
+its own type (TMS, tES, TUS, or PNS), intensity, waveform and timing, and
+optionally its own stimulator, coil or measured threshold where that protocol
+differs from the session default. Each stim code in a recording then points at
+one. Written once, referenced many times, which is also what stops a threshold
+being retyped for every file and corrected in only some of them.
+
+`PNS` matters here in particular: M-waves, H-reflexes and CMAPs are peripheral,
+and before v6.3 of the proposal they had to be misdescribed as TMS, tES or TUS.
+
+Dosing keeps its derivation. 120% of a resting motor threshold of 50 %MSO is
+recorded as an intensity of 60 in %MSO, a reference of `rMT`, and a scaling of
+1.2, with the measured threshold stated once in its own block. Encoding the
+reference into the unit — the old `%RMT` — lost both the threshold and the
+factor, leaving a number that cannot be compared with anyone else's.
+
+Conversion writes the four-file structure the proposal defines: `*_nibs.tsv`
+with one row per parameter set, `*_nibs.json` with the devices, the dosing
+references, and a definition and unit for every column, `*_markers.tsv` with one
+row per placement, and an `*_events.tsv` in which every delivery names the
+protocol it was and where it was applied. Units are always declared rather than
+inferred: 58 could be percent of maximum stimulator output or milliamps.
+
+Where a condition changes the stimulus rather than only the meaning of a trial —
+half of a code at 100 mA and half at 150 mA, or a recruitment curve — each part
+takes its own parameter set and becomes its own row, which a per-code assignment
+could not express. A file is not offered for conversion until every ticked code,
+and every half of a split one, has been assigned.
+
+A converted file can be re-opened and rewritten. Correcting an intensity or a
+mis-assigned code no longer means starting again, and the existing output is
+overwritten in place rather than deleted first.
+
+Studies that do not use parameter sets still convert exactly as before, writing
+the flat sidecar rather than an empty table.
+
 ### Channel assignment for every format
 
 The channel and event-marker dialogue used to run for Spike2 text exports
@@ -398,6 +444,34 @@ selections are reported as they are rather than collapsed to their outer bounds.
 - The **sampling rate and amplitude unit** are reported when a file is opened.
   Both were read automatically but neither was shown until the analysis ran, so
   opening a file gave no way to confirm what had been detected.
+- **A missing latency profile is reported rather than invented.** Onset detection
+  fell back to a hardcoded 10–50 ms, and every detector bounds its result by the
+  minimum, so a stimulus type with no profile returned exactly 10.00 ms on every
+  trial with a between-trial SD of zero — a window edge reported as a
+  physiological latency. Both the analysis and the Inspector now bound onsets by
+  the amplitude window and say so. The maps are per channel, so this was reached
+  most easily by previewing a channel that had never been set up.
+- **The read-back check no longer fails correct conversions.** EDF stores
+  integers, so the written RMS moves by less than one quantisation step; the
+  tolerance is now that bound rather than a fixed percentage. It reported a
+  mismatch most readily on a channel carrying a stimulus artefact, where the step
+  is coarse relative to the EMG being measured.
+- **BIDS-ify no longer offers its own output back as input.** Conversion writes
+  into the folder being scanned, so the worklist grew by one file after every
+  conversion and the duplicates reached the analysis queue as extra recordings
+  for the same participant.
+- **The participant entered in Study Metadata is used.** A recording whose
+  filename carries no `sub-` was converted to `sub-unknown`, contradicting what
+  had been typed and the folder its derivatives were already in.
+- **Reset & reprocess from scratch** now deletes the session it means to. It was
+  removing the pre-derivatives filename, which nothing has written since sessions
+  moved, so inspector edits, PTP markers, silent-period boundaries and exclusions
+  all survived a reset that reported success.
+- **Horizontal scrollbars work** in the Second Level table and the BIDS-ify
+  worklist, with Shift+wheel. Columns were stretched to fill the width, so there
+  was never anything to scroll to.
+- **Second Level follows the derivatives folder** chosen in Setup instead of
+  reading it once, before one had been chosen.
 - The **filter preview** accepts every format the readers handle. It carried its
   own list of extensions that had not been updated when EDF, BrainVision, MATLAB,
   AcqKnowledge and CSV support was added, so a `.mat` file silently failed to load
@@ -1032,7 +1106,15 @@ Add-ons can declare their own settings, which render as controls in the add-on's
 
 ### BIDS-ify
 
-The **Setup → BIDS-ify** tab converts non-BIDS recordings into a BIDS-compliant `rawdata/` layout. Shared stimulation metadata (following the NIBS BEP037 proposal) is edited once and applied to every file, with per-file overrides where needed. Files are reviewed, accepted, and converted from a persistent, status-coloured worklist, so a whole study can be brought into BIDS in one pass.
+The **Setup → BIDS-ify** tab converts non-BIDS recordings into a BIDS-compliant `rawdata/` layout, and describes the stimulation that produced them following the NIBS-BIDS proposal (BEP037, v6.3).
+
+Stimulation is described **per protocol, not per file**. You define a stimulation parameter set once per session — its type (TMS, tES, TUS or PNS), intensity, dosing reference and scaling, and optionally its own stimulator, coil or measured threshold where that protocol differs — and then say which stim code in each recording used it. A recording containing a peripheral M-wave on one code and a TMS MEP on another is therefore described properly, with two rows and two devices, rather than being forced onto a single intensity and a single modality.
+
+Dosing keeps its derivation: 120% of a resting motor threshold of 50 %MSO is recorded as an intensity of 60 in %MSO, a reference of `rMT` and a scaling of 1.2, with the measured threshold stated once. The delivered dose and how it was arrived at both survive, which is what makes intensities comparable across sites.
+
+Conversion writes the four-file v6.3 structure alongside the recording: `*_nibs.tsv` with one row per parameter set, `*_nibs.json` holding the devices, dosing references and column definitions with their units, `*_markers.tsv` with one row per placement, and an `*_events.tsv` whose every delivery names the protocol it was and where it was applied.
+
+Conditions assigned in the **Conditions** tab are carried through. Where a condition changes the stimulus rather than only the meaning of a trial — half of a code at 100 mA and half at 150 mA, or a recruitment curve — each part takes its own parameter set and becomes its own row. Files are reviewed, accepted and converted from a persistent, status-coloured worklist, and a converted file can be re-opened and rewritten if something needs correcting.
 
 ### Session Persistence and Reproducibility
 

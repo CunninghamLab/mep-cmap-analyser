@@ -120,7 +120,6 @@ class ConditionsTabMixin:
         self._cond_selected_rows = () # table rows currently shown
         self._cond_source_path = None # the recording the table was built from
         self._cond_confirmed_path = None  # the recording last confirmed here
-        self._cond_confirming = False # set while handing over to the labels tab
         self._cond_chan_idx = None    # channel the review pane is drawing
         self._cond_clamped = None     # epoch bounds, when the file is stitched
         # {channel_idx: {group_key: (pre_ms, post_ms)}}.
@@ -144,7 +143,9 @@ class ConditionsTabMixin:
         tk.Label(head, text="Conditions",
                  font=("TkDefaultFont", 11, "bold")).pack(side="left")
         attach_info_icon(head, HELP["apply"]).pack(side="left", padx=(4, 0))
-        self._cond_status = tk.Label(head, text="No recording loaded.", fg="#888")
+        self._cond_status = tk.Label(
+            head, text="No recording loaded — open one from Setup ▸ Dataset.",
+            fg="#888")
         self._cond_status.pack(side="left", padx=(12, 0))
         tk.Button(head, text="⟳ Reload from file",
                   command=self._cond_reload).pack(side="right")
@@ -305,10 +306,25 @@ class ConditionsTabMixin:
             foot, variable=self._cond_allow_unassigned,
             text="Exclude any trial left out of every condition",
             command=self._cond_refresh_status).pack(side="left")
+        # Two destinations, one commit.
+        #
+        # The work behind these buttons is substantial -- validation, the
+        # per-channel epoch check, writing the events, merging the window maps
+        # -- and duplicating it would be two callers of one rule, which is how
+        # a rule ends up enforced in one place and quietly skipped in the
+        # other. _cond_apply takes a destination; these only choose it.
+        #
+        # First Level keeps the accent because it is the ordinary route: most
+        # analysts never BIDS-ify at all, and a plain second button reads as
+        # the option it is rather than as an equal fork.
         self._cond_apply_btn = tk.Button(
-            foot, text="✔  Confirm events & continue",
-            command=self._cond_apply)
+            foot, text="✔  Confirm & continue to First Level",
+            command=lambda: self._cond_apply(destination="first_level"))
         self._cond_apply_btn.pack(side="right")
+        self._cond_apply_bids_btn = tk.Button(
+            foot, text="Confirm & continue to BIDS-ify",
+            command=lambda: self._cond_apply(destination="bidsify"))
+        self._cond_apply_bids_btn.pack(side="right", padx=(0, 6))
         # Why Confirm is unavailable, beside Confirm.
         #
         # It shared the review pane's label, which the drawing code rewrites on
@@ -334,6 +350,32 @@ class ConditionsTabMixin:
             return
         if self._cond_rows and getattr(self, "_cond_source_path", None) == path:
             return
+        # A session carries its conditions. Rebuilding from the file would
+        # discard them the moment the tab was opened, which is what made them
+        # look as though they had never been saved.
+        if self._cond_rows and getattr(self, "_cond_source_path", None) is None:
+            self._cond_source_path = path
+            try:
+                self._cond_stim_times = {}
+                _ev, _w = self._configured_events(path)
+                from .pipeline import crop_stim_times
+                _p = self._snapshot_analysis_params()
+                self._cond_stim_times = crop_stim_times(
+                    _ev, _p.get("crop_ranges"), _p.get("crop_start"),
+                    _p.get("crop_end"))
+            except Exception:
+                pass
+            self._cond_refresh_channel_picker()
+            self._cond_refresh_table()
+            # Say which recording these belong to. Restoring the rows without
+            # touching the header left "No recording loaded" above a table
+            # full of conditions, which contradicts itself and reads as the
+            # restore having half worked.
+            self._cond_status.config(
+                text=(os.path.basename(path) + "  \u2014  conditions restored "
+                      "from the session"), fg="#555")
+            self.log("🏷  Conditions restored from the session")
+            return
         self._cond_source_path = path
         self._cond_reload()
 
@@ -347,7 +389,9 @@ class ConditionsTabMixin:
         path = (self.file_path.get() if hasattr(self, "file_path")
                 else "") or ""
         if not path or not os.path.isfile(path):
-            self._cond_status.config(text="No recording loaded.", fg="#888")
+            self._cond_status.config(
+                text="No recording loaded — open one from Setup ▸ Dataset.",
+                fg="#888")
             self._cond_rows, self._cond_stim_times = [], {}
             self._cond_refresh_table()
             return
@@ -388,7 +432,31 @@ class ConditionsTabMixin:
         self._cond_source_path = path
         self._cond_stim_times = {k: list(v) for k, v in events.items()}
         self._cond_refresh_channel_picker()
-        self._cond_rows = C.rows_from_events(self._cond_stim_times)
+        # A converted recording carries its grouping in its own events file.
+        #
+        # Rebuilding from stim types alone threw it away: the conditions were
+        # written into *_events.tsv at conversion and sitting there on reopen,
+        # and the table came back as if the recording had never been grouped.
+        # Falls through to the plain one-row-per-stim-type table when the file
+        # says nothing, which is every unconverted recording.
+        self._cond_rows = []
+        try:
+            from .formats.edf import read_events_rows
+            from . import events_model as _em
+            _side = events_tsv_path(path)
+            if os.path.isfile(_side):
+                self._cond_rows = _em.rows_from_events(read_events_rows(_side))
+                if self._cond_rows:
+                    self.log(f"🏷  Conditions restored from "
+                             f"{os.path.basename(_side)}: "
+                             + ", ".join(f"{r.stim_type}/{r.condition}"
+                                         for r in self._cond_rows))
+        except Exception as exc:            # noqa: BLE001 — fall back below
+            self.log(f"   ⚠️  Could not read conditions from the events file: "
+                     f"{exc}")
+            self._cond_rows = []
+        if not self._cond_rows:
+            self._cond_rows = C.rows_from_events(self._cond_stim_times)
         # Undoing past a reload would restore rows belonging to a recording
         # that is no longer open.
         self._cond_undo_stack.clear()
@@ -550,10 +618,22 @@ class ConditionsTabMixin:
         self._cond_refresh_history_buttons()
         self._cond_refresh_status()
 
+    def _cond_apply_state(self, state: str):
+        """Both Confirm buttons together.
+
+        They commit the same work and differ only in where they land, so one
+        being available while the other is not would mean an invalid table
+        could still be committed by choosing the other destination.
+        """
+        for _name in ("_cond_apply_btn", "_cond_apply_bids_btn"):
+            _btn = getattr(self, _name, None)
+            if _btn is not None:
+                _btn.config(state=state)
+
     def _cond_refresh_status(self):
         """Say whether the table can be applied, and why not when it cannot."""
         if not self._cond_rows:
-            self._cond_apply_btn.config(state="disabled")
+            self._cond_apply_state("disabled")
             self._cond_block.config(text="No conditions to apply.",
                                     fg="#B03A2E")
             return
@@ -562,9 +642,9 @@ class ConditionsTabMixin:
                        allow_unassigned=bool(self._cond_allow_unassigned.get()))
         except C.ConditionError as exc:
             self._cond_block.config(text=str(exc))
-            self._cond_apply_btn.config(state="disabled")
+            self._cond_apply_state("disabled")
             return
-        self._cond_apply_btn.config(state="normal")
+        self._cond_apply_state("normal")
         n = sum(r.n for r in self._cond_rows if not r.excluded)
         self._cond_block.config(
             text=f"{len(self._cond_rows)} condition(s), {n} trial(s) — ready",
@@ -979,7 +1059,7 @@ class ConditionsTabMixin:
 
     # ── apply ────────────────────────────────────────────────────────────────
 
-    def _cond_apply(self):
+    def _cond_apply(self, destination: str = "first_level"):
         """Validate, write the events file, and hand the groups to the analysis."""
         try:
             rows = C.validate(
@@ -989,6 +1069,28 @@ class ConditionsTabMixin:
             messagebox.showwarning("Conditions", str(exc), parent=self.root)
             return
         self._cond_rows = rows
+        self._cond_visited_chans = set()
+
+        # With the epoch applying to one channel at a time, every analysed
+        # channel needs visiting before the setup table is built: an epoch set
+        # on EMG 1 alone leaves EMG 2 on the file-wide window, and the analyst
+        # would not find that out until the results disagreed.
+        if not self._cond_epoch_all_chans.get():
+            _chans = [i for i, _n in self._cond_channel_names()]
+            _seen = getattr(self, "_cond_visited_chans", None) or set()
+            _seen.add(self._cond_selected_channel_idx())
+            self._cond_visited_chans = _seen
+            _left = [c for c in _chans if c not in _seen]
+            if _left:
+                _names = dict(self._cond_channel_names())
+                self._cond_chan.set(_names.get(_left[0], ""))
+                self._cond_channel_changed()
+                self._cond_block.config(
+                    text=(f"{len(_left)} channel(s) still to review — now "
+                          f"showing {_names.get(_left[0], '')}"), fg="#B03A2E")
+                self.log(f"   Epochs are per channel: {len(_left)} channel(s) "
+                         f"still to review.")
+                return
 
         event_rows = C.to_event_rows(rows, self._cond_stim_times)
         groups, decoded = C.group_events(event_rows)
@@ -1039,18 +1141,92 @@ class ConditionsTabMixin:
                  + ", ".join(f"{k} ({len(v)})" for k, v in sorted(groups.items())))
         if written:
             self.log(f"   → {os.path.basename(written)}")
+
+        # Persist the conditions, not just apply them.
+        #
+        # They lived on the app until the session happened to be saved, so
+        # anything reading them from disk -- BIDS-ify, a later run, this file
+        # reopened tomorrow -- found the table empty and silently described the
+        # recording as ungrouped. Confirming is the moment the analyst has
+        # decided, so it is the moment worth writing.
+        try:
+            self._autosave_session()
+        except Exception as exc:                      # noqa: BLE001 — reported
+            self.log(f"   ⚠️  Conditions applied but the session could not be "
+                     f"saved: {exc}")
         self._cond_refresh_status()
-        # Rebuild the labels tab from the conditions and go there. The flag
-        # tells _build_labels_tab that this is the onward step rather than a
-        # fresh file arriving, which would otherwise send the analyst back here.
-        self._cond_confirming = True
+        # Select the first analysed channel BEFORE the table is built.
+        #
+        # It was selected afterwards, so the table was built for whichever
+        # channel happened to be current and then rebuilt again by the switch
+        # -- and the switch was skipped when the index already matched, which
+        # left the table showing the wrong channel with no way to notice. The
+        # setup starts at the first selected channel and the advance walks
+        # forward from there; starting anywhere else means the advance has
+        # nothing to advance to.
+        try:
+            _chans = self._analysis_channel_indices()
+            if _chans:
+                self._chan_confirmed = set()
+                _cnames = (list(self.channel_dd["values"])
+                           if hasattr(self, "channel_dd") else [])
+                _first = _chans[0]
+                self.channel_idx = _first
+                if _first < len(_cnames):
+                    self.channel_var.set(_cnames[_first])
+                try:
+                    self._restore_chan_settings(_first)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Rebuild the labels tab from the conditions, then go where asked.
+        #
+        # The navigation is done HERE rather than inside _build_labels_tab.
+        # That method runs on every rebuild -- opening a file, switching
+        # channel, confirming a channel -- so navigating from it sent all of
+        # those somewhere unexpected. Each caller now says where it wants to
+        # end up, and this one wants wherever the analyst asked for.
+        #
+        # The rebuild happens either way. Conditions change the per-type
+        # windows the labels tab is built from, so skipping it on the way to
+        # BIDS-ify would leave 1a describing the previous grouping until
+        # something else happened to rebuild it.
         try:
             self._build_labels_tab(sorted(groups))
             self.log("   Tab 1a rebuilt from the conditions.")
         except Exception as exc:                      # noqa: BLE001 — reported
             self.log(f"   ⚠️  Could not rebuild the labels tab: {exc}")
-        finally:
-            self._cond_confirming = False
+            return
+
+        if destination == "bidsify":
+            try:
+                self.root.update_idletasks()
+                self.notebook.select(self.setup_outer)
+                self.nb_setup.select(self.tab_bidsify)
+                self._bidsify_tab_refresh()
+                # Select the recording just conditioned. Landing on a list of
+                # fifteen rows and having to find it again loses the connection
+                # between what was just done and what to do next. After the
+                # refresh, because that rebuilds the rows.
+                try:
+                    self._bidsify_select_source(path)
+                except Exception:                     # noqa: BLE001 — cosmetic
+                    pass
+                self.log("   → BIDS-ify. The conditions are written into the "
+                         "events file when this recording is converted.")
+            except Exception as exc:                  # noqa: BLE001 — reported
+                self.log(f"   ⚠️  Could not open BIDS-ify: {exc}")
+            return
+
+        try:
+            self.root.update_idletasks()
+            self.notebook.select(self.stage1_outer)
+            # tab1b_frame is, confusingly, the 1a tab.
+            self.nb_stage1.select(self.tab1b_frame)
+        except Exception:
+            pass
 
 
 # ── writing ──────────────────────────────────────────────────────────────────
@@ -1082,13 +1258,47 @@ def write_events_tsv_beside(recording_path: str, event_rows) -> str:
     import json
 
     path = events_tsv_path(recording_path)
-    cols = ("onset", "duration", "trial_type", "condition")
+    cols = ["onset", "duration", "trial_type", "condition"]
+
+    # Columns this writer does not own are carried through, not overwritten.
+    #
+    # For a CONVERTED recording the "beside the recording" path IS the BIDS
+    # events file: sub-X/ses-Y/emg/..._emg.edf sits next to ..._events.tsv,
+    # which BIDS-ify wrote with nibs_event_id and nibs_position_id linking each
+    # delivery to the stimulation description. Rewriting the file with only
+    # these four columns silently deleted those links, leaving *_nibs.tsv
+    # describing protocols nothing referenced.
+    #
+    # Matched by onset, which is the one field both writers agree on and which
+    # identifies a delivery.
+    extra_by_onset, extra_cols = {}, []
+    try:
+        from .formats.edf import read_events_rows
+        for _old in read_events_rows(path):
+            _extras = {k: v for k, v in _old.items() if k not in cols}
+            if not _extras:
+                continue
+            extra_by_onset[round(float(_old["onset"]), 6)] = _extras
+            for k in _extras:
+                if k not in extra_cols:
+                    extra_cols.append(k)
+    except Exception:               # noqa: BLE001 — no file, or unreadable
+        extra_by_onset, extra_cols = {}, []
+
     with open(path, "w", encoding="utf-8", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=cols, delimiter="\t",
+        w = csv.DictWriter(fh, fieldnames=cols + extra_cols, delimiter="\t",
                            extrasaction="ignore")
         w.writeheader()
         for row in event_rows:
-            w.writerow({k: row.get(k, C.NA) for k in cols})
+            out = {k: row.get(k, C.NA) for k in cols}
+            if extra_cols:
+                try:
+                    _kept = extra_by_onset.get(round(float(row.get("onset")), 6), {})
+                except (TypeError, ValueError):
+                    _kept = {}
+                for k in extra_cols:
+                    out[k] = _kept.get(k, C.NA)
+            w.writerow(out)
 
     side = os.path.splitext(path)[0] + ".json"
     with open(side, "w", encoding="utf-8") as fh:

@@ -76,7 +76,24 @@ class SchemaField:
     units:       Optional[str] = None
     enum:        Optional[tuple] = None
     advanced:    bool = False
-    scope:       str = "session"   # 'session' (shared default) | 'file' (per-recording)
+    scope:       str = "session"   # 'session' | 'file' | 'parameter_set'
+    #: Where this field serialises in the NIBS-BIDS v6.3 output. One of the
+    #: JSON blocks ('StimulatorSet', 'ElementSet', 'IntensitySet'), one of the
+    #: tabular files ('nibs.tsv', 'markers.tsv', 'events.tsv'), or '' for a
+    #: top-level key of *_nibs.json.
+    #:
+    #: Held as data rather than as a mapping in the writer because the writer
+    #: would then be a second list of every field, maintained by hand, and the
+    #: two would drift the first time a field was added to one of them. The
+    #: schema already says what each field IS; this says where it GOES.
+    block:       str = ""
+    #: The NIBS-BIDS v6.3 name this value is written under, or "" for the key
+    #: itself. Kept separate from `key` deliberately: BEP037 has renamed fields
+    #: twice already, and renaming `key` to match would invalidate every saved
+    #: bidsify_state.json. A spec rename is an `emits` change and nothing else.
+    emits:       str = ""
+    #: Read from older saved state, never written. Superseded by a v6.3 field.
+    legacy:      bool = False
     description: str = ""
 
     def applies_to(self, modality: Optional[str]) -> bool:
@@ -164,6 +181,9 @@ class NibsSchema:
             enum=enum,
             advanced=bool(raw.get("advanced", False)),
             scope=raw.get("scope", "session"),
+            block=raw.get("block", ""),
+            emits=raw.get("emits", ""),
+            legacy=bool(raw.get("legacy", False)),
             description=raw.get("description", ""),
         )
 
@@ -181,22 +201,35 @@ class NibsSchema:
                    group:    Optional[str] = None,
                    level:    Optional[str] = None,
                    scope:    Optional[str] = None,
-                   include_advanced: bool = True) -> list:
+                   block:    Optional[str] = None,
+                   include_advanced: bool = True,
+                   include_legacy: bool = False) -> list:
         """
-        Return fields filtered by modality / group / level / scope, in schema
-        order. ``modality=None`` returns every modality's fields; otherwise common
-        fields plus those tagged for ``modality``. ``scope`` filters to
-        'session' or 'file' fields when given.
+        Return fields filtered by modality / group / level / scope / block, in
+        schema order. ``modality=None`` returns every modality's fields;
+        otherwise common fields plus those tagged for ``modality``. ``scope``
+        filters to 'session', 'file' or 'parameter_set' fields when given, and
+        ``block`` to the fields serialising into one JSON block or TSV file.
+
+        Legacy fields are excluded by default, which is what makes `legacy`
+        mean anything: they are read from state saved by an older version but
+        must not be offered in the dialogue, demanded by validation, or written
+        to a sidecar. They stay in ``_by_key``, so a saved value is still
+        recognised rather than reappearing as an unknown custom field.
         """
         out = []
         for f in self._fields:
             if not f.applies_to(modality):
+                continue
+            if not include_legacy and f.legacy:
                 continue
             if group is not None and f.group != group:
                 continue
             if level is not None and f.level != level:
                 continue
             if scope is not None and f.scope != scope:
+                continue
+            if block is not None and f.block != block:
                 continue
             if not include_advanced and f.advanced:
                 continue

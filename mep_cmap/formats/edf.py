@@ -109,6 +109,36 @@ def extract_emg_waveform_and_fs(file_path: str, channel_idx: int = 0):
     return sig, fs, unit
 
 
+def read_events_rows(path: str):
+    """Full rows from a sibling BIDS ``_events.tsv``, or [].
+
+    Everything the file says, not only onset and trial_type. The stim-time
+    reader below keeps just those two, which is all it needs, and that is what
+    lost the grouping on the way back in: a recording converted with its
+    conditions written into the events file was reopened as if it had never
+    been grouped, because the `condition` column was read and dropped.
+    """
+    if not os.path.isfile(path):
+        return []
+    out = []
+    try:
+        with open(path, encoding="utf-8", newline="") as fh:
+            reader = csv.DictReader(fh, delimiter="\t")
+            if not reader.fieldnames or "onset" not in reader.fieldnames:
+                return []
+            for row in reader:
+                try:
+                    row = {k: (v.strip() if isinstance(v, str) else v)
+                           for k, v in row.items() if k}
+                    row["onset"] = float(row["onset"])
+                except (TypeError, ValueError, KeyError):
+                    continue
+                out.append(row)
+    except OSError:
+        return []
+    return out
+
+
 def _read_events_tsv(path: str):
     """{trial_type: [onset_seconds, ...]} from a BIDS _events.tsv, or None."""
     if not os.path.isfile(path):

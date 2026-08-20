@@ -71,3 +71,4 @@ mep_cmap_io/target/
 dist/
 build/
 *.egg-info/
+*.json.bak 

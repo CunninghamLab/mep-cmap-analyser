@@ -110,6 +110,47 @@ def _under_sourcedata(file_path: str, scan_root: str) -> bool:
     return "sourcedata" in parts
 
 
+def session_path_for(source_path: str, metadata=None,
+                     derivatives_root: str = "") -> str:
+    """Where a recording's session JSON lives.
+
+        <derivatives_root>/derivatives/<sub>/<ses>/<bids_prefix>_session.json
+
+    falling back to the source file's own folder when no derivatives root is
+    configured.
+
+    Derivatives rather than beside the recording, because a session is
+    something the tool produced; raw data is what the amplifier and the
+    stimulator wrote and is better left as they wrote it. The autosave and Save
+    Session used to disagree about this -- one wrote a BIDS-named file under
+    derivatives, the other opened a dialogue beside the raw data -- so a
+    recording could carry two sessions that knew nothing of each other, and
+    whichever the analyst happened to pick on the way back in was the one that
+    won.
+
+    A FUNCTION OF ITS ARGUMENTS, not of the app. The app method reads the open
+    file's metadata off self, which answers only for the file currently loaded;
+    anything working over a list of recordings has none of them loaded. Two
+    builders would drift, and the one that drifted would delete or fail to find
+    files silently.
+    """
+    if not source_path:
+        return ""
+    bids_prefix = _make_bids_prefix(
+        metadata.bids_prefix() if metadata else "",
+        pathlib.Path(source_path).stem)
+    source_dir = os.path.dirname(source_path)
+    deriv_root = derivatives_root or source_dir
+    sub_ses = (metadata.sub_ses_path() if metadata
+               else os.path.join("sub-unknown", "ses-01"))
+    # Avoid derivatives/derivatives/ — same fix as in pipeline.py
+    if os.path.basename(os.path.normpath(deriv_root)).lower() == "derivatives":
+        save_dir = os.path.join(deriv_root, sub_ses)
+    else:
+        save_dir = os.path.join(deriv_root, "derivatives", sub_ses)
+    return os.path.join(save_dir, f"{bids_prefix}_session.json")
+
+
 def _make_bids_prefix(meta_prefix: str, file_stem: str) -> str:
     """Build a unique, clean BIDS prefix from metadata and source file stem.
 
@@ -1750,7 +1791,8 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
 
     # ──────────────────────────────────────────────────────────────
     def _open_inspector_preview(self, segments_dict, fs, pre_ms, post_ms, unit,
-                                label_map, color_map):
+                                label_map, color_map, metadata_dict=None,
+                                ptp_windows_by_type=None):
         """Open the Inspector read-only, before any analysis has run.
 
         A separate call site rather than a flag on _open_inspector_gui. That
@@ -1775,14 +1817,20 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
 
         inspector = DataInspectorWindow(
             self.root, segments_dict, time_axis,
-            metadata_dict       = {},
+            # Seeded with the analysis's own detections when the caller has
+            # them. Empty means the Inspector detects each trial itself, which
+            # is a different computation: anchoring needs the median onset of
+            # the whole sample, and one trial cannot supply it.
+            metadata_dict       = dict(metadata_dict or {}),
             label_map=label_map, color_map=color_map, emg_unit=unit,
             ptp_start_ms        = self.ptp_start.get(),
             ptp_end_ms          = self.ptp_end.get(),
-            # Anchored per-type windows are computed from a completed run, so
-            # a preview cannot have them; the file-wide pair is correct here
-            # and _preview_show says so in the log.
-            ptp_windows_by_type = None,
+            # The per-type amplitude window the caller derived, so preview
+            # measures the interval the run will measure. It was passed as
+            # None with a comment saying a preview could not have them --
+            # true only while the preview did not detect. Empty still falls
+            # back to the file-wide pair above.
+            ptp_windows_by_type = dict(ptp_windows_by_type or {}),
             analysis_pre_ms     = pre_ms,
             visible_pre_ms      = self._visible_pre_by_type(),
             extra_segs          = {},
@@ -2774,6 +2822,26 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             "label_map":        self.label_map,
             "color_map":        self.color_map,
             "window_map":       {k: list(v) for k, v in self.window_map.items()},
+
+            # Conditions. Held in three parts because they answer three
+            # questions: the events file rows say which trial belongs to which
+            # condition, the map says how a group key decomposes, and the table
+            # is what the Conditions tab redraws.
+            #
+            # None of them were saved, so reopening a session lost every
+            # condition assigned in it -- and silently, because the analysis
+            # still ran on the stimulus types underneath.
+            "condition_event_rows": list(self.condition_event_rows or []),
+            "condition_map":        {k: list(v) for k, v
+                                     in (self.condition_map or {}).items()},
+            "condition_rows":       [
+                {"stim_type": r.stim_type, "condition": r.condition,
+                 "trials": list(r.trials), "excluded": bool(r.excluded),
+                 "pre_ms": r.pre_ms, "post_ms": r.post_ms}
+                for r in (getattr(self, "_cond_rows", None) or [])],
+            "condition_epochs":     {
+                str(_c): {k: list(v) for k, v in (_b or {}).items()}
+                for _c, _b in (getattr(self, "_cond_epochs", None) or {}).items()},
             "gap_ms_map":       self.gap_ms_map,
             "reference_map":    self.reference_map,
             "reference_display": getattr(self, '_reference_display', {}),
@@ -2809,34 +2877,21 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
     def session_path(self):
         """Where this recording's session is saved, or None with no file open.
 
-        One rule, used by the autosave and by Save Session alike. They used to
-        disagree: the autosave wrote a BIDS-named file under derivatives while
-        Save Session opened a dialogue beside the raw data, so a recording
-        could carry two sessions that knew nothing of each other and the one
-        that won was whichever the analyst happened to pick on the way back in.
-
-        Derivatives rather than beside the recording, because a session is
-        something the tool produced. Raw data is what the scanner and the
-        stimulator wrote, and is better left as they wrote it.
+        Thin wrapper over :func:`session_path_for`, which is the actual rule.
+        Kept separate because this one can only answer for the file currently
+        open: it reads file_path, study_metadata and derivatives_path off the
+        app. Anything working over a LIST of recordings -- BIDS-ify, the reset,
+        a batch export -- has none of those loaded and must call the pure
+        function with the path it holds.
         """
         fp = self.file_path.get()
         if not fp:
             return None
-        meta = getattr(self, "study_metadata", None)
-        bids_prefix = _make_bids_prefix(meta.bids_prefix() if meta else "",
-                                        pathlib.Path(fp).stem)
-        source_dir = os.path.dirname(fp)
-        deriv_root = (self.derivatives_path.get()
-                      if hasattr(self, "derivatives_path")
-                      and self.derivatives_path.get() else source_dir)
-        sub_ses = (meta.sub_ses_path() if meta
-                   else os.path.join("sub-unknown", "ses-01"))
-        # Avoid derivatives/derivatives/ — same fix as in pipeline.py
-        if os.path.basename(os.path.normpath(deriv_root)).lower() == "derivatives":
-            save_dir = os.path.join(deriv_root, sub_ses)
-        else:
-            save_dir = os.path.join(deriv_root, "derivatives", sub_ses)
-        return os.path.join(save_dir, f"{bids_prefix}_session.json")
+        return session_path_for(
+            fp,
+            getattr(self, "study_metadata", None),
+            (self.derivatives_path.get()
+             if hasattr(self, "derivatives_path") else ""))
 
     def _autosave_session(self):
         """Silently save the session to the BIDS derivatives folder.
@@ -3021,6 +3076,30 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         # window_map; both are simply absent here, which is the same as every
         # type using the file-wide window.
         self.window_map={k: tuple(v) for k, v in (sess.get("window_map") or {}).items()}
+
+        # Conditions. Absent from a session written before they existed, which
+        # loads as a recording with none assigned -- the state every session
+        # had until now.
+        self.condition_event_rows = list(sess.get("condition_event_rows") or [])
+        self.condition_map = {k: tuple(v) for k, v
+                              in (sess.get("condition_map") or {}).items()}
+        try:
+            from .conditions import ConditionRow
+            self._cond_rows = [
+                ConditionRow(stim_type=r.get("stim_type", ""),
+                             condition=r.get("condition", ""),
+                             trials=tuple(r.get("trials") or ()),
+                             excluded=bool(r.get("excluded")),
+                             pre_ms=r.get("pre_ms"),
+                             post_ms=r.get("post_ms"))
+                for r in (sess.get("condition_rows") or [])]
+            self._cond_epochs = {
+                int(_c): {k: tuple(v) for k, v in (_b or {}).items()}
+                for _c, _b in (sess.get("condition_epochs") or {}).items()}
+        except Exception:
+            pass
+        # Force the tab to adopt the restored rows rather than rebuild.
+        self._cond_source_path = None
         self.gap_ms_map=sess.get("gap_ms_map",{})
         self.delay_ms_map=sess.get("delay_ms_map",{})
         self.delay_source_map=sess.get("delay_source_map",{})
@@ -3214,6 +3293,55 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             messagebox.showwarning("File not found",
                 f"Session references:\n  {fp}\n\nUse Browse to locate it.",
                 parent=self.root)
+            return
+
+        if not fp:
+            return
+
+        # Reopen the recording the session describes.
+        #
+        # Everything above restores state into memory and nothing put it on
+        # screen: the setup table still showed whatever was there before, the
+        # channel dropdown was not repopulated, and the Conditions tab held
+        # rows with no recording behind them -- which read as "none of my
+        # settings saved" when in fact none of them had been redrawn.
+        #
+        # The restored state is stashed and reapplied afterwards, because
+        # opening a file resets exactly the maps that were just loaded.
+        _keep = {}
+        for _attr in ("label_map", "color_map", "gap_ms_map", "delay_ms_map",
+                      "delay_source_map", "reference_map", "latency_map",
+                      "latency_stim_map", "latency_muscle_map", "csp_types",
+                      "window_map", "condition_map", "condition_event_rows",
+                      "_chan_settings", "_cond_rows", "_cond_epochs"):
+            if hasattr(self, _attr):
+                _keep[_attr] = getattr(self, _attr)
+        _keep_channel = self.channel_idx
+        _keep_analyse = set(getattr(self, "analyse_channels", set()) or set())
+
+        try:
+            self._browse_file_path(fp)
+        except Exception as exc:                      # noqa: BLE001 — reported
+            self.log(f"   ⚠️  Could not reopen {os.path.basename(fp)}: {exc}")
+            return
+
+        for _attr, _val in _keep.items():
+            setattr(self, _attr, _val)
+        self.channel_idx = _keep_channel
+        if _keep_analyse:
+            self.analyse_channels = _keep_analyse
+        self._cond_source_path = None
+
+        try:
+            self._restore_chan_settings(self.channel_idx)
+        except Exception:
+            pass
+        try:
+            self._build_labels_tab(sorted(self.label_map)
+                                   or sorted(self.available_markers or []))
+            self.log("   Setup table rebuilt from the session.")
+        except Exception as exc:                      # noqa: BLE001 — reported
+            self.log(f"   ⚠️  Could not rebuild the setup table: {exc}")
 
 
     def _configured_events(self, file_path, fallback_marker=None):
@@ -4761,7 +4889,17 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         ]:
             self._queue_tree.heading(col, text=text, command=lambda c=col: _sort_by(c))
             self._queue_tree.column(col, width=width, stretch=False, minwidth=30)
-        self._queue_tree.column("path", width=500, stretch=True, minwidth=200)
+        # The path column does NOT stretch.
+        #
+        # Stretching made it exactly as wide as the space left over, so the
+        # columns never totalled more than the widget and the horizontal
+        # scrollbar below had nothing to scroll to. A path longer than the
+        # column was simply unreadable -- and these are BIDS paths inside a
+        # OneDrive tree, so the part that identifies the file is at the end,
+        # which is the part that got cut.
+        #
+        # Wide enough for a realistic path, and scrollable when it is not.
+        self._queue_tree.column("path", width=900, stretch=False, minwidth=200)
 
         q_vs = ttk.Scrollbar(tree_frame, orient="vertical",   command=self._queue_tree.yview)
         q_hs = ttk.Scrollbar(tree_frame, orient="horizontal",  command=self._queue_tree.xview)
@@ -4769,6 +4907,30 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         self._queue_tree.grid(row=0, column=0, sticky="nsew")
         q_vs.grid(row=0, column=1, sticky="ns")
         q_hs.grid(row=1, column=0, sticky="ew")
+
+        # Shift+wheel scrolls sideways, which is what anyone reaches for before
+        # dragging a scrollbar. Bound to the tree rather than the window so it
+        # does not hijack the wheel elsewhere.
+        def _hwheel(event):
+            _d = event.delta
+            if _d:
+                self._queue_tree.xview_scroll(int(-_d / 120) or
+                                              (-1 if _d > 0 else 1), "units")
+            return "break"
+
+        self._queue_tree.bind("<Shift-MouseWheel>", _hwheel)
+        # X11 reports the wheel as buttons 6/7 horizontally. Windows Tk does
+        # not know those numbers and REFUSES THE BIND -- "bad button number 6"
+        # at construction, which stops the window being built at all. So it is
+        # attempted rather than assumed: a binding that cannot exist on this
+        # platform is not an error, it is simply not that platform.
+        for _seq, _dir in (("<Button-6>", -1), ("<Button-7>", 1)):
+            try:
+                self._queue_tree.bind(
+                    _seq, lambda _e, _d=_dir:
+                    self._queue_tree.xview_scroll(_d, "units"))
+            except tk.TclError:
+                pass
         tree_frame.grid_rowconfigure(0, weight=1)
         tree_frame.grid_columnconfigure(0, weight=1)
 
@@ -4814,6 +4976,41 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             root  = deriv if deriv else os.path.expanduser("~")
             self._dataset = DatasetSession.load_or_create(root)
         return self._dataset
+
+    def _fit_path_column(self):
+        """Widen the Path column to the longest path actually in the queue.
+
+        A fixed width is a guess, and the guess is wrong in both directions: too
+        narrow and the end of the path -- the part that identifies the file --
+        is unreadable however far you scroll, because there is nothing further
+        to scroll to; too wide and the scrollbar's thumb shrinks for no reason.
+        Measuring the strings that are there gets it right for the study in
+        front of the analyst rather than for an imagined one.
+
+        Measured in the widget's own font, because a path of a given character
+        count is a different number of pixels on every machine.
+        """
+        tree = getattr(self, "_queue_tree", None)
+        if tree is None:
+            return
+        try:
+            import tkinter.font as _tkfont
+            try:
+                _f = _tkfont.nametofont(
+                    ttk.Style().lookup("Treeview", "font") or "TkDefaultFont")
+            except Exception:
+                _f = _tkfont.nametofont("TkDefaultFont")
+
+            widest = _f.measure("Path")
+            for iid in tree.get_children():
+                _p = tree.set(iid, "path")
+                if _p:
+                    widest = max(widest, _f.measure(_p))
+            # Padding for the cell margins, and a floor so an empty queue does
+            # not collapse the column to the width of its heading.
+            tree.column("path", width=max(300, widest + 24))
+        except Exception:
+            pass
 
     def _queue_refresh(self):
         """Redraw the queue treeview from current dataset state."""
@@ -4873,6 +5070,8 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
                                 _ftype,
                                 stim_str, last, _size, _date, fe.path),
                         tags=(fe.status, str(_bytes)))
+
+        self._fit_path_column()
 
         n_done  = ds.n_complete
         n_total = ds.n_total
@@ -5109,13 +5308,49 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
                 deleted.extend(_rm_sidecar(str(p), _suffix))
 
             # 4. The saved session for this file.
-            _sess = p.with_suffix("").parent / (p.stem + "_session.json")
-            if _sess.exists():
-                try:
-                    _sess.unlink()
-                    deleted.append(_sess.name)
-                except Exception as exc:
-                    skipped.append(f"{_sess.name}: {exc}")
+            #
+            # Under derivatives, via the shared rule. This used to delete
+            # `<stem>_session.json` beside the recording, which is the OLD
+            # convention -- replaced precisely because a recording could carry
+            # two sessions that knew nothing of each other. So the reset was
+            # removing a file current versions never write, while the real
+            # session sat untouched in derivatives and was restored on the next
+            # open. Everything "from scratch" is meant to clear -- inspector
+            # edits, PTP markers, CSP boundaries, exclusions -- survived it.
+            _sess_candidates = []
+            try:
+                # Metadata parsed from THIS file's name, not self.study_metadata:
+                # the reset runs over a selection, and the loaded file's
+                # metadata would build one wrong path and repeat it for every
+                # other recording, deleting nothing and reporting success.
+                from .bids import StudyMetadata as _SM
+                _parsed = self._parse_bids_from_filename(str(p))
+                _meta = _SM(
+                    participant_id=_parsed['participant_id'] or "sub-unknown",
+                    session=_parsed['session'] or "ses-01",
+                    task=_parsed['task'], timepoint=_parsed['timepoint'],
+                    limb=_parsed['limb'], measure=_parsed['measure'],
+                    acq=_parsed['acq'])
+                _sp = session_path_for(
+                    str(p), _meta,
+                    (self.derivatives_path.get()
+                     if hasattr(self, "derivatives_path") else ""))
+                if _sp:
+                    _sess_candidates.append(pathlib.Path(_sp))
+            except Exception:               # noqa: BLE001 — never block a reset
+                pass
+            # The pre-derivatives location too, so a file last touched by an
+            # older version is not left with a session the reset cannot reach.
+            _sess_candidates.append(
+                p.with_suffix("").parent / (p.stem + "_session.json"))
+
+            for _sess in _sess_candidates:
+                if _sess.exists():
+                    try:
+                        _sess.unlink()
+                        deleted.append(_sess.name)
+                    except Exception as exc:
+                        skipped.append(f"{_sess.name}: {exc}")
 
             # 4c. The conditions assigned to this recording.
             #
@@ -6427,6 +6662,10 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             self._apply_epoch_limit_to_prestim(fpath)
         except Exception:
             pass
+        # Opening a file lands on Conditions: what a stimulus type is FOR is
+        # decided before how its response is detected. Set here rather than in
+        # _build_labels_tab, which also runs on channel switches and confirms.
+        self._go_to_conditions_after_load = True
 
         # ── populate inline channel dropdown
         chan_list = list_waveform_channels(fpath)
@@ -7490,6 +7729,32 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
 
     # ──────────────────────────────────────────────────────────────────────
 
+    def _inherited(self, mapping, stim, default=None):
+        """A per-type setting for this row, falling back to its stimulus type.
+
+        Splitting a stimulus type into conditions rebuilds this table with
+        composite keys -- A becomes A-pre and A-post -- and every one of these
+        maps is keyed by the row. A muscle group, latency profile, gap or
+        colour set against A therefore vanished the moment conditions were
+        applied, and the new rows silently took defaults.
+
+        A condition is a property of the trial, not of the response: A-pre and
+        A-post are the same stimulus recorded at different times, so they want
+        the same detection settings. Inheriting them is what the analyst
+        expects, and it is only ever a starting point -- either row can be
+        edited afterwards and its own entry then wins.
+        """
+        if stim in (mapping or {}):
+            return mapping[stim]
+        try:
+            from .conditions import decompose
+            base, cond = decompose(stim)
+        except Exception:
+            return default
+        if cond and base in (mapping or {}):
+            return mapping[base]
+        return default
+
     def _sync_sidecar_root(self):
         """Point the sidecar layer at the derivatives folder.
 
@@ -7718,7 +7983,8 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             self._lab_entry_colour[stim] = v_col
 
             # Gap ms
-            v_gap = tk.DoubleVar(value=self.gap_ms_map.get(stim, 0.0))
+            v_gap = tk.DoubleVar(
+                value=self._inherited(self.gap_ms_map, stim, 0.0))
             tk.Entry(inner, textvariable=v_gap, width=6)\
                 .grid(row=r, column=3, padx=4, sticky="w")
             self._lab_entry_gap[stim] = v_gap
@@ -7727,7 +7993,8 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             # stimulus. Negative means the pulse fired BEFORE the marker.
             # Sits beside Gap because both concern timing around the pulse and
             # neither is interpretable without the other in view.
-            v_delay = tk.DoubleVar(value=self.delay_ms_map.get(stim, 0.0))
+            v_delay = tk.DoubleVar(
+                value=self._inherited(self.delay_ms_map, stim, 0.0))
             tk.Entry(inner, textvariable=v_delay, width=6)\
                 .grid(row=r, column=4, padx=4, sticky="w")
             self._lab_entry_delay[stim] = v_delay
@@ -7762,7 +8029,15 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             self._last_default_pre, self._last_default_post = _def_pre, _def_post
 
             # Detect CSP
-            v_csp = tk.BooleanVar(value=(stim in self.csp_types))
+            _csp_on = stim in self.csp_types
+            if not _csp_on:
+                try:
+                    from .conditions import decompose
+                    _b, _c = decompose(stim)
+                    _csp_on = bool(_c) and _b in self.csp_types
+                except Exception:
+                    pass
+            v_csp = tk.BooleanVar(value=_csp_on)
             tk.Checkbutton(inner, variable=v_csp)\
                 .grid(row=r, column=7, padx=10, sticky="w")
             self._lab_entry_csp[stim] = v_csp
@@ -7784,9 +8059,10 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
 
             # Stim type dropdown
             _def_stype, _def_muscle = prefs.default_latency_key
-            _prev_stype  = self.latency_stim_map.get(stim, _def_stype)
-            _prev_muscle = self.latency_muscle_map.get(stim, _def_muscle)
-            _prev_lat    = self.latency_map.get(stim)
+            _prev_stype  = self._inherited(self.latency_stim_map, stim, _def_stype)
+            _prev_muscle = self._inherited(self.latency_muscle_map, stim,
+                                           _def_muscle)
+            _prev_lat    = self._inherited(self.latency_map, stim)
             v_stype = tk.StringVar(value=_prev_stype)
             stype_cb = ttk.Combobox(inner, textvariable=v_stype,
                                     values=list(MUSCLE_OPTIONS.keys()),
@@ -7934,29 +8210,28 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         self._labels_tab_confirmed = False
         self._confirm_btn_var.set("⚠  Setup not confirmed — click to confirm")
 
-        # Go to Conditions first, not straight to the labels tab.
-        #
-        # What a stimulus type is FOR is decided before how its response is
-        # detected: twenty pulses labelled A may be two timepoints, and
-        # configuring latency windows for "A" before saying so means
-        # configuring them again for each half afterwards. The table arrives
-        # populated and correct, so a recording needing no conditions costs one
-        # click through.
-        #
-        # Rebuilding this tab is also what the Conditions tab itself does on
-        # Confirm, and jumping back to Conditions at that moment would be a
-        # loop; the flag distinguishes the two callers.
-        self.root.update_idletasks()
-        if getattr(self, "_cond_confirming", False):
-            self.notebook.select(self.stage1_outer)
-            self.nb_stage1.select(self.tab1b_frame)
-        else:
+        # Only after a file was opened, and once.
+        if getattr(self, "_go_to_conditions_after_load", False):
+            self._go_to_conditions_after_load = False
+            self.root.update_idletasks()
             try:
                 self.notebook.select(self.setup_outer)
                 self.nb_setup.select(self.tab_conditions)
             except Exception:
                 self.notebook.select(self.stage1_outer)
                 self.nb_stage1.select(self.tab1b_frame)
+
+        # No navigation here.
+        #
+        # This runs whenever the table is rebuilt -- opening a file, switching
+        # channel, confirming a channel, applying conditions -- and navigating
+        # from it meant every one of those jumped somewhere. Confirming a
+        # channel advanced to the next one and was then thrown to the
+        # Conditions tab, which read as the advance having stopped working.
+        #
+        # Where to go after a REBUILD depends on why it was rebuilt, so the
+        # decision belongs to the caller. Opening a file goes to Conditions;
+        # everything else stays where it is.
 
     def _browse_mmax_for_var(self, string_var):
         """Interactively configure an external normalisation reference file.

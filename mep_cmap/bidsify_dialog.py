@@ -40,7 +40,22 @@ _BG     = "#f5f5f5"
 _FG     = "#212121"
 _BTN_FG = "white"
 
-_MODALITIES = ["TMS", "tES", "TUS"]
+#: Fallback only. The list actually offered comes from the schema's own
+#: `modalities`, because a second hardcoded copy is a list that silently goes
+#: stale: PNS was added to the schema for v6.3 (M-waves, H-reflexes and CMAPs
+#: are peripheral) and this dropdown carried on offering three.
+_MODALITIES = ["TMS", "tES", "TUS", "PNS"]
+
+
+def _modalities_for(schema):
+    """Modalities the schema declares, falling back to the constant above."""
+    try:
+        vals = [m for m in (getattr(schema, "modalities", None) or [])
+                if m and m != "common"]
+    except Exception:                       # noqa: BLE001 — never block the dialogue
+        vals = []
+    return vals or list(_MODALITIES)
+
 _GROUP_TITLES = {"device": "Device", "parameters": "Stimulation parameters",
                  "targeting": "Targeting", "event": "Events"}
 
@@ -140,7 +155,8 @@ class BidsifyDialog:
 
         tk.Label(hdr, text="Stimulation modality", bg=_BG, fg=_FG,
                  font=("TkDefaultFont", 10, "bold")).grid(row=0, column=0, sticky="w")
-        mod = ttk.Combobox(hdr, textvariable=self.modality_var, values=_MODALITIES,
+        mod = ttk.Combobox(hdr, textvariable=self.modality_var,
+                           values=_modalities_for(self.schema),
                            state="readonly", width=10)
         mod.grid(row=0, column=1, sticky="w", padx=(8, 0))
         mod.bind("<<ComboboxSelected>>", lambda _e: self._rebuild_fields())
@@ -171,9 +187,24 @@ class BidsifyDialog:
             "<Configure>",
             lambda e: self._canvas.itemconfigure(self._win, width=e.width))
         # mousewheel
-        self._canvas.bind_all("<MouseWheel>",
-                              lambda e: self._canvas.yview_scroll(
-                                  int(-1 * (e.delta / 120)), "units"))
+        #
+        # bind_all is application-wide, so this binding OUTLIVES the dialogue:
+        # once the window closes, the next wheel event anywhere still calls
+        # back into a destroyed canvas and raises "invalid command name". The
+        # handler therefore checks the widget is still alive and removes itself
+        # when it is not, rather than assuming its own lifetime.
+        def _wheel(e):
+            try:
+                if not self._canvas.winfo_exists():
+                    raise tk.TclError("canvas gone")
+                self._canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+            except tk.TclError:
+                try:
+                    self.top.unbind_all("<MouseWheel>")
+                except Exception:       # noqa: BLE001 — already torn down
+                    pass
+
+        self._canvas.bind_all("<MouseWheel>", _wheel)
 
     def _build_footer(self) -> None:
         opt = tk.Frame(self.top, bg="#ececec")

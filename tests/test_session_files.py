@@ -8,6 +8,7 @@ took effect depended on what the analyst happened to pick on the way back in.
 """
 
 import ast
+import os
 import pathlib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -24,9 +25,53 @@ def _body(name, src=APP):
 
 
 def test_there_is_one_rule_for_where_a_session_lives():
-    body = _body("session_path")
-    assert "derivatives" in body
-    assert "_session.json" in body
+    """Asserted by calling it, not by reading it.
+
+    The rule moved out of the method into session_path_for so that code working
+    over a LIST of recordings could use it too. Source-text assertions on the
+    method broke on that move while the behaviour was unchanged, which is a
+    test reporting on where code sits rather than what it does.
+    """
+    from mep_cmap.app import session_path_for
+    p = session_path_for(os.path.join("study", "raw", "rec.smr"),
+                         None, os.path.join("study", "deriv"))
+    assert p.endswith("_session.json")
+    assert "derivatives" in p
+
+
+def test_the_session_goes_to_derivatives_not_beside_the_raw_data():
+    """Raw data is what the amplifier and the stimulator wrote; a session is
+    something this tool produced."""
+    from mep_cmap.app import session_path_for
+    raw = os.path.join("study", "raw")
+    p = session_path_for(os.path.join(raw, "rec.smr"), None,
+                         os.path.join("study", "deriv"))
+    assert os.path.dirname(p) != raw
+    # Falls back to the recording's own folder only when none is configured.
+    q = session_path_for(os.path.join(raw, "rec.smr"), None, "")
+    assert q.startswith(os.path.join(raw, "derivatives"))
+
+
+def test_derivatives_is_not_nested_twice():
+    from mep_cmap.app import session_path_for
+    p = session_path_for(os.path.join("study", "rec.smr"), None,
+                         os.path.join("study", "derivatives"))
+    assert "derivatives" + os.sep + "derivatives" not in p
+
+
+def test_every_recording_gets_its_own_session():
+    """Two recordings in one session folder must not share a file, or the
+    second silently overwrites the first."""
+    from mep_cmap.app import session_path_for
+    a = session_path_for(os.path.join("s", "sub-004_run-1.smr"), None, "d")
+    b = session_path_for(os.path.join("s", "sub-004_run-2.smr"), None, "d")
+    assert a != b
+
+
+def test_the_method_delegates_rather_than_repeating_the_rule():
+    """Two builders drift, and the one that drifts deletes or fails to find
+    files silently -- which is exactly what the reset was doing."""
+    assert "session_path_for(" in _body("session_path")
 
 
 def test_both_writers_use_it():
@@ -57,17 +102,17 @@ def test_saving_without_a_recording_says_so():
     assert "Open a recording first" in _body("save_session")
 
 
-def test_the_session_goes_to_derivatives_not_beside_the_raw_data():
-    """Raw data is what the scanner and the stimulator wrote; a session is
-    something this tool produced."""
-    body = _body("session_path")
-    assert "derivatives_path" in body
-    assert "os.path.dirname(fp)" in body, "falls back only when none is set"
+def test_the_session_goes_to_derivatives_not_beside_the_raw_data_source():
+    """Kept as a source check only for the reset path, which must use the
+    shared rule rather than the pre-derivatives filename it used to delete."""
+    body = _body("_dataset_reset_selected") if "_dataset_reset_selected" in APP else APP
+    assert "session_path_for(" in body
 
 
-def test_derivatives_is_not_nested_twice():
-    body = _body("session_path")
-    assert "== 'derivatives'" in body or '== "derivatives"' in body
+def test_derivatives_is_not_nested_twice_in_the_rule():
+    from mep_cmap.app import session_path_for
+    p = session_path_for("rec.smr", None, os.path.join("a", "DERIVATIVES"))
+    assert p.lower().count("derivatives") == 1
 
 
 # ── reachable from anywhere in First Level ───────────────────────────────────
@@ -148,3 +193,106 @@ def test_the_disabled_button_says_why():
     i = APP.index("self._run_btn = tk.Button")
     assert "Tooltip(self._run_btn" in APP[i:i + 900]
     assert "1c" in APP[i:i + 900]
+
+
+# ── conditions belong to the session ─────────────────────────────────────────
+
+def test_the_session_carries_the_conditions():
+    """None of this was saved, so reopening a session lost every condition
+    assigned in it -- and silently, because the analysis still ran on the
+    stimulus types underneath.
+    """
+    body = _body("_build_session_payload") if "_build_session_payload" in APP \
+        else APP
+    for key in ("condition_event_rows", "condition_map", "condition_rows",
+                "condition_epochs"):
+        assert f'"{key}"' in APP, f"{key} is not saved"
+
+
+def test_the_rows_are_saved_field_by_field():
+    """ConditionRow is frozen and not JSON-serialisable; storing it whole would
+    fail at save time rather than at load."""
+    i = APP.index('"condition_rows"')
+    block = APP[i:i + 500]
+    for field in ("stim_type", "condition", "trials", "excluded",
+                  "pre_ms", "post_ms"):
+        assert field in block, f"{field} is dropped on save"
+
+
+def test_loading_reconstructs_the_rows():
+    assert "ConditionRow(stim_type=r.get" in APP
+
+
+def test_a_session_written_before_conditions_still_loads():
+    """It loads as a recording with none assigned, which is the state every
+    session had until now."""
+    assert 'sess.get("condition_rows") or []' in APP
+    assert 'sess.get("condition_event_rows") or []' in APP
+
+
+def test_the_epoch_book_survives_with_integer_channels():
+    """JSON keys are strings; a channel index that came back as '0' would
+    never match the integer the tab looks up."""
+    assert "int(_c): {k: tuple(v)" in APP
+
+
+def test_the_restored_table_is_not_rebuilt_over():
+    """Rebuilding from the file the moment the tab opened is what made the
+    conditions look as though they had never been saved."""
+    tab = (PKG / "conditions_tab.py").read_text(encoding="utf-8") \
+        if 'PKG' in dir() else \
+        (ROOT / "mep_cmap" / "conditions_tab.py").read_text(encoding="utf-8")
+    assert "Conditions restored from the session" in tab
+    assert "_cond_source_path" in APP
+
+
+# ── loading a session must put it on screen ──────────────────────────────────
+
+def test_loading_reopens_the_recording():
+    """Everything restored into memory and nothing was redrawn: the setup
+    table still showed whatever was there before, the channel dropdown was not
+    repopulated, and the Conditions tab held rows with no recording behind
+    them -- which reads as "none of my settings saved" when in fact none of
+    them had been displayed.
+    """
+    body = _body("load_session")
+    assert "_browse_file_path(fp)" in body
+
+
+def test_the_restored_state_survives_reopening_the_file():
+    """Opening a recording resets exactly the maps that were just loaded."""
+    body = _body("load_session")
+    assert "_keep" in body
+    for attr in ("latency_map", "window_map", "_chan_settings", "_cond_rows"):
+        assert attr in body, f"{attr} is not preserved across the reopen"
+
+
+def test_the_setup_table_is_rebuilt():
+    body = _body("load_session")
+    assert "_build_labels_tab" in body
+
+
+def test_the_channels_own_settings_are_reapplied():
+    """The flat maps are a view of one channel's snapshot; without this the
+    table shows whichever channel was last active."""
+    body = _body("load_session")
+    assert "_restore_chan_settings(self.channel_idx)" in body
+
+
+def test_a_missing_file_stops_before_reopening():
+    """Warning and then trying to open it anyway would raise on top of the
+    warning."""
+    body = _body("load_session")
+    i = body.index("File not found")
+    j = body.index("_browse_file_path(fp)")
+    assert "return" in body[i:j]
+
+
+def test_a_session_with_no_file_does_not_try_to_open_one():
+    body = _body("load_session")
+    assert "if not fp:" in body
+
+
+def test_reopening_failure_is_reported_not_raised():
+    body = _body("load_session")
+    assert "Could not reopen" in body

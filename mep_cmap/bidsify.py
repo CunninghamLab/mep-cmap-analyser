@@ -106,6 +106,16 @@ class BidsifyItem:
     participant_extra: dict = field(default_factory=dict)   # extra participants.tsv cols
     task_name:         str = ""    # for _emg.json TaskName; falls back to metadata.task
     prefix_override:   Optional[str] = None   # explicit BIDS prefix (preserves source-stem tokens)
+    #: Session-level stimulation parameter sets (mep_cmap.stim_params), and this
+    #: file's mapping of stim code -> set name. Together they are what makes
+    #: *_nibs.tsv possible: the sets are the rows, the mapping is what lets
+    #: *_events.tsv reference them.
+    param_sets:        list = field(default_factory=list)
+    code_sets:         dict = field(default_factory=dict)
+    #: Conditions read from the recording's own session (see conditions_for).
+    #: Not stored by BIDS-ify: they belong to the recording, and most analysts
+    #: never open this tab.
+    condition_rows:    list = field(default_factory=list)
 
 
 @dataclass
@@ -121,6 +131,11 @@ class PlannedFile:
     nibs_dir:          str
     nibs_json_path:    str
     channels:          list         # [(name, type, unit_or_None)]
+    #: v6.3 splits stimulation across four files. The sidecar alone cannot
+    #: describe a recording with more than one protocol in it.
+    nibs_tsv_path:     str = ""
+    markers_tsv_path:  str = ""
+    markers_json_path: str = ""
     notes:             list = field(default_factory=list)
 
 
@@ -230,6 +245,9 @@ def plan_bidsify(items: list,
             events_tsv_path=os.path.join(emg_dir, f"{prefix}_events.tsv"),
             nibs_dir=nibs_dir,
             nibs_json_path=os.path.join(nibs_dir, f"{prefix}_{nibs_suffix}.json"),
+            nibs_tsv_path=os.path.join(nibs_dir, f"{prefix}_{nibs_suffix}.tsv"),
+            markers_tsv_path=os.path.join(nibs_dir, f"{prefix}_markers.tsv"),
+            markers_json_path=os.path.join(nibs_dir, f"{prefix}_markers.json"),
             channels=chans,
         )
         if not item.marker_names:
@@ -364,7 +382,22 @@ def read_back_signature(path: str, ref_counts=None) -> dict:
             else:
                 x_rms = x
             rms = float(np.sqrt(np.mean(np.square(x_rms)))) if x_rms.size else 0.0
-            chans.append({"name": r.getLabel(i), "n_samples": n_full, "rms": rms})
+            # Quantisation step of THIS channel, so the comparison can predict
+            # how much the RMS should legitimately move rather than guessing a
+            # relative tolerance. It matters most exactly where a fixed
+            # tolerance fails: a channel carrying a large stimulus artefact has
+            # a wide physical range, so its step is coarse relative to the
+            # small EMG the RMS is actually measuring.
+            try:
+                pmin = float(r.getPhysicalMinimum(i))
+                pmax = float(r.getPhysicalMaximum(i))
+                dmin = float(r.getDigitalMinimum(i))
+                dmax = float(r.getDigitalMaximum(i))
+                lsb = abs(pmax - pmin) / max(1.0, abs(dmax - dmin))
+            except Exception:               # noqa: BLE001 — older pyedflib
+                lsb = 0.0
+            chans.append({"name": r.getLabel(i), "n_samples": n_full,
+                          "rms": rms, "lsb": lsb})
         return {"n_channels": n, "sampling_frequency": float(fs),
                 "samples_per_record": spr, "channels": chans}
     finally:
@@ -497,28 +530,480 @@ def write_channels_tsv(pf: PlannedFile, rec: Recording,
                ["name", "type", "units", "sampling_frequency"], rows)
 
 
+def find_session_for(source_path: str, metadata=None,
+                     derivatives_root: str = "") -> str:
+    """The session JSON belonging to one recording, or "".
+
+    Two routes, because the obvious one is not always enough.
+
+    The direct construction via session_path_for is exact and cheap, and is
+    tried first. It relies on the participant being derivable from the file's
+    name, which is true of a BIDS-organised study and false of, say,
+    `rawdata/Spike/Example Data 1.smr`. There the name yields nothing, the
+    lookup resolves to `sub-unknown`, and a session saved under the metadata
+    the analyst typed is missed entirely -- the conditions exist and are simply
+    not found.
+
+    So the fallback matches on what the session itself records. Every session
+    stores the `file_path` it was written for, and its filename ends with the
+    source stem, so candidates are found by name and then CONFIRMED by reading
+    that field. Matching on the stem alone would be a guess; confirming makes
+    it a fact.
+
+    Where several sessions claim the same recording -- which happens when the
+    participant id was corrected, leaving the old one orphaned -- the most
+    recently written wins, since that is the one the analyst last worked in.
+    """
+    from .app import session_path_for
+
+    direct = session_path_for(source_path, metadata, derivatives_root)
+    if direct and os.path.isfile(direct):
+        return direct
+    if not source_path:
+        return ""
+
+    root = derivatives_root or os.path.dirname(source_path)
+    if os.path.basename(os.path.normpath(root)).lower() != "derivatives":
+        root = os.path.join(root, "derivatives")
+    if not os.path.isdir(root):
+        return ""
+
+    stem = os.path.splitext(os.path.basename(source_path))[0]
+    want = os.path.normcase(os.path.basename(source_path))
+    hits = []
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            if not name.endswith("_session.json"):
+                continue
+            if not name[:-len("_session.json")].endswith(stem):
+                continue
+            cand = os.path.join(dirpath, name)
+            try:
+                with open(cand, "r", encoding="utf-8") as fh:
+                    stored = json.load(fh).get("file_path") or ""
+            except Exception:           # noqa: BLE001 — unreadable, skip
+                continue
+            if os.path.normcase(os.path.basename(stored)) != want:
+                continue
+            try:
+                hits.append((os.path.getmtime(cand), cand))
+            except OSError:
+                hits.append((0.0, cand))
+    if not hits:
+        return ""
+    hits.sort()
+    return hits[-1][1]
+
+
+def recorded_metadata_for(source_path: str, metadata=None,
+                          derivatives_root: str = ""):
+    """The StudyMetadata the analyst entered for this recording, or None.
+
+    Taken from the recording's own session, which stores `study_metadata`
+    verbatim. That entry is the only place a participant is recorded: nothing
+    else in the tool holds one, so a recording whose FILENAME says nothing --
+    `rawdata/Spike/Example Data 1.smr` -- has no other source.
+
+    Without this, BIDS-ify parsed the filename, found no `sub-`, and wrote the
+    conversion to `sub-unknown` while the analyst had plainly typed sub-333 in
+    the metadata window. The output disagreed with the tool's own record of
+    who the recording belonged to.
+
+    Returns None when there is no session or no metadata in it, leaving the
+    caller's filename-derived guess in place.
+    """
+    from .bids import StudyMetadata
+
+    try:
+        path = find_session_for(source_path, metadata, derivatives_root)
+        if not path:
+            return None
+        with open(path, "r", encoding="utf-8") as fh:
+            sm = json.load(fh).get("study_metadata") or {}
+        if not sm.get("participant_id"):
+            return None
+        fields = getattr(StudyMetadata, "__dataclass_fields__", {})
+        return StudyMetadata(**{k: v for k, v in sm.items() if k in fields})
+    except Exception:                   # noqa: BLE001 — fall back to the guess
+        return None
+
+
+def conditions_for(source_path: str, metadata=None,
+                   derivatives_root: str = "") -> list:
+    """The conditions assigned to a recording, or [] if none were.
+
+    Read from the recording's session JSON, which is where the Conditions tab
+    already stores them. BIDS-ify owns no copy: conditions belong to the
+    recording rather than to a conversion, and most analysts never open this
+    tab at all -- their work must not end up filed under a feature they do not
+    use.
+
+    Reads `condition_rows`, the table the analyst edited, NOT
+    `condition_event_rows`, which is that table already projected into events.
+    Both are stored, and projecting the model here rather than trusting the
+    stored projection is what keeps the Conditions tab and BIDS-ify from
+    describing the same recording differently.
+
+    Never raises. A missing, unreadable or half-written session means no
+    conditions, and no conditions is a valid state -- it writes the stimulus
+    codes exactly as recorded.
+    """
+    from .conditions import ConditionRow
+
+    try:
+        path = find_session_for(source_path, metadata, derivatives_root)
+        if not path or not os.path.isfile(path):
+            return []
+        with open(path, "r", encoding="utf-8") as fh:
+            sess = json.load(fh)
+        out = []
+        for r in (sess.get("condition_rows") or []):
+            if not isinstance(r, dict):
+                continue
+            out.append(ConditionRow(
+                stim_type=r.get("stim_type", ""),
+                condition=r.get("condition", ""),
+                trials=tuple(r.get("trials") or ()),
+                excluded=bool(r.get("excluded")),
+                pre_ms=r.get("pre_ms"),
+                post_ms=r.get("post_ms")))
+        return out
+    except Exception:                   # noqa: BLE001 — see docstring
+        return []
+
+
 def write_events_tsv(pf: PlannedFile, rec: Recording) -> None:
+    """The timeline: one row per delivery.
+
+    Projected by events_model, which the Conditions tab uses too. Each built
+    its own answer before, so a recording could carry two _events.tsv files
+    that disagreed with nothing to say which was right.
+
+    Conditions come from the recording's session rather than from BIDS-ify's
+    own state, so a file grouped in the Conditions tab carries that grouping
+    here, and a file that was never grouped writes its stimulus codes exactly
+    as recorded.
+    """
+    from . import events_model as _em
+
     # trial_type: prefer something meaningful over the cosmetic marker label.
     fallback_type = (pf.item.metadata.measure or pf.item.metadata.acq
                      or "stim")
-    rows = []
+
+    raw = []
     for ev in rec.events_table():
-        tt = ev["trial_type"]
-        # Use the fallback only when the code is genuinely empty. Single-
+        code = ev["trial_type"]
+        # The fallback applies only when the code is genuinely empty. Single-
         # character DigMark codes (A/B/C/D) are valid labels - do NOT collapse.
-        if tt in (None, "", "n/a"):
-            tt = fallback_type
-        rows.append({"onset": ev["onset"], "duration": ev["duration"],
-                     "trial_type": tt})
-    _write_tsv(pf.events_tsv_path, ["onset", "duration", "trial_type"], rows)
+        if code in (None, "", "n/a"):
+            code = fallback_type
+        raw.append({"onset": ev["onset"], "code": code,
+                    "duration": ev.get("duration", 0)})
+
+    columns, rows = _em.project(
+        raw,
+        condition_rows=pf.item.condition_rows,
+        code_sets=pf.item.code_sets,
+        param_sets=pf.item.param_sets)
+    _write_tsv(pf.events_tsv_path, columns, rows)
+
+    # Provenance beside it: a reader needs to know whether the grouping came
+    # from the recording or from somebody's judgement about it.
+    _write_json(os.path.splitext(pf.events_tsv_path)[0] + ".json", {
+        "trial_type": {"Description": _em.describe_source(pf.item.condition_rows)},
+    })
 
 
 def write_nibs_sidecar(pf: PlannedFile, schema) -> None:
-    values = dict(pf.item.sidecar_values)
-    values.setdefault("StimulationModality", pf.item.modality)
-    sidecar = schema.ordered_sidecar(values, modality=pf.item.modality)
-    sidecar["SourceFile"] = os.path.basename(pf.item.source_path)
-    _write_json(pf.nibs_json_path, sidecar)
+    """Write the NIBS-BIDS v6.3 stimulation description.
+
+    Four files, not one. The old single flat *_nibs.json could hold exactly one
+    value per field for the whole recording, so a file containing a peripheral
+    M-wave on one code and a TMS MEP on another could describe neither. v6.3
+    separates them:
+
+        *_nibs.tsv      one row per stimulation parameter set
+        *_nibs.json     device, dosing references, and the column definitions
+        *_markers.tsv   one row per element placement
+        *_events.tsv    one row per delivery, naming a set and a position
+                        (written by write_events_tsv, in the emg/ folder)
+
+    Everything about WHERE a value goes is read from the schema's `block` and
+    `emits`, so adding a field is a schema edit rather than a code change here.
+    """
+    from . import stim_params as _sp
+
+    sets = _sp.sets_in_use(pf.item.code_sets, pf.item.param_sets)
+
+    # No parameter sets: keep writing the flat sidecar so a study that has not
+    # adopted them still converts. It is the old shape, and honestly so --
+    # inventing an empty *_nibs.tsv would claim a description that is absent.
+    if not sets:
+        values = dict(pf.item.sidecar_values)
+        values.setdefault("StimulationModality", pf.item.modality)
+        sidecar = schema.ordered_sidecar(values, modality=pf.item.modality)
+        sidecar["SourceFile"] = os.path.basename(pf.item.source_path)
+        _write_json(pf.nibs_json_path, sidecar)
+        return
+
+    _write_nibs_tsv(pf, schema, sets)
+    _write_markers(pf, schema, sets)
+    _write_nibs_json(pf, schema, sets)
+
+
+def _resolved(pf, schema, block, s, modality=None):
+    """Session defaults for one block, with this parameter set's overrides on top.
+
+    A device is not necessarily a property of the recording. M-waves delivered
+    by a Digitimer and MEPs by a Magstim in one file are two stimulators, and a
+    coil swapped mid-session to reach a different target is two elements. v6.3
+    expects that: stimulator_id and nibs_element_id are columns of *_nibs.tsv
+    pointing into arrays, so the device is referenced per row.
+
+    Returned keyed by `emits`, with a stable identity string so two sets sharing
+    a device share its entry rather than duplicating it.
+    """
+    out = {}
+    for fld in schema.fields_for(modality or s.nibs_type, block=block):
+        raw = s.values.get(fld.key)
+        if raw in (None, "") or str(raw).strip() == "":
+            raw = pf.item.sidecar_values.get(fld.key)
+        if raw in (None, "") or str(raw).strip() == "":
+            continue
+        coerced, err = schema.coerce_value(fld, raw)
+        out[fld.emits or fld.key] = raw if err else coerced
+    return out
+
+
+def _identity(values) -> str:
+    """A stable key for a block's values, so identical devices share one entry."""
+    return "|".join(f"{k}={values[k]}" for k in sorted(values))
+
+
+def _blocked_values(pf, schema, block, modality=None):
+    """Session-level values whose schema `block` matches, keyed by `emits`."""
+    out = {}
+    for fld in schema.fields_for(modality or pf.item.modality, block=block):
+        raw = pf.item.sidecar_values.get(fld.key)
+        if raw in (None, "") or str(raw).strip() == "":
+            continue
+        coerced, err = schema.coerce_value(fld, raw)
+        out[fld.emits or fld.key] = raw if err else coerced
+    return out
+
+
+def _device_ids(pf, schema, sets):
+    """``({set_name: (stimulator_id, element_id)}, stimulators, elements)``.
+
+    Computed once and used by both the table and the sidecar, so a row cannot
+    reference an id the sidecar does not define. Sets sharing a device share its
+    id; sets that override it get their own.
+    """
+    stim_by_key, elem_by_key = {}, {}
+    per_set = {}
+    for s in sets:
+        sv = _resolved(pf, schema, "StimulatorSet", s)
+        ev = _resolved(pf, schema, "ElementSet", s)
+        sid = eid = ""
+        if sv:
+            k = _identity(sv)
+            if k not in stim_by_key:
+                # Named after the manufacturer where there is one, because an
+                # id a human can read is worth more in a shared dataset than a
+                # serial number nobody recognises.
+                base = str(sv.get("Manufacturer") or "stimulator")
+                name = base
+                n = 2
+                while any(v[0] == name for v in stim_by_key.values()):
+                    name = f"{base}_{n}"
+                    n += 1
+                stim_by_key[k] = (name, sv)
+            sid = stim_by_key[k][0]
+        if ev:
+            k = _identity(ev)
+            if k not in elem_by_key:
+                base = str(ev.get("ModelName") or ev.get("Manufacturer")
+                           or "element")
+                name = base
+                n = 2
+                while any(v[0] == name for v in elem_by_key.values()):
+                    name = f"{base}_{n}"
+                    n += 1
+                elem_by_key[k] = (name, ev)
+            eid = elem_by_key[k][0]
+        per_set[s.name] = (sid, eid)
+
+    stimulators = [dict(v, StimulatorID=nm) for nm, v in stim_by_key.values()]
+    elements = [dict(v, ElementID=nm) for nm, v in elem_by_key.values()]
+    return per_set, stimulators, elements
+
+
+def _write_nibs_tsv(pf: PlannedFile, schema, sets) -> None:
+    from . import stim_params as _sp
+    columns, rows = _sp.nibs_rows(sets, schema)
+
+    # Device columns, only where they say something. A study on one stimulator
+    # does not need a column repeating its name on every row; a file mixing a
+    # Digitimer and a Magstim cannot be read without one.
+    per_set, stimulators, elements = _device_ids(pf, schema, sets)
+    if len(stimulators) > 1 or len(elements) > 1:
+        at = columns.index("nibs_type") + 1
+        if stimulators:
+            columns.insert(at, "stimulator_id"); at += 1
+        if elements:
+            columns.insert(at, "nibs_element_id")
+        for r in rows:
+            sid, eid = per_set.get(r["nibs_event_id"], ("", ""))
+            if stimulators:
+                r["stimulator_id"] = sid or "n/a"
+            if elements:
+                r["nibs_element_id"] = eid or "n/a"
+    _write_tsv(pf.nibs_tsv_path, columns, rows)
+
+
+def _write_markers(pf: PlannedFile, schema, sets) -> None:
+    """One row per element placement, referenced from *_events.tsv.
+
+    A set with no position still gets a row: nibs_position_id is what the
+    timeline points at, and a delivery with nowhere to point is unreadable.
+    The placement is named rather than located, which is the usual case for
+    non-navigated work and exactly what the spec's own motor example does.
+    """
+    seen, rows = {}, []
+    shared = _blocked_values(pf, schema, "markers.tsv")
+    for s in sets:
+        pos = s.position or f"{s.name}_position"
+        if pos in seen:
+            continue
+        seen[pos] = True
+        row = {"nibs_position_id": pos, "nibs_element_id": s.name}
+        row.update(shared)
+        rows.append(row)
+
+    columns = ["nibs_position_id", "nibs_element_id"]
+    for r in rows:
+        for k in r:
+            if k not in columns:
+                columns.append(k)
+    for r in rows:
+        for k in columns:
+            r.setdefault(k, "n/a")
+    _write_tsv(pf.markers_tsv_path, columns, rows)
+
+    _write_json(pf.markers_json_path, {
+        "nibs_position_id": {
+            "LongName": "Position identifier",
+            "Description": "Placement of the stimulating element. Referenced "
+                           "from nibs_position_id in *_events.tsv."},
+        "nibs_element_id": {
+            "LongName": "Element identifier",
+            "Description": "Element delivering the stimulation. Links to "
+                           "ElementSet.ElementID in *_nibs.json."},
+    })
+
+
+def _write_nibs_json(pf: PlannedFile, schema, sets) -> None:
+    """Device, dosing references, and what every column in *_nibs.tsv means.
+
+    The spec is explicit that units are always stated in the sidecar and never
+    assumed from the numbers in the table: 58 could be percent of maximum
+    stimulator output or milliamps, and a numeric column without a declared
+    unit is not merely undocumented, it is unreadable.
+    """
+    from . import stim_params as _sp
+
+    out = {}
+    desc = pf.item.sidecar_values.get("StimulationDescription")
+    if desc:
+        out["NIBSDescription"] = desc
+    out["ConcurrentModalities"] = ["emg"]
+    # The timeline lives with the recording, so the stimulation description
+    # points at it rather than duplicating onsets.
+    out["IntendedFor"] = (f"bids::{pf.rel_dir}/"
+                          f"{os.path.basename(pf.events_tsv_path)}")
+
+    # Devices, from the same computation the table used, so a stimulator_id in
+    # a row always has an entry here to resolve against.
+    _per_set, _stimulators, _elements = _device_ids(pf, schema, sets)
+    if _stimulators:
+        out["StimulatorSet"] = (_stimulators[0] if len(_stimulators) == 1
+                                else _stimulators)
+    if _elements:
+        out["ElementSet"] = _elements[0] if len(_elements) == 1 else _elements
+
+    # IntensitySet: the measured value of each dosing reference, given once.
+    intensity = []
+    _ref_field = {"RestingMotorThreshold": ("rMT", "resting_motor"),
+                  "ActiveMotorThreshold": ("aMT", "active_motor")}
+    _used = {str(s.values.get("IntensityReference") or "") for s in sets}
+    for key, (ref_id, ref_type) in _ref_field.items():
+        # A set may carry its own threshold: one measured for a different
+        # target, or with a different coil. The session default is the
+        # fallback, not the only answer.
+        raw = next((s.values.get(key) for s in sets
+                    if s.values.get(key) not in (None, "")), None)
+        if raw in (None, ""):
+            raw = pf.item.sidecar_values.get(key)
+        if raw in (None, "") or ref_id not in _used:
+            continue
+        fld = schema.field(key)
+        coerced, err = schema.coerce_value(fld, raw) if fld else (raw, None)
+        entry = {"IntensityID": ref_id,
+                 "Value": raw if err else coerced,
+                 "Units": (fld.units if fld and fld.units else "%MSO"),
+                 "Type": ref_type}
+        method = pf.item.sidecar_values.get("MotorThresholdMethod")
+        if method:
+            entry["Algorithm"] = method
+        intensity.append(entry)
+    if intensity:
+        out["IntensitySet"] = intensity
+
+    nav = _blocked_values(pf, schema, "NavigationSystem")
+    if nav:
+        out["NavigationSystem"] = nav
+
+    # Column definitions for *_nibs.tsv, including the units the spec requires.
+    columns, _ = _sp.nibs_rows(sets, schema)
+    out["nibs_event_id"] = {
+        "LongName": "Stimulation parameter set identifier",
+        "Description": "Identifier of a stimulation parameter set. Referenced "
+                       "from nibs_event_id in *_events.tsv. Unique within this "
+                       "file."}
+    out["nibs_type"] = {
+        "LongName": "Stimulation modality",
+        "Description": "Non-invasive or peripheral stimulation modality.",
+        "Levels": {t: t for t in sorted({s.nibs_type for s in sets})}}
+
+    by_emit = {}
+    for fld in schema.fields_for(pf.item.modality, block="nibs.tsv"):
+        by_emit.setdefault(fld.emits or fld.key, fld)
+    for col in columns:
+        if col in out:
+            continue
+        fld = by_emit.get(col)
+        if fld is None:
+            continue
+        entry = {"Description": fld.description or fld.key}
+        if fld.units:
+            entry["Units"] = fld.units
+        if fld.enum:
+            entry["Levels"] = {v: v for v in fld.enum}
+        out[col] = entry
+
+    # Units declared per set rather than per column when the analyst stated
+    # them: a PNS row in mA and a TMS row in %MSO share one column.
+    units = {str(s.values.get("StimulationIntensityUnits") or "")
+             for s in sets} - {""}
+    if units and "stimulus_intensity" in out:
+        out["stimulus_intensity"]["Units"] = (
+            units.pop() if len(units) == 1
+            else "mixed — see StimulationIntensityUnits per set")
+
+    out["NIBSSchema"]        = schema.schema_name
+    out["NIBSSchemaVersion"] = schema.schema_version
+    out["SourceFile"]        = os.path.basename(pf.item.source_path)
+    _write_json(pf.nibs_json_path, out)
 
 
 # ── Dataset-level files (idempotent) ──────────────────────────────────────────

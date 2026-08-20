@@ -40,6 +40,40 @@ def _cfg_fields_read_by(func_name, source):
     raise AssertionError(f"{func_name} not found")
 
 
+def _string_constants(source):
+    """Every string literal in the module, implicit concatenation joined.
+
+    Log messages in preview.py are wrapped across source lines, so a sentence
+    can be correct at runtime and still absent from the file as a contiguous
+    substring: the parser joins the adjacent literals, a plain `in SOURCE`
+    check does not. Asserting on the raw text therefore tests the line
+    wrapping rather than the message, and reflowing a paragraph breaks the
+    test while the tool carries on working. This returns what the compiler
+    sees.
+
+    f-strings arrive as JoinedStr; only their constant parts are kept, so a
+    message split around an interpolation still reads as one string.
+
+    One string per literal, not per node: ast.walk also descends INTO each
+    JoinedStr, so counting its children as well as the joined whole reports one
+    f-string message twice -- and a caller counting how many places say
+    something then sees three sites where there are two. The children are
+    skipped, which is safe because walk is breadth-first and reaches the parent
+    first.
+    """
+    out, nested = [], set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.JoinedStr):
+            out.append("".join(
+                p.value for p in node.values
+                if isinstance(p, ast.Constant) and isinstance(p.value, str)))
+            nested.update(id(p) for p in node.values)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str) \
+                and id(node) not in nested:
+            out.append(node.value)
+    return out
+
+
 def test_preview_supplies_exactly_the_filter_fields():
     """The preview's config must cover what the filter stage reads -- no more.
 
@@ -155,22 +189,72 @@ def test_the_preview_opener_writes_nothing_back():
             f"_open_inspector_preview must not touch {forbidden}"
 
 
-def test_the_preview_opener_starts_from_empty_metadata():
-    """Empty metadata is what makes every marker freshly detected.
+def test_the_preview_opener_is_seeded_by_its_caller():
+    """The Inspector re-detects whatever it is not given, one trial at a time.
 
-    Seeded metadata would show saved edits from an earlier session as though
-    the current settings had produced them.
+    That is a different computation from the analysis: onset anchoring takes
+    the MEDIAN onset of a stimulus type and the search window is widened from
+    the latency profile across the sample, work that needs every trial. Given
+    none of it, the Inspector fell back to the file-wide window and reported
+    the window edge as a latency -- so the preview disagreed with the run it
+    was previewing.
     """
-    tree = ast.parse(_method_source("_open_inspector_preview"))
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and \
-                getattr(node.func, "id", "") == "DataInspectorWindow":
-            kw = {k.arg: k.value for k in node.keywords}
-            assert "metadata_dict" in kw
-            assert isinstance(kw["metadata_dict"], ast.Dict) and \
-                not kw["metadata_dict"].keys, "preview must seed no metadata"
-            return
-    raise AssertionError("_open_inspector_preview never opens the inspector")
+    body = _method_source("_open_inspector_preview")
+    assert "metadata_dict=None" in body, "the opener takes no seed"
+    assert "dict(metadata_dict or {})" in body
+
+
+def test_the_preview_detects_with_the_pipelines_own_detector():
+    """pipeline_detect_onsets is the sole source of automatic onset values in
+    the analysis; calling it here is what makes this a rehearsal rather than a
+    second opinion."""
+    assert "pipeline_detect_onsets(" in PREVIEW_SRC
+
+
+def test_the_preview_config_is_not_built_by_field_name():
+    """Filtering the snapshot by PipelineConfig field names looked tidy and was
+    wrong twice over: the snapshot names several settings differently
+    (min_amp for min_peak_amplitude), so a name filter silently substitutes
+    defaults; and 38 of the 49 detection fields are not top-level keys at all,
+    because the run passes them as one detection_params mapping.
+    """
+    assert "dataclasses.fields(PipelineConfig)" not in PREVIEW_SRC
+    assert "_detection_config_kwargs(_params)" in PREVIEW_SRC
+
+
+def test_the_preview_reads_this_channels_latency_profile():
+    """The flat map belongs to whichever channel was last harvested, and on any
+    other channel it is empty -- which floors every onset at the amplitude
+    window and returns exactly its edge: 10.00 ms on every trial, with a
+    between-trial SD of zero.
+    """
+    assert 'latency_map=_own("latency_map", {})' in PREVIEW_SRC
+    assert 'chan_settings' in PREVIEW_SRC
+
+
+def test_the_preview_uses_the_runs_own_parameter_names():
+    """min_amp, not min_peak_amplitude."""
+    assert 'min_peak_amplitude=_params["min_amp"]' in PREVIEW_SRC
+
+
+def test_a_failed_pre_detection_says_the_preview_may_not_match():
+    """Falling back silently would restore the disagreement without saying so.
+
+    Two branches fall back to the Inspector detecting each trial on its own:
+    pre-detection raising, and pre-detection returning an empty seed. Neither
+    is a fault, but a preview that takes either one silently is a confident
+    picture of settings that are not the ones about to be applied. Both are
+    checked here, because a warning added to one branch and forgotten in the
+    other leaves exactly that.
+
+    Asserted against the compiled string literals, not the source text: these
+    messages are wrapped mid-sentence across source lines.
+    """
+    hits = [s for s in _string_constants(PREVIEW_SRC)
+            if "may not match the run" in s]
+    assert len(hits) == 2, (
+        "expected the fallback warning on both the raising and the empty-seed "
+        f"branch, found {len(hits)}")
 
 
 def test_the_two_inspector_call_sites_pass_the_same_settings():

@@ -20,13 +20,16 @@ Status lifecycle (derived, not hand-set):
     converted    — EDF/BDF + sidecars written
 
 This module is pure logic (no Tk, no pyedflib); it depends only on
-bids_schema for validation. Fully unit-testable.
+bids_schema for validation and stim_params for the parameter set model.
+Fully unit-testable.
 """
 
 import os
 import json
 from dataclasses import dataclass, field, asdict
 from typing import Optional
+
+from . import stim_params as _stim_params
 
 STATE_FILENAME = "bidsify_state.json"
 
@@ -48,7 +51,7 @@ STATUS_COLOURS = {
     STATUS_CONVERTED:   "#5cb85c",
 }
 
-_SCHEMA_STATE_VERSION = 1
+_SCHEMA_STATE_VERSION = 3
 
 
 # ── Per-file record ───────────────────────────────────────────────────────────
@@ -62,12 +65,29 @@ class FileBidsRecord:
     output_prefix: str = ""            # last written BIDS prefix (for reference)
     marker_names:  list = field(default_factory=list)  # per-file stim codes (scan & pick)
     stim_channel:  str = ""            # per-file stim event channel (scan & pick)
+    #: stim code -> parameter set name. Which protocol each ticked code was.
+    #:
+    #: Per file rather than per session because the same code means different
+    #: things in different recordings: 'A' is the M-wave in one file and the
+    #: only stimulus in another. The SETS are session-level, because a
+    #: threshold is not a property of a recording; the ASSIGNMENT is per file,
+    #: because a stim code is.
+    code_sets:     dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "FileBidsRecord":
+        # Conditions are deliberately NOT held here. They belong to the
+        # recording, not to a conversion, and the session JSON already stores
+        # them under "condition_rows" -- so a copy in this file would be a
+        # second truth that nothing reconciles. It would also put the work of
+        # analysts who never open BIDS-ify into a file named after a feature
+        # they do not use. bidsify.conditions_for() reads the session instead.
+        #
+        # Version 3 records that removal. Keys written by the brief version
+        # that held them are ignored: only the fields below are read.
         return cls(
             rel_path=d.get("rel_path", ""),
             overrides=dict(d.get("overrides", {})),
@@ -77,6 +97,11 @@ class FileBidsRecord:
             output_prefix=d.get("output_prefix", ""),
             marker_names=list(d.get("marker_names", []) or []),
             stim_channel=d.get("stim_channel", ""),
+            # Absent in state written before v2. An empty assignment is the
+            # honest answer for a file reviewed before parameter sets existed:
+            # its codes are unassigned, and it reports as incomplete rather
+            # than silently claiming a protocol nobody stated.
+            code_sets=dict(d.get("code_sets", {}) or {}),
         )
 
 
@@ -90,6 +115,10 @@ class BidsifyState:
         self.powerline_hz = 50
         self.marker_name  = "A"
         self.rawdata_root = ""          # chosen output rawdata root (optional)
+        #: Session-level stimulation parameter sets (see mep_cmap.stim_params).
+        #: Written once and referenced by every file, because a resting motor
+        #: threshold is a property of the session, not of a recording.
+        self.param_sets: list = []
         self._files: dict = {}          # rel_path -> FileBidsRecord
 
     # ---- path keying ----------------------------------------------------------
@@ -124,6 +153,11 @@ class BidsifyState:
                 st.powerline_hz = int(d.get("powerline_hz", 50))
                 st.marker_name  = d.get("marker_name", "A")
                 st.rawdata_root = d.get("rawdata_root", "")
+                # Absent before state version 2. from_dicts tolerates anything
+                # a hand edit could do and skips what it cannot read, because
+                # this runs at startup and an unreadable set must not stop the
+                # tool opening on a study the analyst still needs.
+                st.param_sets   = _stim_params.from_dicts(d.get("param_sets"))
                 for rec in d.get("files", []):
                     fr = FileBidsRecord.from_dict(rec)
                     st._files[fr.rel_path] = fr
@@ -141,6 +175,7 @@ class BidsifyState:
             "powerline_hz": self.powerline_hz,
             "marker_name": self.marker_name,
             "rawdata_root": self.rawdata_root,
+            "param_sets": _stim_params.to_dicts(self.param_sets),
             "files": [r.to_dict() for r in self._files.values()],
         }
         tmp = self.state_path(self.root) + ".tmp"
@@ -196,7 +231,41 @@ class BidsifyState:
         vals["StimulationModality"] = self.modality
         return vals
 
-    def status(self, path: str, schema) -> str:
+    def unassigned_codes(self, path: str, splits=()) -> list:
+        """Ticked stim codes with no parameter set, for this file.
+
+        A code with no set cannot be described: *_nibs.tsv would have no row
+        for its stimuli and *_events.tsv nothing to reference. Reported rather
+        than guessed, because guessing here means publishing a protocol nobody
+        stated.
+
+        ``splits`` is the (code, condition) pairs the Conditions tab created.
+        A split code needs a set for EVERY half -- half of 'A' at 100 mA and
+        half at 150 mA is two protocols -- so it is checked per pair rather
+        than per code. Passed in rather than read here, because that keeps this
+        module free of file access and lets the caller reuse a lookup it has
+        already done.
+        """
+        rec = self.record_for(path, create=False)
+        if rec is None:
+            return []
+        by_code = {}
+        for _c, _cond in (splits or []):
+            by_code.setdefault(_c, []).append(_cond)
+        assigned = rec.code_sets or {}
+        out = []
+        for code in (rec.marker_names or []):
+            conds = by_code.get(code) or []
+            if not conds:
+                if not assigned.get(code):
+                    out.append(code)
+                continue
+            for cond in conds:
+                if not assigned.get(f"{code}\u00b7{cond}"):
+                    out.append(f"{code} / {cond}")
+        return out
+
+    def status(self, path: str, schema, splits=()) -> str:
         """Derive the worklist status for a file."""
         rec = self.record_for(path, create=False)
         if rec and rec.converted:
@@ -204,7 +273,14 @@ class BidsifyState:
         if rec is None or not rec.reviewed:
             return STATUS_NOT_STARTED
         vr = schema.validate(self.effective_values(path), modality=self.modality)
-        return STATUS_READY if vr.ok else STATUS_INCOMPLETE
+        if not vr.ok:
+            return STATUS_INCOMPLETE
+        # A file reviewed before parameter sets existed has ticked codes and no
+        # assignment. It was Ready under the old rules and is not under the new
+        # ones, which is the honest answer: its stimulation is undescribed.
+        if self.unassigned_codes(path, splits):
+            return STATUS_INCOMPLETE
+        return STATUS_READY
 
     def missing_required(self, path: str, schema) -> list:
         """Required field keys still missing for this file (for the tree's hint column)."""
@@ -224,6 +300,33 @@ class BidsifyState:
             out[self.status(p, schema)] += 1
         return out
 
-    def ready_paths(self, paths: list, schema) -> list:
-        """Files that are Ready (reviewed + valid, not yet converted)."""
-        return [p for p in paths if self.status(p, schema) == STATUS_READY]
+    def reopen_for_edit(self, path: str) -> bool:
+        """Clear the converted flag so a file can be corrected and rewritten.
+
+        Keeps everything else -- overrides, ticked codes, parameter set
+        assignment -- because the point is to change one thing that was wrong,
+        not to start again. reset_file() is still there for starting again.
+
+        The written files are NOT deleted. Rewriting overwrites them in place,
+        and deleting first would lose the old output if the rewrite then failed.
+        Returns False when there was nothing converted to reopen.
+        """
+        rec = self.record_for(path, create=False)
+        if rec is None or not rec.converted:
+            return False
+        rec.converted = False
+        rec.converted_at = ""
+        return True
+
+    def ready_paths(self, paths: list, schema, splits_for=None) -> list:
+        """Files that are Ready (reviewed + valid, not yet converted).
+
+        ``splits_for`` is an optional callable taking a path and returning that
+        recording's (code, condition) pairs. Without it a split code is judged
+        on the bare code alone, so a file with one half of a split assigned and
+        the other not would be offered for conversion and would write events
+        referencing a parameter set that is not there.
+        """
+        return [p for p in paths
+                if self.status(p, schema,
+                               splits_for(p) if splits_for else ()) == STATUS_READY]

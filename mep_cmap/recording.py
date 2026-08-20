@@ -299,8 +299,24 @@ def compare_signatures(ref: dict,
                      f"source={r.get('n_samples')} written={t.get('n_samples')} "
                      f"(diff {diff_n:+d}, allowed 0..{pad_tol - 1} padding)")
         rr, tr = r.get("rms", 0.0), t.get("rms", 0.0)
-        if not math.isclose(rr, tr, rel_tol=rms_rtol, abs_tol=rms_atol):
+        # Tolerance of one quantisation step, which is a BOUND rather than a
+        # guess: EDF stores integers, so every sample moves by less than one
+        # step, and |rms(b) - rms(a)| <= rms(b - a) <= max|b - a| < lsb.
+        # Anything within that is explained by integer storage alone; anything
+        # beyond it is not, so this stays strict about real corruption. A 20%
+        # gain error or a halved amplitude is orders of magnitude outside it.
+        #
+        # A relative tolerance cannot do this job. The error is not zero-mean
+        # noise: pyedflib truncates rather than rounds, leaving a systematic
+        # offset of about half a step, and that offset beats against the
+        # signal's own DC mean to shift the RMS by mean*offset/rms. On a
+        # channel with a small AC amplitude sitting on an offset, that is far
+        # more than 0.1% while the samples are still correct to within a step.
+        lsb = float(t.get("lsb") or 0.0)
+        tol = max(rms_rtol * abs(rr), rms_atol, lsb)
+        if abs(tr - rr) > tol:
             d.append(f"ch{i} '{r.get('name')}' RMS: "
-                     f"source={rr:.6g} written={tr:.6g}")
+                     f"source={rr:.6g} written={tr:.6g} "
+                     f"(differs by more than one quantisation step)")
 
     return (len(d) == 0, d)

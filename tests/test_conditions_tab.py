@@ -267,28 +267,88 @@ def test_loading_a_file_lands_on_conditions():
 
 def test_confirming_goes_on_to_the_labels_tab():
     body = _method("_cond_apply")
-    assert "self._cond_confirming = True" in body
     assert "_build_labels_tab(sorted(groups))" in body
+    # The navigation is done here, not inside the rebuild: that method runs on
+    # every rebuild, so navigating from it sent channel switches and confirms
+    # somewhere unexpected too.
+    assert "nb_stage1.select(self.tab1b_frame)" in body
 
 
-def test_confirming_does_not_bounce_back_to_conditions():
-    """Confirm rebuilds the labels tab, which is also what a fresh file does;
-    without distinguishing the two callers that would be a loop."""
-    body = _method("_build_labels_tab", src=APP)
-    assert "_cond_confirming" in body
-    i = body.index("_cond_confirming")
-    assert "nb_stage1.select" in body[i:i + 300]
-
-
-def test_the_flag_is_cleared_even_if_the_rebuild_fails():
-    """Left set, every later file would skip the Conditions tab silently."""
+def test_a_failed_rebuild_does_not_navigate():
+    """Landing on a setup table that was not rebuilt would show the previous
+    grouping as though it were the new one."""
     body = _method("_cond_apply")
-    assert "finally:" in body
-    assert "self._cond_confirming = False" in body
+    i = body.index("Could not rebuild")
+    j = body.index("nb_stage1.select(self.tab1b_frame)")
+    assert "return" in body[i:j]
+
+
+def test_the_rebuild_does_not_navigate():
+    """_build_labels_tab runs on opening a file, switching channel, confirming
+    a channel and applying conditions. Navigating from it meant every one of
+    those jumped somewhere -- confirming a channel advanced to the next and was
+    then thrown to the Conditions tab, which read as the advance having stopped
+    working. Where to go depends on why it was rebuilt, so the caller decides.
+    """
+    body = _method("_build_labels_tab", src=APP)
+    # The jump may live here, but only behind the flag: an ungated select
+    # would fire on every channel switch and every confirm.
+    i = body.index("nb_setup.select(self.tab_conditions)")
+    guard = body.rindex("_go_to_conditions_after_load", 0, i)
+    assert i - guard < 400, "the jump is not gated on a file having been opened"
+
+
+def test_opening_a_file_is_what_goes_to_conditions():
+    assert "_go_to_conditions_after_load = True" in APP
+    body = _method("_build_labels_tab", src=APP)
+    assert "_go_to_conditions_after_load" in body
+
+
+def test_the_jump_happens_once_per_file():
+    """Left set, every later rebuild would jump again."""
+    body = _method("_build_labels_tab", src=APP)
+    assert "_go_to_conditions_after_load = False" in body
 
 
 def test_the_button_says_what_it_does_next():
-    assert "Confirm events & continue" in TAB
+    """Both of them, and each names its own destination.
+
+    "Confirm events & continue" did not say where it went. There are now two
+    destinations, because BIDS-ifying before analysing is a real order of work
+    and the tab previously assumed everyone analyses first.
+    """
+    assert "Confirm & continue to First Level" in TAB
+    assert "Confirm & continue to BIDS-ify" in TAB
+
+
+def test_both_destinations_commit_through_one_function():
+    """Two commit paths would be two callers of one rule -- validation, the
+    per-channel epoch check, writing the events -- and the second would
+    eventually skip a step the first enforces."""
+    assert TAB.count("def _cond_apply(") == 1
+    assert 'destination="first_level"' in TAB
+    assert 'destination="bidsify"' in TAB
+
+
+def test_both_buttons_are_enabled_together():
+    """An invalid table must not become committable by choosing the other
+    destination."""
+    body = _method("_cond_refresh_status")
+    assert "_cond_apply_btn.config" not in body
+    assert body.count("_cond_apply_state") >= 3
+
+
+def test_the_labels_tab_is_rebuilt_whichever_destination():
+    """Conditions change the per-type windows 1a is built from, so skipping the
+    rebuild on the way to BIDS-ify would leave it describing the last
+    grouping."""
+    body = _method("_cond_apply")
+    rebuild = body.find("_build_labels_tab")
+    branch = body.find('destination == \'bidsify\'')
+    if branch == -1:
+        branch = body.find('destination == "bidsify"')
+    assert rebuild != -1 and branch != -1
+    assert rebuild < branch, "the rebuild must happen before the branch"
 
 
 def test_navigation_falls_back_if_the_tab_is_missing():
@@ -655,3 +715,88 @@ def test_loose_trials_can_be_given_rows():
 
 def test_adding_when_nothing_is_loose_says_so():
     assert "already belongs to a condition" in _method("_cond_add_unassigned")
+
+
+# ── which channel the setup starts on ────────────────────────────────────────
+
+def test_confirming_hands_over_on_the_first_analysed_channel():
+    """It handed over on whichever channel happened to be current, so
+    confirming from the Conditions tab could land on EMG 2 with EMG 1 never
+    configured -- and the per-channel advance then had nothing to advance to,
+    because the channel it would have started from was already behind it.
+    """
+    body = _method("_cond_apply")
+    assert "_analysis_channel_indices()" in body
+    assert "_chans[0]" in body
+
+
+def test_the_hand_over_clears_previous_confirmations():
+    """A channel marked confirmed from before would be skipped by the advance,
+    leaving it configured for the old grouping."""
+    body = _method("_cond_apply")
+    assert "self._chan_confirmed = set()" in body
+
+
+def test_per_channel_epochs_walk_every_channel_first():
+    """An epoch set on EMG 1 alone leaves EMG 2 on the file-wide window, and
+    the analyst would not find out until the results disagreed."""
+    body = _method("_cond_apply")
+    assert "_cond_epoch_all_chans.get()" in body
+    assert "_cond_visited_chans" in body
+
+
+def test_the_walk_says_how_many_are_left():
+    body = _method("_cond_apply")
+    assert "still to review" in body
+
+
+def test_the_walk_stops_before_writing_anything():
+    """Half-reviewed channels must not produce an events file."""
+    body = _method("_cond_apply")
+    i = body.index("still to review")
+    j = body.index("to_event_rows")
+    assert i < j, "the walk must return before the events file is built"
+
+
+def test_the_visited_set_resets_for_the_next_run():
+    """Left populated, a second pass would skip every channel."""
+    body = _method("_cond_apply")
+    assert "_cond_visited_chans = set()" in body
+
+
+def test_applying_to_all_channels_does_not_walk():
+    """The common case is one window for the recording; walking every channel
+    to confirm that would be ceremony."""
+    body = _method("_cond_apply")
+    assert "if not self._cond_epoch_all_chans.get():" in body
+
+
+def test_the_header_names_the_recording_after_a_restore():
+    """Restoring the rows without touching the header left "No recording
+    loaded" above a table full of conditions, which contradicts itself and
+    reads as the restore having half worked."""
+    body = _method("_cond_tab_shown")
+    assert "_cond_status.config" in body
+    assert "restored" in body
+
+
+def test_the_empty_header_says_what_to_do():
+    assert "open one from Setup" in TAB
+
+
+def test_the_channel_is_chosen_before_the_table_is_built():
+    """It was chosen afterwards, so the table was built for whichever channel
+    happened to be current and rebuilt again by the switch -- and the switch
+    was skipped when the index already matched, leaving the wrong channel
+    displayed with no way to notice."""
+    body = _method("_cond_apply")
+    i = body.index("self.channel_idx = _first")
+    j = body.index("_build_labels_tab(sorted(groups))")
+    assert i < j, "the channel must be selected before the rebuild"
+
+
+def test_the_channel_is_set_unconditionally():
+    """Guarding on the index already matching left a table built for another
+    channel in place."""
+    body = _method("_cond_apply")
+    assert "if self.channel_idx != _first" not in body

@@ -310,6 +310,32 @@ class Stage2Mixin:
         # Bind right-click on heading for column context menu
         self._s2_tree.bind("<Button-3>", self._s2_on_right_click)
 
+        # Shift+wheel scrolls sideways, which is what anyone reaches for before
+        # dragging a scrollbar. Bound to the tree rather than the window so it
+        # does not hijack the wheel elsewhere. Same idiom as the Stage 1 file
+        # queue, deliberately: two tables that scroll differently is worse than
+        # either behaviour on its own.
+        def _s2_hwheel(event):
+            _d = event.delta
+            if _d:
+                self._s2_tree.xview_scroll(int(-_d / 120) or
+                                           (-1 if _d > 0 else 1), "units")
+            return "break"
+
+        self._s2_tree.bind("<Shift-MouseWheel>", _s2_hwheel)
+        # X11 reports the wheel as buttons 6/7 horizontally. Windows Tk does
+        # not know those numbers and REFUSES THE BIND -- "bad button number 6"
+        # at construction, which stops the tab being built at all. So it is
+        # attempted rather than assumed: a binding that cannot exist on this
+        # platform is not an error, it is simply not that platform.
+        for _seq, _dir in (("<Button-6>", -1), ("<Button-7>", 1)):
+            try:
+                self._s2_tree.bind(
+                    _seq, lambda _e, _d=_dir:
+                    self._s2_tree.xview_scroll(_d, "units"))
+            except tk.TclError:
+                pass
+
         # ── Status bar + quick-select ─────────────────────────────────────────
         bot = tk.Frame(f)
         bot.pack(fill="x", padx=10, pady=(0, 6))
@@ -323,17 +349,48 @@ class Stage2Mixin:
         # ── Internal state ────────────────────────────────────────────────────
         # group_columns: list of {"name": str, "type": "between"|"within"}
         self._s2_group_cols  = []
-
-        # If derivatives path already set from Stage 1, populate and auto-scan
-        _existing_deriv = self.derivatives_path.get() \
-            if hasattr(self, 'derivatives_path') else ""
-        if _existing_deriv:
-            self._s2_deriv_var.set(_existing_deriv)
-            self.root.after(100, self._s2_scan)
         # group_values: {col_name: [val1, val2, ...]}
         self._s2_group_vals  = {}
         # row data: list of dicts (one per session row)
         self._s2_rows        = []
+
+        # Follow Setup's derivatives folder, rather than reading it once.
+        #
+        # This panel is built when the notebook is, which is BEFORE Setup has a
+        # folder and before a restored session writes one. So a single read at
+        # construction found an empty string and nothing ever revisited it: the
+        # analyst opened Second Level on a fully processed study, saw an empty
+        # table, and had no clue the blank folder box was the reason. It only
+        # ever appeared to work when the path happened to be known before the
+        # notebook was built.
+        #
+        # Mirrored on write rather than re-read when the tab is selected,
+        # because the scan is what fills _s2_rows, and Build group analysis file
+        # works from _s2_rows whether or not anyone looked at the tab first.
+        #
+        # Registered AFTER the row state above exists: the scan it triggers is
+        # deferred, so order does not bite today, but a synchronous scan would
+        # reach _s2_rows before there was one.
+        self._s2_deriv_followed = self._s2_deriv_var.get().strip()
+
+        def _s2_follow_deriv(*_a):
+            _new = self.derivatives_path.get().strip()
+            _cur = self._s2_deriv_var.get().strip()
+            # A path typed into this tab's own box wins. Only a box that is
+            # empty, or still holds whatever was mirrored last time, follows
+            # Setup -- otherwise choosing a folder in Setup would silently
+            # discard a deliberately different one set here.
+            if _cur and _cur != self._s2_deriv_followed and _cur != _new:
+                return
+            if _new != _cur:
+                self._s2_deriv_var.set(_new)
+            self._s2_deriv_followed = _new
+            self._s2_autoscan()
+
+        self.derivatives_path.trace_add("write", _s2_follow_deriv)
+        # And once now, for the case the old one-shot read was written for: a
+        # path already known by the time this panel is built.
+        _s2_follow_deriv()
 
         self._s2_rebuild_tree_columns()
         self._s2_update_status()
@@ -346,6 +403,46 @@ class Stage2Mixin:
         if folder:
             self._s2_deriv_var.set(folder)
             self.derivatives_path.set(folder)
+
+    def _s2_autoscan(self, delay_ms=150):
+        """Scan because Setup changed, quietly, and once per burst.
+
+        Not simply _s2_scan. That reports a missing folder with a dialogue,
+        which is right when the analyst pressed Scan folder and wrong when
+        nobody asked: startup writes derivatives_path more than once, and a
+        folder that is briefly unset or absent is not worth interrupting anyone
+        about. An automatic scan is therefore silent about a bad path and does
+        nothing at all rather than complaining.
+
+        Coalesced too, because those repeated writes would otherwise walk the
+        whole derivatives tree once each.
+        """
+        _tok = getattr(self, "_s2_autoscan_token", None)
+        if _tok is not None:
+            try:
+                self.root.after_cancel(_tok)
+            except Exception:                       # noqa: BLE001 — stale token
+                pass
+            self._s2_autoscan_token = None
+        self._s2_autoscan_token = self.root.after(delay_ms, self._s2_autoscan_fire)
+
+    def _s2_autoscan_fire(self):
+        """The deferred half. Re-checks the path, because it may have moved on."""
+        self._s2_autoscan_token = None
+        _path = self._s2_deriv_var.get().strip()
+        if not _path or not os.path.isdir(_path):
+            return
+        if not hasattr(self, "_s2_tree"):
+            return
+        try:
+            self._s2_scan()
+        except Exception as exc:                    # noqa: BLE001 — logged
+            # An automatic scan must not take the window down. The manual
+            # button still surfaces problems the ordinary way.
+            _log = getattr(self, "log", None)
+            if callable(_log):
+                _log(f"   ⚠️  Automatic derivatives scan failed: "
+                     f"{type(exc).__name__}: {exc}")
 
     def _s2_scan(self):
         """Scan the derivatives folder for sidecar JSONs and populate the table."""
@@ -385,12 +482,36 @@ class Stage2Mixin:
                         if not _run:
                             _m = re.search(r"run-([A-Za-z0-9]+)", fn)
                             _run = _m.group(1) if _m else ""
+
+                        # Limb and channel, so rows that differ can be told
+                        # apart.
+                        #
+                        # A multi-channel run writes one set of derivatives per
+                        # channel, so a two-channel recording produced two rows
+                        # with identical participant, session and task -- no
+                        # column said which was which, and the two muscles read
+                        # as a duplicate.
+                        #
+                        # Both come from the filename's BIDS entities, with the
+                        # sidecar as a fallback: the entity is what the run
+                        # itself wrote, so it is right even when the sidecar is
+                        # from an older version that did not record it.
+                        _limb = meta.get("limb") or ""
+                        if not _limb:
+                            _m = re.search(r"limb-([A-Za-z0-9]+)", fn)
+                            _limb = _m.group(1) if _m else ""
+                        _chan = meta.get("channel") or ""
+                        if not _chan:
+                            _m = re.search(r"channel-([A-Za-z0-9]+)", fn)
+                            _chan = _m.group(1) if _m else ""
                         found.append({
                             "include":        True,
                             "participant_id": meta.get("participant_id") or _sub,
                             "session":        meta.get("session")        or _ses,
                             "run":            _run,
                             "task":           meta.get("task",           ""),
+                            "limb":           _limb,
+                            "channel":        _chan,
                             "timepoint":      meta.get("timepoint",      ""),
                             "_json_path":     jpath,
                             "_trials_csv":    jpath.replace("_trials.json", "_trials.csv"),
@@ -425,7 +546,8 @@ class Stage2Mixin:
 
         # Sort by participant then session
         merged.sort(key=lambda r: (r["participant_id"], r["session"],
-                                   r.get("run", "")))
+                                   r.get("run", ""), r.get("limb", ""),
+                                   r.get("channel", "")))
         self._s2_rows = merged
         self._s2_refresh_tree()
         self._s2_update_status()
@@ -435,7 +557,7 @@ class Stage2Mixin:
     def _s2_rebuild_tree_columns(self):
         """Rebuild Treeview columns from current state."""
         fixed = ["include", "participant_id", "session", "run", "task",
-                 "timepoint", "configure"]
+                 "limb", "channel", "timepoint", "configure"]
         group_names = [gc["name"] for gc in self._s2_group_cols]
         all_cols = fixed + group_names
 
@@ -446,6 +568,8 @@ class Stage2Mixin:
             "session":        80,
             "run":            55,
             "task":           90,
+            "limb":           70,
+            "channel":        85,
             "timepoint":      80,
             "configure":      80,
         }
@@ -455,6 +579,8 @@ class Stage2Mixin:
             "session":        "Session",
             "run":            "Run",
             "task":           "Task",
+            "limb":           "Limb",
+            "channel":        "Channel",
             "timepoint":      "Timepoint",
             "configure":      "Setup",
         }
@@ -468,7 +594,21 @@ class Stage2Mixin:
                 lbl = f"~ {col}"
             self._s2_tree.heading(col, text=lbl,
                 command=lambda c=col: self._s2_sort_by(c))
-            self._s2_tree.column(col, width=w, minwidth=50, anchor="center")
+            # stretch=False, and stated rather than left to the default.
+            #
+            # Tk's default is stretch=True, which makes every column absorb a
+            # share of the leftover space: the columns then total exactly the
+            # widget width, never more, so the horizontal scrollbar below has
+            # nothing to scroll to and does nothing at all. The same default
+            # made the Stage 1 file queue's scrollbar inert.
+            #
+            # It matters more here than it looks, because the column count is
+            # not fixed -- every group column added by the analyst widens the
+            # table, and with stretch on, they are absorbed by squeezing the
+            # fixed columns until Participant and Timepoint are unreadable
+            # instead of becoming scrollable.
+            self._s2_tree.column(col, width=w, minwidth=50, stretch=False,
+                                 anchor="center")
 
         self._s2_rebuild_col_buttons()
 
@@ -491,17 +631,23 @@ class Stage2Mixin:
         """Clear and repopulate the Treeview from self._s2_rows."""
         for item in self._s2_tree.get_children():
             self._s2_tree.delete(item)
-        fixed = ["participant_id", "session", "run", "task", "timepoint"]
+        # Filled from the tree's OWN column list, not a second one written by
+        # hand.
+        #
+        # There were two lists and they disagreed: the columns included "run"
+        # and this loop did not, so every value after it was written one column
+        # to the left and Run was permanently blank. A column added to one list
+        # and forgotten in the other shifts the whole row silently.
+        _cols = [c for c in (self._s2_tree["columns"] or [])
+                 if c not in ("include", "configure")]
         for i, row in enumerate(self._s2_rows):
-            vals = []
-            vals.append("☑" if row.get("include", True) else "☐")
-            for col in ["participant_id", "session", "task", "timepoint"]:
+            vals = ["☑" if row.get("include", True) else "☐"]
+            for col in _cols:
                 vals.append(row.get(col, ""))
             # Configure column: show tick if already configured
             cfg = row.get("_config", {})
-            vals.append("⚙ configured" if cfg.get("_done") else "⚙ setup")
-            for gc in self._s2_group_cols:
-                vals.append(row.get(gc["name"], ""))
+            vals.insert(self._s2_tree["columns"].index("configure"),
+                        "⚙ configured" if cfg.get("_done") else "⚙ setup")
             tag = "even" if i % 2 == 0 else "odd"
             self._s2_tree.insert("", "end", iid=str(i),
                                  values=vals, tags=(tag,))

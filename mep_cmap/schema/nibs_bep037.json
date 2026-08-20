@@ -1,12 +1,13 @@
 {
   "schema_name": "nibs_bep037",
-  "schema_version": "0.2.0",
-  "based_on": "BEP037 NIBS-BIDS, draft v6.2 (2026-03). Field keys are a grounded reconstruction from the NIBS/TMS reporting domain and the BEP037 structure (TMS/tES/TUS; parameters harmonised with SimNIBS where possible). The authoritative spec is the locked BEP037 Google document; reconcile key names against it and bump schema_version when you do.",
+  "schema_version": "0.3.0",
+  "based_on": "NIBS-BIDS (BEP037) proposal v6.3, from the development repository at https://github.com/nigelrogasch/nibs-bids (specification/nibs-bids.md), cross-checked against the preprint at doi:10.5281/zenodo.19337642. Earlier versions of this schema were a reconstruction of v6.2; field names are now taken from the spec text itself. Field keys below are this tool's own stable identifiers and are NOT renamed when the spec renames things: 'emits' carries the v6.3 output name and 'block' says which file or JSON block it is written into, so a spec rename is an 'emits' change and never breaks a saved bidsify_state.json.",
   "datatype": "nibs",
   "modalities": [
     "TMS",
     "tES",
-    "TUS"
+    "TUS",
+    "PNS"
   ],
   "groups": [
     "device",
@@ -19,7 +20,7 @@
     "recommended",
     "optional"
   ],
-  "_field_notes": "Each field: key (the JSON sidecar key, BIDS-style CamelCase), modalities (which NIBS modalities it applies to; 'common' = all), group (UI/display block), level (required|recommended|optional), type (string|number|integer|boolean|array), units (null or a unit string), enum (null or list of allowed values), advanced (bool; collapsed by default in the dialog), description, scope (session=enter once in shared defaults | file=likely to vary per recording, foregrounded in the per-file editor).",
+  "_field_notes": "Each field: key (the JSON sidecar key, BIDS-style CamelCase), modalities (which NIBS modalities it applies to; 'common' = all), group (UI/display block), level (required|recommended|optional), type (string|number|integer|boolean|array), units (null or a unit string), enum (null or list of allowed values), advanced (bool; collapsed by default in the dialog), description, scope (session=enter once in shared defaults | file=likely to vary per recording, foregrounded in the per-file editor). block: where the value serialises (StimulatorSet | ElementSet | IntensitySet | NavigationSystem | nibs.tsv | markers.tsv | events.tsv | coordsystem.json | '' for a top-level *_nibs.json key). emits: the v6.3 name written under, '' meaning the key itself. legacy: read from older saved state, never written. scope gains 'parameter_set' = varies by stimulation parameter set (per stim code), which is where v6.3 puts most stimulation parameters.",
   "fields": [
     {
       "key": "StimulationModality",
@@ -33,11 +34,15 @@
       "enum": [
         "TMS",
         "tES",
-        "TUS"
+        "TUS",
+        "PNS"
       ],
       "advanced": false,
       "description": "Primary non-invasive brain stimulation modality applied during the recording.",
-      "scope": "session"
+      "scope": "session",
+      "block": "",
+      "emits": "nibs_type",
+      "legacy": true
     },
     {
       "key": "StimulationDescription",
@@ -51,7 +56,9 @@
       "enum": null,
       "advanced": false,
       "description": "Free-text summary of the stimulation protocol, in the experimenter's own words.",
-      "scope": "file"
+      "scope": "file",
+      "block": "",
+      "emits": "NIBSDescription"
     },
     {
       "key": "Manufacturer",
@@ -65,7 +72,9 @@
       "enum": null,
       "advanced": false,
       "description": "Manufacturer of the stimulation device (e.g. Magstim, MagVenture, Brainsway, Soterix, NeuroFUS).",
-      "scope": "session"
+      "scope": "session",
+      "block": "StimulatorSet",
+      "emits": "Manufacturer"
     },
     {
       "key": "ManufacturersModelName",
@@ -79,7 +88,9 @@
       "enum": null,
       "advanced": false,
       "description": "Model name/number of the stimulation device (e.g. 'Magstim 200^2', 'MagPro X100').",
-      "scope": "session"
+      "scope": "session",
+      "block": "StimulatorSet",
+      "emits": "ManufacturerModelName"
     },
     {
       "key": "SoftwareVersions",
@@ -93,7 +104,9 @@
       "enum": null,
       "advanced": true,
       "description": "Version of the stimulator control / neuronavigation software used for acquisition.",
-      "scope": "session"
+      "scope": "session",
+      "block": "StimulatorSet",
+      "emits": "SoftwareVersion"
     },
     {
       "key": "DeviceSerialNumber",
@@ -107,7 +120,9 @@
       "enum": null,
       "advanced": true,
       "description": "Serial number of the stimulation device.",
-      "scope": "session"
+      "scope": "session",
+      "block": "StimulatorSet",
+      "emits": "ManufacturerSerialNumber"
     },
     {
       "key": "CoilModel",
@@ -121,7 +136,9 @@
       "enum": null,
       "advanced": false,
       "description": "Model name of the TMS coil (e.g. 'D70 Alpha', 'Cool-B65', 'MCF-B70').",
-      "scope": "session"
+      "scope": "session",
+      "block": "ElementSet",
+      "emits": "ModelName"
     },
     {
       "key": "CoilType",
@@ -142,7 +159,9 @@
       ],
       "advanced": false,
       "description": "Geometry of the TMS coil.",
-      "scope": "session"
+      "scope": "session",
+      "block": "ElementSet",
+      "emits": "CoilShape"
     },
     {
       "key": "CoilManufacturer",
@@ -156,27 +175,71 @@
       "enum": null,
       "advanced": true,
       "description": "Manufacturer of the TMS coil, if different from the stimulator manufacturer.",
-      "scope": "session"
+      "scope": "session",
+      "block": "ElementSet",
+      "emits": "Manufacturer"
     },
     {
       "key": "PulseShape",
       "modalities": [
-        "TMS"
+        "TMS",
+        "PNS",
+        "tES",
+        "TUS"
       ],
       "group": "device",
       "level": "recommended",
       "type": "string",
       "units": null,
       "enum": [
-        "monophasic",
-        "biphasic",
-        "halfsine",
-        "biphasic-burst",
-        "other"
+        "Monophasic",
+        "Biphasic",
+        "Halfsine",
+        "Rectangle",
+        "Sinusoid",
+        "Noise",
+        "Custom"
       ],
       "advanced": false,
-      "description": "Waveform of the induced electric field pulse.",
-      "scope": "session"
+      "description": "Waveform shape of the base stimulus, from the closed vocabulary in NIBS-BIDS v6.3. Monophasic/Biphasic/Halfsine apply to TMS; Rectangle covers square pulses (tES blocks and peripheral nerve stimulation); Sinusoid covers tACS and TUS carriers; Custom requires StimulusDescription.",
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "stimulus_shape"
+    },
+    {
+      "key": "FirstInflection",
+      "modalities": [
+        "TMS"
+      ],
+      "group": "parameters",
+      "level": "optional",
+      "type": "string",
+      "units": null,
+      "enum": [
+        "rising",
+        "descending"
+      ],
+      "advanced": true,
+      "description": "Direction of the first deflection of the induced current, corresponding to the normal or reverse setting on the stimulator.",
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "first_inflection"
+    },
+    {
+      "key": "StimulusDescription",
+      "modalities": [
+        "common"
+      ],
+      "group": "parameters",
+      "level": "optional",
+      "type": "string",
+      "units": null,
+      "enum": null,
+      "advanced": true,
+      "description": "Free-text description of a waveform not covered by the shape vocabulary. Required by v6.3 when PulseShape is 'Custom'.",
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "stimulus_description"
     },
     {
       "key": "CurrentDirection",
@@ -196,7 +259,9 @@
       ],
       "advanced": false,
       "description": "Direction of the induced current in the cortex relative to the central sulcus (posterior-anterior, etc.).",
-      "scope": "session"
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "current_direction"
     },
     {
       "key": "PulseConfiguration",
@@ -217,12 +282,16 @@
       ],
       "advanced": false,
       "description": "High-level TMS protocol class.",
-      "scope": "file"
+      "scope": "file",
+      "block": "",
+      "emits": "",
+      "legacy": true
     },
     {
       "key": "TargetMuscle",
       "modalities": [
-        "TMS"
+        "TMS",
+        "PNS"
       ],
       "group": "parameters",
       "level": "recommended",
@@ -231,12 +300,15 @@
       "enum": null,
       "advanced": false,
       "description": "Muscle used to define the motor hotspot and threshold (e.g. 'FDI', 'APB', 'ADM').",
-      "scope": "file"
+      "scope": "file",
+      "block": "",
+      "emits": ""
     },
     {
       "key": "StimulationIntensity",
       "modalities": [
-        "TMS"
+        "TMS",
+        "PNS"
       ],
       "group": "parameters",
       "level": "recommended",
@@ -245,12 +317,15 @@
       "enum": null,
       "advanced": false,
       "description": "Test-pulse stimulation intensity. The unit is given by StimulationIntensityUnits.",
-      "scope": "file"
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "stimulus_intensity"
     },
     {
       "key": "StimulationIntensityUnits",
       "modalities": [
-        "TMS"
+        "TMS",
+        "PNS"
       ],
       "group": "parameters",
       "level": "recommended",
@@ -258,16 +333,54 @@
       "units": null,
       "enum": [
         "%MSO",
-        "%RMT",
-        "%AMT",
-        "%SI1mV",
+        "mA",
         "T",
         "A/us",
         "V"
       ],
       "advanced": false,
-      "description": "Unit in which StimulationIntensity is expressed (percent of maximum stimulator output, percent of resting/active motor threshold, etc.).",
-      "scope": "file"
+      "description": "Units of the delivered amplitude in StimulationIntensity. This is the unit only: what the intensity was dosed against goes in IntensityReference, and the multiplier in IntensityScaling. So 120% of a resting motor threshold of 50 %MSO is recorded as intensity 60, units %MSO, reference rMT, scaling 1.2.",
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": ""
+    },
+    {
+      "key": "IntensityReference",
+      "modalities": [
+        "common"
+      ],
+      "group": "parameters",
+      "level": "recommended",
+      "type": "string",
+      "units": null,
+      "enum": [
+        "rMT",
+        "aMT",
+        "1mV",
+        "e-field",
+        "absolute"
+      ],
+      "advanced": false,
+      "description": "What the intensity was dosed against. 'rMT' and 'aMT' reference the measured motor thresholds; 'absolute' means the amplitude was set directly. The measured value of the reference is recorded once per session (RestingMotorThreshold / ActiveMotorThreshold).",
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "intensity_reference"
+    },
+    {
+      "key": "IntensityScaling",
+      "modalities": [
+        "common"
+      ],
+      "group": "parameters",
+      "level": "recommended",
+      "type": "string",
+      "units": null,
+      "enum": null,
+      "advanced": false,
+      "description": "Multiplier applied to the reference, e.g. 1.2 for 120% of resting motor threshold, or 'absolute' when the amplitude was specified directly. Delivered amplitude = reference value x scaling.",
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "intensity_scaling"
     },
     {
       "key": "RestingMotorThreshold",
@@ -281,7 +394,9 @@
       "enum": null,
       "advanced": false,
       "description": "Resting motor threshold expressed as percent of maximum stimulator output.",
-      "scope": "session"
+      "scope": "session",
+      "block": "IntensitySet",
+      "emits": "Value"
     },
     {
       "key": "ActiveMotorThreshold",
@@ -295,7 +410,9 @@
       "enum": null,
       "advanced": true,
       "description": "Active motor threshold expressed as percent of maximum stimulator output.",
-      "scope": "session"
+      "scope": "session",
+      "block": "IntensitySet",
+      "emits": "Value"
     },
     {
       "key": "MotorThresholdMethod",
@@ -314,12 +431,15 @@
       ],
       "advanced": true,
       "description": "Procedure used to estimate motor threshold.",
-      "scope": "session"
+      "scope": "session",
+      "block": "IntensitySet",
+      "emits": "Algorithm"
     },
     {
       "key": "ConditioningStimulusIntensity",
       "modalities": [
-        "TMS"
+        "TMS",
+        "PNS"
       ],
       "group": "parameters",
       "level": "optional",
@@ -328,12 +448,15 @@
       "enum": null,
       "advanced": true,
       "description": "Paired-pulse conditioning stimulus intensity (units as StimulationIntensityUnits).",
-      "scope": "file"
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "pattern1_intensity"
     },
     {
       "key": "TestStimulusIntensity",
       "modalities": [
-        "TMS"
+        "TMS",
+        "PNS"
       ],
       "group": "parameters",
       "level": "optional",
@@ -342,12 +465,15 @@
       "enum": null,
       "advanced": true,
       "description": "Paired-pulse test stimulus intensity (units as StimulationIntensityUnits).",
-      "scope": "file"
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "pattern1_intensity"
     },
     {
       "key": "InterPulseInterval",
       "modalities": [
-        "TMS"
+        "TMS",
+        "PNS"
       ],
       "group": "parameters",
       "level": "optional",
@@ -356,12 +482,15 @@
       "enum": null,
       "advanced": true,
       "description": "Interval between conditioning and test pulses in paired-pulse protocols (e.g. SICI, ICF).",
-      "scope": "file"
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "pattern1_interval"
     },
     {
       "key": "RepetitionRate",
       "modalities": [
-        "TMS"
+        "TMS",
+        "PNS"
       ],
       "group": "parameters",
       "level": "optional",
@@ -370,12 +499,15 @@
       "enum": null,
       "advanced": true,
       "description": "Pulse repetition rate for repetitive TMS protocols.",
-      "scope": "file"
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "pattern2_frequency"
     },
     {
       "key": "NumberOfPulses",
       "modalities": [
-        "TMS"
+        "TMS",
+        "PNS"
       ],
       "group": "parameters",
       "level": "optional",
@@ -384,12 +516,15 @@
       "enum": null,
       "advanced": true,
       "description": "Total number of pulses delivered in the recording/run.",
-      "scope": "file"
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "stimulus_pulses_number"
     },
     {
       "key": "PulsesPerTrain",
       "modalities": [
-        "TMS"
+        "TMS",
+        "PNS"
       ],
       "group": "parameters",
       "level": "optional",
@@ -398,12 +533,15 @@
       "enum": null,
       "advanced": true,
       "description": "Number of pulses per train (repetitive TMS).",
-      "scope": "file"
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "pattern2_count"
     },
     {
       "key": "NumberOfTrains",
       "modalities": [
-        "TMS"
+        "TMS",
+        "PNS"
       ],
       "group": "parameters",
       "level": "optional",
@@ -412,12 +550,15 @@
       "enum": null,
       "advanced": true,
       "description": "Number of trains delivered (repetitive TMS).",
-      "scope": "file"
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "pattern3_count"
     },
     {
       "key": "InterTrainInterval",
       "modalities": [
-        "TMS"
+        "TMS",
+        "PNS"
       ],
       "group": "parameters",
       "level": "optional",
@@ -426,12 +567,15 @@
       "enum": null,
       "advanced": true,
       "description": "Interval between trains (repetitive TMS).",
-      "scope": "file"
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "pattern3_interval"
     },
     {
       "key": "BurstFrequency",
       "modalities": [
-        "TMS"
+        "TMS",
+        "PNS"
       ],
       "group": "parameters",
       "level": "optional",
@@ -440,12 +584,15 @@
       "enum": null,
       "advanced": true,
       "description": "Within-burst frequency for theta-burst stimulation.",
-      "scope": "file"
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "pattern1_frequency"
     },
     {
       "key": "PulsesPerBurst",
       "modalities": [
-        "TMS"
+        "TMS",
+        "PNS"
       ],
       "group": "parameters",
       "level": "optional",
@@ -454,12 +601,15 @@
       "enum": null,
       "advanced": true,
       "description": "Number of pulses per burst for theta-burst stimulation.",
-      "scope": "file"
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "pattern1_count"
     },
     {
       "key": "InterStimulusInterval",
       "modalities": [
-        "TMS"
+        "TMS",
+        "PNS"
       ],
       "group": "parameters",
       "level": "optional",
@@ -468,7 +618,9 @@
       "enum": null,
       "advanced": true,
       "description": "Nominal interval between successive single pulses in a mapping/MEP block.",
-      "scope": "file"
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "pattern1_interval"
     },
     {
       "key": "StimulationType",
@@ -488,7 +640,9 @@
       ],
       "advanced": false,
       "description": "Transcranial electrical stimulation sub-type.",
-      "scope": "file"
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "stimulus_shape"
     },
     {
       "key": "Current",
@@ -502,7 +656,9 @@
       "enum": null,
       "advanced": false,
       "description": "Applied current amplitude.",
-      "scope": "file"
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "stimulus_intensity"
     },
     {
       "key": "CurrentDensity",
@@ -516,12 +672,15 @@
       "enum": null,
       "advanced": true,
       "description": "Current density at the stimulating electrode.",
-      "scope": "file"
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": ""
     },
     {
       "key": "StimulationDuration",
       "modalities": [
-        "tES"
+        "tES",
+        "PNS"
       ],
       "group": "parameters",
       "level": "recommended",
@@ -530,7 +689,9 @@
       "enum": null,
       "advanced": false,
       "description": "Total duration of stimulation, excluding fade in/out.",
-      "scope": "file"
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "stimulus_duration"
     },
     {
       "key": "FadeInDuration",
@@ -544,7 +705,9 @@
       "enum": null,
       "advanced": true,
       "description": "Ramp-up duration at stimulation onset.",
-      "scope": "file"
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "ramp_up"
     },
     {
       "key": "FadeOutDuration",
@@ -558,12 +721,15 @@
       "enum": null,
       "advanced": true,
       "description": "Ramp-down duration at stimulation offset.",
-      "scope": "file"
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "ramp_down"
     },
     {
       "key": "Frequency",
       "modalities": [
-        "tES"
+        "tES",
+        "PNS"
       ],
       "group": "parameters",
       "level": "optional",
@@ -572,7 +738,9 @@
       "enum": null,
       "advanced": true,
       "description": "Oscillation frequency for tACS.",
-      "scope": "file"
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "frequency"
     },
     {
       "key": "PhaseOffset",
@@ -586,12 +754,15 @@
       "enum": null,
       "advanced": true,
       "description": "Phase offset for tACS, relative to a reference channel or event.",
-      "scope": "file"
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "starting_phase"
     },
     {
       "key": "ElectrodeType",
       "modalities": [
-        "tES"
+        "tES",
+        "PNS"
       ],
       "group": "device",
       "level": "recommended",
@@ -606,12 +777,15 @@
       ],
       "advanced": false,
       "description": "Type of stimulating electrode.",
-      "scope": "session"
+      "scope": "session",
+      "block": "ElementSet",
+      "emits": "ElectrodeShape"
     },
     {
       "key": "ElectrodeSize",
       "modalities": [
-        "tES"
+        "tES",
+        "PNS"
       ],
       "group": "device",
       "level": "optional",
@@ -620,7 +794,9 @@
       "enum": null,
       "advanced": true,
       "description": "Contact area of the stimulating electrode.",
-      "scope": "session"
+      "scope": "session",
+      "block": "ElementSet",
+      "emits": "ElectrodeArea"
     },
     {
       "key": "MontageDescription",
@@ -634,12 +810,15 @@
       "enum": null,
       "advanced": false,
       "description": "Description of the electrode montage (anode/cathode placement).",
-      "scope": "session"
+      "scope": "session",
+      "block": "markers.tsv",
+      "emits": "position_description"
     },
     {
       "key": "AnodeLocation",
       "modalities": [
-        "tES"
+        "tES",
+        "PNS"
       ],
       "group": "targeting",
       "level": "optional",
@@ -648,12 +827,15 @@
       "enum": null,
       "advanced": true,
       "description": "Anode position, e.g. a 10-20 label such as 'C3'.",
-      "scope": "session"
+      "scope": "parameter_set",
+      "block": "markers.tsv",
+      "emits": "position_label"
     },
     {
       "key": "CathodeLocation",
       "modalities": [
-        "tES"
+        "tES",
+        "PNS"
       ],
       "group": "targeting",
       "level": "optional",
@@ -662,7 +844,9 @@
       "enum": null,
       "advanced": true,
       "description": "Cathode position, e.g. a 10-20 label such as 'Fp2'.",
-      "scope": "session"
+      "scope": "parameter_set",
+      "block": "markers.tsv",
+      "emits": "position_label"
     },
     {
       "key": "TransducerModel",
@@ -676,7 +860,9 @@
       "enum": null,
       "advanced": false,
       "description": "Model of the ultrasound transducer.",
-      "scope": "session"
+      "scope": "session",
+      "block": "ElementSet",
+      "emits": "ModelName"
     },
     {
       "key": "FundamentalFrequency",
@@ -690,7 +876,9 @@
       "enum": null,
       "advanced": false,
       "description": "Carrier (fundamental) frequency of the ultrasound.",
-      "scope": "file"
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "frequency"
     },
     {
       "key": "AcousticIntensitySPPA",
@@ -704,7 +892,9 @@
       "enum": null,
       "advanced": true,
       "description": "Spatial-peak pulse-average acoustic intensity.",
-      "scope": "file"
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "spatial_peak_pulse_average_intensity"
     },
     {
       "key": "MechanicalIndex",
@@ -718,7 +908,9 @@
       "enum": null,
       "advanced": true,
       "description": "Mechanical index of the sonication.",
-      "scope": "file"
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "mechanical_index"
     },
     {
       "key": "PulseRepetitionFrequency",
@@ -732,7 +924,9 @@
       "enum": null,
       "advanced": true,
       "description": "Pulse repetition frequency of the sonication.",
-      "scope": "file"
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "pattern1_frequency"
     },
     {
       "key": "DutyCycle",
@@ -746,7 +940,9 @@
       "enum": null,
       "advanced": true,
       "description": "Duty cycle of the sonication.",
-      "scope": "file"
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "duty_cycle"
     },
     {
       "key": "SonicationDuration",
@@ -760,14 +956,17 @@
       "enum": null,
       "advanced": false,
       "description": "Total duration of a sonication.",
-      "scope": "file"
+      "scope": "parameter_set",
+      "block": "nibs.tsv",
+      "emits": "stimulus_duration"
     },
     {
       "key": "TargetRegion",
       "modalities": [
         "TMS",
         "tES",
-        "TUS"
+        "TUS",
+        "PNS"
       ],
       "group": "targeting",
       "level": "recommended",
@@ -776,14 +975,17 @@
       "enum": null,
       "advanced": false,
       "description": "Anatomical/functional target of stimulation (e.g. 'left M1 hand knob', 'left DLPFC').",
-      "scope": "session"
+      "scope": "parameter_set",
+      "block": "markers.tsv",
+      "emits": "position_description"
     },
     {
       "key": "TargetingMethod",
       "modalities": [
         "TMS",
         "tES",
-        "TUS"
+        "TUS",
+        "PNS"
       ],
       "group": "targeting",
       "level": "recommended",
@@ -799,7 +1001,9 @@
       ],
       "advanced": false,
       "description": "How the stimulation site was located on the head.",
-      "scope": "session"
+      "scope": "parameter_set",
+      "block": "markers.tsv",
+      "emits": "coil_positioning_method"
     },
     {
       "key": "NeuronavigationSystem",
@@ -814,7 +1018,9 @@
       "enum": null,
       "advanced": true,
       "description": "Neuronavigation system used (e.g. 'Localite', 'Brainsight', 'Visor2'). Leave blank if no neuronavigation was used.",
-      "scope": "session"
+      "scope": "session",
+      "block": "NavigationSystem",
+      "emits": "NavigationSystemName"
     },
     {
       "key": "StructuralMRI",
@@ -829,7 +1035,9 @@
       "enum": null,
       "advanced": true,
       "description": "Reference to the structural scan used for neuronavigation (BIDS path or 'template').",
-      "scope": "session"
+      "scope": "session",
+      "block": "coordsystem.json",
+      "emits": "IntendedFor"
     },
     {
       "key": "TargetCoordinateSystem",
@@ -849,7 +1057,9 @@
       ],
       "advanced": true,
       "description": "Coordinate system in which TargetCoordinates are expressed.",
-      "scope": "session"
+      "scope": "session",
+      "block": "coordsystem.json",
+      "emits": "NIBSCoordinateSystem"
     },
     {
       "key": "TargetCoordinates",
@@ -864,7 +1074,9 @@
       "enum": null,
       "advanced": true,
       "description": "Target location as [x, y, z] in TargetCoordinateSystem.",
-      "scope": "session"
+      "scope": "parameter_set",
+      "block": "markers.tsv",
+      "emits": ""
     },
     {
       "key": "CoilOrientation",
@@ -878,7 +1090,14 @@
       "enum": null,
       "advanced": true,
       "description": "Coil handle orientation relative to the mid-sagittal line.",
-      "scope": "session"
+      "scope": "parameter_set",
+      "block": "markers.tsv",
+      "emits": "coil_handle_direction"
     }
+  ],
+  "scopes": [
+    "session",
+    "file",
+    "parameter_set"
   ]
 }

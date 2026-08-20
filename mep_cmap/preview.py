@@ -433,7 +433,16 @@ class PreviewDetectionMixin:
         samples_before = int(prestim_ms * fs / 1000)
         delay_map = params.get("delay_ms_map") or {}
 
-        segments, picked, dropped = {}, {}, {}
+        # Two sets are cut: the chosen trials, which the Inspector draws, and
+        # EVERY trial, which detection runs over.
+        #
+        # Onset anchoring takes the median onset of a stimulus type and the
+        # amplitude window is derived from it, so detecting over eight of
+        # twenty trials gives a different median -- and therefore a different
+        # window and a different peak-to-peak -- from the run. Cutting all of
+        # them costs one pass over an array already in memory, and it is the
+        # difference between the preview being close and being right.
+        segments, picked, dropped, every = {}, {}, {}, {}
         for stim_type, idxs in chosen.items():
             samples_after = window_samples(_wincfg, stim_type, fs)[1]
             times = loaded["usable"].get(stim_type, [])
@@ -456,7 +465,19 @@ class PreviewDetectionMixin:
                 picked[stim_type] = kept
             dropped[stim_type] = len(idxs) - len(segs)
 
+            _all = []
+            for i in range(len(times)):
+                ix = int(np.argmin(np.abs(time - times[i]))) + shift
+                if ix < 0 or ix >= len(emg):
+                    continue
+                seg = emg[max(0, ix - samples_before): ix + samples_after]
+                if len(seg) == samples_before + samples_after:
+                    _all.append(seg)
+            if _all:
+                every[stim_type] = _all
+
         return dict(segments=segments, picked=picked, dropped=dropped,
+                    every=every,
                     fs=fs, unit=loaded["unit"], prestim_ms=prestim_ms,
                     post_ms=post_ms)
 
@@ -468,13 +489,169 @@ class PreviewDetectionMixin:
                 self.log(f"     ({payload['dropped'][stim_type]} chosen "
                          f"trial(s) did not fit the window)")
 
-        # State the two things a pre-run preview cannot reproduce, rather than
-        # letting the analyst assume the run will match in every respect.
-        if getattr(self, "ptp_anchor", None) is not None and \
-                bool(self.ptp_anchor.get()):
-            self.log("   ℹ️  Amplitude-window anchoring is computed from a "
-                     "completed run, so this preview uses the file-wide "
-                     "window.")
+        # Detect with the analysis's own detector, and seed the Inspector with
+        # the result.
+        #
+        # The Inspector re-detects whatever it is not given, one trial at a
+        # time. That is a different computation from the analysis: onset
+        # anchoring takes the MEDIAN onset of a stimulus type, and the search
+        # window is widened from the latency profile across the sample -- work
+        # that needs every trial. Given none of it, the Inspector fell back to
+        # the file-wide window and reported the window edge as a latency, so
+        # the preview disagreed with the run it was previewing.
+        #
+        # pipeline_detect_onsets is the sole source of automatic onset values
+        # in the analysis. Calling it here is what makes this a rehearsal
+        # rather than a second opinion.
+        _seed, _ptp_ms = {}, {}
+        try:
+            from .pipeline import (PipelineConfig, pipeline_detect_onsets,
+                                   ptp_window_for_stim_type,
+                                   window_samples)
+            # Built the way the RUN builds it, for this channel.
+            #
+            # Filtering the snapshot by PipelineConfig field names looked
+            # tidy and was wrong twice over. The snapshot names several
+            # settings differently -- min_amp for min_peak_amplitude -- so a
+            # name filter silently substitutes defaults; and 38 of the 49
+            # detection fields are not top-level keys at all, because the run
+            # passes them as one detection_params mapping.
+            #
+            # latency_map is read from THIS CHANNEL's snapshot, not from the
+            # flat map. The flat map belongs to whichever channel was last
+            # harvested, and on any other channel it is empty -- which floors
+            # every onset at the amplitude window and returns exactly its edge,
+            # 10.00 ms on every trial, with a between-trial SD of zero.
+            from .app import _detection_config_kwargs
+            _params = self._snapshot_analysis_params()
+            _setup = (_params.get("chan_settings") or {}).get(
+                _params.get("channel_idx", getattr(self, "channel_idx", 0))) or {}
+
+            def _own(key, default=None):
+                return _setup.get(key, _params.get(key, default))
+
+            _cfg = PipelineConfig(
+                pre_ms=float(_params["pre_ms"]),
+                post_ms=float(_params["post_ms"]),
+                prestim_ms=float(_params["prestim_ms"]),
+                ptp_start=float(_params["ptp_start"]),
+                ptp_end=float(_params["ptp_end"]),
+                window_map=_own("window_map", {}) or {},
+                latency_map=_own("latency_map", {}) or {},
+                peak_fraction=_params["peak_fraction"],
+                min_peak_amplitude=_params["min_amp"],
+                slope_threshold=_params["slope_threshold"],
+                onset_method=_params["onset_method"],
+                onset_bootstrap_crit=_params["onset_bootstrap_crit"],
+                onset_bootstrap_n=_params["onset_bootstrap_n"],
+                onset_bigoni_smooth_ms=_params.get("onset_bigoni_smooth_ms", 0.5),
+                onset_bigoni_min_run_ms=_params.get("onset_bigoni_min_run_ms", 0.5),
+                onset_bigoni_walkback_sd=_params.get("onset_bigoni_walkback_sd", 1.0),
+                onset_anchor=_params.get("onset_anchor", False),
+                onset_anchor_halfwidth_ms=_params.get("onset_anchor_halfwidth_ms", 8.0),
+                # The ptp_anchor* settings are NOT passed here. They are not
+                # Tk-backed, so config_detection_kwargs returns them, and
+                # naming them as well raises "got multiple values for keyword
+                # argument" -- which the try block caught, leaving an empty
+                # seed and the Inspector detecting on its own. Which settings
+                # that mapping carries depends on the params it is given, so
+                # checking it against an empty dict proves nothing.
+                **_detection_config_kwargs(_params))
+            _fs = payload["fs"]
+            # Detect on ANALYSIS-shaped segments, seed in INSPECTOR space.
+            #
+            # These are two different cuts of the same trial. The preview keeps
+            # the full pre-stimulus baseline -- prestim_ms, so the Inspector has
+            # it to draw -- while the analysis detects on the shorter epoch,
+            # pre_ms. Handed the long ones, the detector found nothing at all on
+            # any trial, the seed came back empty, and the Inspector quietly
+            # detected each trial itself: the very behaviour this replaced.
+            #
+            # So each trial is trimmed to the analysis window, detected exactly
+            # as the run detects it, and the resulting time converted back to
+            # the long segment's index space -- which is what the run does when
+            # it seeds the Inspector after a completed analysis.
+            _sb_seed = int(round(float(payload["prestim_ms"]) * _fs / 1000))
+            # The amplitude window is derived AFTER the onsets, per stimulus
+            # type, exactly as the run derives it at Stage 5d.
+            #
+            # Seeding only the onset left the Inspector to find the peaks in
+            # the file-wide window, while the run measures them in a window
+            # anchored to that type's median onset. On an M-wave starting at
+            # 4 ms with a 10 ms window start, the first phase falls outside it
+            # entirely and peak-to-peak is read from whatever is left --
+            # a different NUMBER, not merely a marker in a different place.
+            _ptp_ms = {}
+            for _st, _segs in (payload["segments"] or {}).items():
+                if not len(_segs):
+                    continue
+                # Detect over EVERY trial of this type, not only the ones being
+                # shown: the anchor is a median across the sample, so a subset
+                # moves it and moves the amplitude window with it.
+                _det = (payload.get("every") or {}).get(_st) or _segs
+                _before, _after = window_samples(_cfg, _st, _fs)
+                _lo = max(0, _sb_seed - _before)
+                _ana = np.asarray(_det)[:, _lo: _sb_seed + _after]
+                if _ana.shape[1] < _before + 2:
+                    continue
+                _p0 = _before + int(round(float(_cfg.ptp_start) * _fs / 1000))
+                _p1 = _before + int(round(float(_cfg.ptp_end) * _fs / 1000))
+                _onsets = pipeline_detect_onsets(
+                    _st, _ana, set(), _p0, _p1, _fs, _cfg,
+                    log_callback=self.log)
+                # Detection is keyed by position within ALL trials; the
+                # Inspector numbers only the ones it was given. Map one to the
+                # other, or every marker lands on the wrong trial.
+                _shown = (payload.get("picked") or {}).get(_st)
+                for _disp, _oms in enumerate(
+                        [_onsets.get(_i) for _i in
+                         (_shown if _shown is not None
+                          else range(len(_segs)))]):
+                    if _oms is not None:
+                        _seed[(_st, _disp)] = {
+                            "onset_idx": _sb_seed + int(round(_oms * _fs / 1000))
+                        }
+                try:
+                    _w0, _w1 = ptp_window_for_stim_type(
+                        _st, _onsets or {}, _fs, _cfg, _p0, _p1, _before,
+                        log_callback=self.log)[:2]
+                    # Back to ms about the stimulus, which is what the
+                    # Inspector takes.
+                    _ptp_ms[_st] = ((_w0 - _before) * 1000.0 / _fs,
+                                    (_w1 - _before) * 1000.0 / _fs)
+                except Exception:
+                    pass
+        except Exception as exc:                      # noqa: BLE001 — reported
+            import traceback
+            _seed = {}
+            self.log(f"   ⚠️  Could not pre-detect for the preview "
+                     f"({type(exc).__name__}: {exc}); the Inspector will "
+                     f"detect each trial on its own, which may not match the "
+                     f"run.")
+            for _line in traceback.format_exc().strip().splitlines()[-3:]:
+                self.log(f"      {_line.strip()}")
+
+        # Say what was seeded, positively.
+        #
+        # A silent seed is indistinguishable from no seed: the markers simply
+        # look wrong, and the only clue is a warning that appears when the
+        # detection RAISES but not when it merely returns nothing. Reporting
+        # the count either way makes the two cases tell themselves apart.
+        if _seed:
+            _by_type = {}
+            for (_st, _i) in _seed:
+                _by_type[_st] = _by_type.get(_st, 0) + 1
+            self.log("   Onsets pre-detected with the analysis settings: "
+                     + ", ".join(f"{k} {v}" for k, v in sorted(_by_type.items())))
+            if _ptp_ms:
+                self.log("   Amplitude window per type: "
+                         + ", ".join(f"{k} {v[0]:.1f}-{v[1]:.1f} ms"
+                                     for k, v in sorted(_ptp_ms.items())))
+        else:
+            self.log("   ⚠️  No onsets were pre-detected — the Inspector will "
+                     "detect each trial on its own, which may not match the "
+                     "run.")
+
         self.log("   ℹ️  Outlier decisions do not exist yet — every chosen "
                  "trial is shown. Markers are fixed and nothing is saved.")
 
@@ -483,5 +660,6 @@ class PreviewDetectionMixin:
             payload["prestim_ms"], payload["post_ms"],
             payload["unit"],
             dict(getattr(self, "label_map", {}) or {}),
-            dict(getattr(self, "color_map", {}) or {}))
+            dict(getattr(self, "color_map", {}) or {}),
+            metadata_dict=_seed, ptp_windows_by_type=_ptp_ms)
         self.log("🔎 Preview closed — no changes were saved")

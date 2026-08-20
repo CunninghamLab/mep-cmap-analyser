@@ -868,8 +868,34 @@ class DataInspectorWindow:
         _pre_ms = (self._analysis_pre_ms
                    if self._analysis_pre_ms is not None
                    else abs(int(self.t[0])))
-        _lat = self.latency_map.get(self.cur_type, (10.0, 50.0))
-        _min_lat, _max_lat = _lat if _lat else (10.0, 50.0)
+        # A missing profile is bounded by the amplitude window and SAID, not
+        # replaced by a constant.
+        #
+        # The fallback was a hardcoded 10-50 ms, and every detector bounds its
+        # result by the minimum -- so a stimulus type absent from the map
+        # reported an onset of about 10 ms whatever the trace did. It happens
+        # most easily on a channel that was never set up: the maps are per
+        # channel, so previewing EMG 2 with EMG 1 configured finds nothing.
+        #
+        # The pipeline warns in the same situation. This did not, which is why
+        # the preview and the analysis disagreed with each other.
+        _lat = self.latency_map.get(self.cur_type)
+        if not _lat:
+            _lat = (float(self.ptp_start_ms), float(self.ptp_end_ms))
+            if not getattr(self, "_warned_no_latency", None):
+                self._warned_no_latency = set()
+            if self.cur_type not in self._warned_no_latency:
+                self._warned_no_latency.add(self.cur_type)
+                try:
+                    self.status.config(
+                        fg="#B03A2E",
+                        text=(f"'{self.cur_type}' has no latency profile on "
+                              f"this channel — onsets bounded by the amplitude "
+                              f"window ({_lat[0]:.0f}-{_lat[1]:.0f} ms). Set "
+                              f"its stimulus type and muscle group on tab 1a."))
+                except Exception:
+                    pass
+        _min_lat, _max_lat = _lat
 
         # One shared dispatch with the pipeline (detection/dispatch.py). This
         # was previously a four-branch copy that did not know about methods

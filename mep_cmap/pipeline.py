@@ -782,8 +782,24 @@ def pipeline_detect_onsets(stim_type, segs_all, out_set,
     if len(segs_all) == 0:
         return onsets
 
-    _base_lat = cfg.latency_map.get(stim_type, (10.0, 50.0))
-    _min_lat0, _max_lat0 = _base_lat if _base_lat else (10.0, 50.0)
+    # A missing profile is REPORTED, not substituted.
+    #
+    # The fallback used to be a hardcoded 10-50 ms, and every detector bounds
+    # its result by the minimum -- so a stimulus type absent from the map
+    # returned exactly 10.00 ms on every trial, with a between-trial SD of
+    # zero. That is the same window-edge-as-latency failure the search-window
+    # comment above describes at length, reached by a different door: there
+    # the profile was overridden, here it was invented.
+    _base_lat = cfg.latency_map.get(stim_type)
+    if not _base_lat:
+        _base_lat = (float(cfg.ptp_start), float(cfg.ptp_end))
+        log_callback(
+            f"   \u26a0\ufe0f  '{stim_type}' has no latency profile, so onset "
+            f"detection is bounded by the amplitude window "
+            f"({_base_lat[0]:.0f}-{_base_lat[1]:.0f} ms) instead. Set the "
+            f"stimulus type and muscle group for it on tab 1a: onsets pinned "
+            f"to a window edge read as real latencies.")
+    _min_lat0, _max_lat0 = _base_lat
     _eff_min_lat, _eff_max_lat = _min_lat0, _max_lat0
 
     # Condition median over outlier-screened trials. Previously computed only
@@ -1013,8 +1029,11 @@ def pipeline_quantify_segments(stim_type, segs_all, prestim_all,
 
     # Physiological onset window for this stim type, used by the agreement
     # calculation. Mirrors pipeline_detect_onsets' unnarrowed bounds.
-    _ag_lat = cfg.latency_map.get(stim_type, (10.0, 50.0))
-    _ag_min_lat, _ag_max_lat = _ag_lat if _ag_lat else (10.0, 50.0)
+    # Same rule as the detection path above: a missing profile is bounded by
+    # the amplitude window the analyst chose, not by a constant from here.
+    _ag_lat = (cfg.latency_map.get(stim_type)
+               or (float(cfg.ptp_start), float(cfg.ptp_end)))
+    _ag_min_lat, _ag_max_lat = _ag_lat
     _agreement_warned = False
     _offset_warned = False
     # Condition median for the derivative-ratio member's peak-jitter gate.

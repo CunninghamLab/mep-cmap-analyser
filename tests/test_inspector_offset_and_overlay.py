@@ -142,7 +142,11 @@ def test_the_offset_text_actually_reaches_the_status_bar():
     This asserts the variable is interpolated into the string that is actually
     displayed.
     """
-    a = SRC.index("self.status.config(")
+    # The call that displays the offset, not merely the first status update:
+    # the inspector has several, and a new one added above this would make an
+    # index-based search test the wrong string.
+    a = SRC.index("offset_txt")
+    a = SRC.index("self.status.config(", a)
     b = SRC.index("))", a)
     shown = SRC[a:b]
     assert "{offset_txt}" in shown, (

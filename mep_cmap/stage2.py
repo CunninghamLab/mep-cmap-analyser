@@ -19,18 +19,42 @@ import pandas as pd
 
 from .bids import StudyMetadata
 from .preferences import accent_button_kw
+from .results_layout import FAMILIES as _RL_FAMILIES
+from .results_layout import sibling as _rl_sibling
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Add-on sidecar join
 # ─────────────────────────────────────────────────────────────────────────────
-# Core first-level outputs that live beside <prefix>_trials.csv and must never be
+# Core first-level outputs sharing the session prefix, which must never be
 # treated as add-on sidecars.
-_S2_CORE_SUFFIXES = (
-    "_trials.csv", "_trials_with_outliers.csv",
-    "_summary.csv", "_summary_with_outliers.csv",
-    "_bootstrap.csv",
+#
+# Derived from the layout's own table of what this tool writes rather than
+# listed by hand. The hand-written list had drifted: <prefix>_onset_methods.csv
+# is five rows per trial, one per detection method, and joined as a sidecar it
+# was de-duplicated down to whichever method came first, silently attaching one
+# arbitrary method's latency to every trial and discarding the rest.
+# <prefix>_averaged.csv had the same exposure. Deriving the list means a core
+# output added to results_layout is excluded here the day it is written,
+# instead of joining itself until someone notices.
+#
+# The two extras are not in FAMILIES: _trials_with_outliers.csv is the
+# deprecated file older studies still carry, and _bootstrap.csv is not routed
+# by family.
+_S2_CORE_SUFFIXES = tuple(
+    [f"_{_n}" for _n in _RL_FAMILIES if _n.endswith(".csv")]
+    + ["_trials_with_outliers.csv", "_bootstrap.csv"]
 )
+
+#: Shipped demonstrations, not measurements. rectified_area exists to show an
+#: add-on author the read-from-context / write-new-file shape, and it is
+#: enabled exactly the way a real add-on is, so its numbers would otherwise
+#: land in a manuscript's group table because someone clicked it once to see
+#: what add-ons do. Excluded here rather than crippled at the source: it must
+#: still emit correct join keys, because it is the file third-party add-ons are
+#: copied from, and an author whose own copy is named for their own measurement
+#: joins normally.
+_S2_EXAMPLE_SUFFIXES = ("_rectified_area.csv",)
 
 # A sidecar must carry these to be joinable per trial. Segment is 1-based and
 # indexes segs_all, so it is stable even if a table is filtered or re-sorted.
@@ -53,24 +77,114 @@ _S2_JOIN_KEYS = ("StimType", "Segment")
 _S2_OPTIONAL_JOIN_KEYS = ("Condition",)
 
 
-def _s2_join_addon_sidecars(df, trials_csv_path, note):
-    """Left-join any per-trial add-on outputs sitting beside <prefix>_trials.csv.
+def _s2_core_prefix(base):
+    """The session prefix a core trial file's sidecars are named after.
 
-    An add-on sidecar is any other CSV in the same results folder sharing the
-    session prefix and carrying the (StimType, Segment) join keys — the columns
-    an add-on emits so its per-trial rows can be matched back to core trials.
+    Either core name yields the same prefix, because the add-on join is
+    independent of which one the merge was built from.
+    """
+    for suf in ("_trials_selected.csv", "_trials.csv"):
+        if base.endswith(suf):
+            return base[: -len(suf)]
+    return None
+
+
+def _s2_addon_tag(fn, prefix):
+    """The short name identifying an add-on, from its filename.
+
+    ONE rule, used by both the picker and the join. If the picker derived
+    names differently, it would offer add-ons that never join and hide ones
+    that do -- a selection whose entries do not correspond to anything.
+    """
+    return fn[len(prefix) + 1:-4] if len(fn) > len(prefix) + 5 else "addon"
+
+
+def _s2_is_addon_file(fn):
+    """Whether a CSV sharing the session prefix is an add-on output.
+
+    Core outputs and the shipped demonstration are excluded on exactly the
+    same terms as in the join below.
+    """
+    if any(fn.endswith(suf) for suf in _S2_CORE_SUFFIXES):
+        return False
+    if any(fn.endswith(suf) for suf in _S2_EXAMPLE_SUFFIXES):
+        return False
+    return True
+
+
+def _s2_discover_addons(rows):
+    """{add-on tag: how many of these sessions have it}.
+
+    Discovered from what is actually on disk rather than from a list of
+    known add-ons: third-party add-ons are the normal case, and a picker that
+    only offered the built-in ones would silently exclude exactly the outputs
+    someone wrote themselves.
+
+    The count is reported because add-ons need not be present in every
+    session. Selecting one that only some sessions have is allowed -- it may
+    be exactly what was intended -- but the analyst should be able to see it
+    before choosing, since the missing rows arrive as NaN and are then
+    indistinguishable from a measurement that failed.
+    """
+    from .results_layout import find_results, results_root_for
+
+    counts = {}
+    for row in rows:
+        csv_path = row.get("_trials_csv", "")
+        if not csv_path:
+            continue
+        prefix = _s2_core_prefix(os.path.basename(csv_path))
+        if prefix is None:
+            continue
+        seen = set()
+        try:
+            found = find_results(results_root_for(csv_path), ".csv")
+        except Exception:
+            continue
+        for path in found:
+            fn = os.path.basename(path)
+            if not fn.startswith(f"{prefix}_") or not _s2_is_addon_file(fn):
+                continue
+            seen.add(_s2_addon_tag(fn, prefix))
+        for tag in seen:
+            counts[tag] = counts.get(tag, 0) + 1
+    return counts
+
+
+def _s2_join_addon_sidecars(df, trials_csv_path, note, allowed=None):
+    """Left-join any per-trial add-on outputs found under this session's results/.
+
+    An add-on sidecar is any other CSV anywhere under the same results/ folder
+    sharing the session prefix and carrying the (StimType, Segment) join keys —
+    the columns an add-on emits so its per-trial rows can be matched back to
+    core trials. Both the flat and the foldered layouts are searched.
+
+    ``allowed`` is a set of add-on tags to join, or None for every one found.
+    An EMPTY set therefore means "none", which is not the same as None and
+    must not be collapsed into it.
 
     Purely additive: only columns absent from `df` are brought in, so an add-on
     can never overwrite a core measurement. Any sidecar that fails to load or
     join is skipped with a note; the group merge always proceeds.
     """
-    import glob
+    from .results_layout import find_results, results_root_for
 
     base = os.path.basename(trials_csv_path)
-    if not base.endswith("_trials.csv"):
+    # Either core name, because the add-on join is independent of whether the
+    # merge was built from the full trials.csv or its column-narrowed copy.
+    # Without the second name a Selected run returned here immediately and
+    # silently joined no add-on outputs at all -- the columns would simply not
+    # be in the group file, with nothing said about it.
+    prefix = _s2_core_prefix(base)
+    if prefix is None:
         return df
-    prefix   = base[: -len("_trials.csv")]
-    res_dir  = os.path.dirname(trials_csv_path)
+    # Searched across the whole results tree, not just the folder the trials
+    # file sits in. Add-ons write to results/add-ons/ while trials is in
+    # results/trials/, so "beside the trials file" stopped being where the
+    # sidecars are; a study written flat still has them in the root, and
+    # find_results reads both and de-duplicates by name. report/ is excluded
+    # there by folder, so a stacked report is never mistaken for a sidecar.
+    res_root = results_root_for(trials_csv_path)
 
     keys = [k for k in _S2_JOIN_KEYS + _S2_OPTIONAL_JOIN_KEYS
             if k in df.columns]
@@ -79,15 +193,31 @@ def _s2_join_addon_sidecars(df, trials_csv_path, note):
     if "File" in df.columns:
         keys = ["File"] + keys
 
-    for path in sorted(glob.glob(os.path.join(res_dir, f"{prefix}_*.csv"))):
+    # Sorted by name after de-duplication, so the order sidecars are joined in
+    # does not depend on which folder each happens to live in.
+    _cands = [p for p in find_results(res_root, ".csv")
+              if os.path.basename(p).startswith(f"{prefix}_")]
+    for path in sorted(_cands, key=lambda p: os.path.basename(p)):
         fn = os.path.basename(path)
-        if any(fn.endswith(suf) for suf in _S2_CORE_SUFFIXES):
+        if not _s2_is_addon_file(fn):
+            continue
+        # Not selected. Silent: the analyst chose this, and a note per
+        # excluded add-on per session would bury the ones that mean something.
+        if allowed is not None and _s2_addon_tag(fn, prefix) not in allowed:
             continue
         try:
             side = pd.read_csv(path)
         except Exception as e:
             note(f"{fn}: unreadable ({e})")
             continue
+        # Silent by design, for now. Whether a sidecar was MEANT to join is not
+        # inferable from its shape: variability writes six aggregate tables that
+        # can never carry a Segment, and its jackknife has one row per trial
+        # while being a leave-one-out statistic rather than a per-trial
+        # measurement. Both a "missing key" note and a "one row per trial" test
+        # fire on those, telling the user to re-run something that will never
+        # change. The add-on knows; the joiner does not. See the open question
+        # about declaring per-trial outputs in the add-on contract.
         if side.empty or not set(_S2_JOIN_KEYS).issubset(side.columns):
             continue
 
@@ -121,7 +251,7 @@ def _s2_join_addon_sidecars(df, trials_csv_path, note):
         # by a different algorithm than the core pipeline's; silently discarding
         # it would lose data, and silently overwriting would corrupt the core
         # measurement. It arrives as 'mepfeatx_Latency(ms)' instead.
-        tag = fn[len(prefix) + 1:-4] if len(fn) > len(prefix) + 5 else "addon"
+        tag = _s2_addon_tag(fn, prefix)
         rename, new_cols = {}, []
         for c in side.columns:
             if c in use:
@@ -268,6 +398,31 @@ class Stage2Mixin:
                   command=self._s2_browse_deriv).pack(side="left")
         tk.Button(toolbar, text="Scan folder",
                   command=self._s2_scan).pack(side="left", padx=(12, 0))
+        # ── Which trial file feeds the merge ─────────────────────────────
+        # Full is the default and always available. Selected reads the
+        # column-narrowed copy instead, and is refused rather than
+        # approximated when the sessions cannot agree on one -- see
+        # _s2_resolve_source.
+        tk.Label(toolbar, text="Trials file:").pack(side="left", padx=(12, 2))
+        self._s2_source_var = tk.StringVar(value="Full")
+        ttk.Combobox(toolbar, textvariable=self._s2_source_var,
+                     values=["Full", "Trimmed"], state="readonly",
+                     width=9).pack(side="left")
+        # ── Add-on columns ───────────────────────────────────────────────
+        # On by default: every study built before this switch existed had
+        # its add-on outputs joined, and a control that silently changes
+        # what an existing study produces is worse than no control.
+        #
+        # None in _s2_addon_allow means "everything found", which is not the
+        # same as a selection that happens to list everything: a new add-on
+        # run tomorrow joins under None and does not under an explicit list.
+        self._s2_addons_var = tk.BooleanVar(value=True)
+        self._s2_addon_allow = None
+        tk.Checkbutton(toolbar, text="Add-on columns",
+                       variable=self._s2_addons_var).pack(side="left",
+                                                          padx=(12, 0))
+        tk.Button(toolbar, text="Choose\u2026",
+                  command=self._s2_choose_addons).pack(side="left", padx=(2, 0))
         tk.Button(toolbar, text="Save design",
                   command=self._s2_save_design).pack(side="left", padx=(6, 0))
         tk.Button(toolbar, text="Load design",
@@ -515,6 +670,17 @@ class Stage2Mixin:
                             "timepoint":      meta.get("timepoint",      ""),
                             "_json_path":     jpath,
                             "_trials_csv":    jpath.replace("_trials.json", "_trials.csv"),
+                            # Resolved through the layout rather than by
+                            # string surgery, so a study written in the flat
+                            # layout finds its file where it actually is.
+                            "_trials_selected_csv": _rl_sibling(
+                                jpath, "trials_selected.csv"),
+                            # What this session SAID it selected. None means
+                            # it wrote no narrowed file; a missing key (also
+                            # None here) means it predates the feature. Both
+                            # fail the "has the file" check below first, so
+                            # the message names the real cause.
+                            "_column_selection": meta.get("column_selection"),
                         })
                     except Exception:
                         pass
@@ -1030,6 +1196,167 @@ class Stage2Mixin:
         self._s2_rebuild_tree_columns()
         self._s2_refresh_tree()
 
+    def _s2_choose_addons(self):
+        """Pick which add-on outputs join, from what the scan actually found.
+
+        Offered from disk rather than from a list of known add-ons: a
+        third-party add-on is the normal case, and a picker that only knew the
+        built-in ones would silently exclude precisely the outputs someone
+        wrote themselves.
+        """
+        rows = list(self._s2_rows or [])
+        if not rows:
+            messagebox.showinfo("No sessions",
+                "Scan a derivatives folder first, so there is something to "
+                "look in.", parent=self.root)
+            return
+
+        counts = _s2_discover_addons(rows)
+        if not counts:
+            messagebox.showinfo("No add-on outputs",
+                "No per-trial add-on outputs were found beside these "
+                "sessions' results.", parent=self.root)
+            return
+
+        n_sessions = len(rows)
+        win = tk.Toplevel(self.root)
+        win.title("Add-on columns")
+        win.transient(self.root)
+        win.resizable(False, False)
+
+        tk.Label(win,
+                 text="Which add-on outputs to join into the group file.\n"
+                      "Only add-ons found beside the scanned sessions are "
+                      "listed.",
+                 justify="left", fg="grey").pack(anchor="w", padx=12,
+                                                 pady=(10, 6))
+
+        body = tk.Frame(win)
+        body.pack(fill="x", padx=12)
+        vars_ = {}
+        for tag in sorted(counts):
+            n = counts[tag]
+            # Selected by default when nothing has been chosen yet, so opening
+            # the dialog and pressing OK does not quietly narrow anything.
+            v = tk.BooleanVar(value=(self._s2_addon_allow is None
+                                     or tag in self._s2_addon_allow))
+            vars_[tag] = v
+            row = tk.Frame(body)
+            row.pack(anchor="w", fill="x")
+            tk.Checkbutton(row, text=tag, variable=v, anchor="w").pack(
+                side="left")
+            # Partial coverage stated up front. An add-on present in some
+            # sessions still joins, but its missing rows arrive as NaN and are
+            # then indistinguishable from a measurement that ran and failed.
+            note = (f"all {n} sessions" if n == n_sessions
+                    else f"{n} of {n_sessions} sessions")
+            tk.Label(row, text=note,
+                     fg=("grey" if n == n_sessions else "#B03A2E")).pack(
+                side="left", padx=(8, 0))
+
+        btns = tk.Frame(win)
+        btns.pack(pady=10)
+
+        def _all():
+            for v in vars_.values():
+                v.set(True)
+
+        def _none():
+            for v in vars_.values():
+                v.set(False)
+
+        def _ok():
+            chosen = {t for t, v in vars_.items() if v.get()}
+            # Everything ticked stores None, not the full list: None means
+            # "whatever is there", so an add-on run after this design was
+            # saved still joins. An explicit list would freeze the study to
+            # today's add-ons without saying so.
+            self._s2_addon_allow = None if chosen == set(counts) else chosen
+            win.destroy()
+
+        tk.Button(btns, text="All", width=8, command=_all).pack(side="left",
+                                                                padx=4)
+        tk.Button(btns, text="None", width=8, command=_none).pack(side="left",
+                                                                  padx=4)
+        tk.Button(btns, text="OK", width=10, command=_ok).pack(side="left",
+                                                               padx=(12, 4))
+        tk.Button(btns, text="Cancel", width=10,
+                  command=win.destroy).pack(side="left", padx=4)
+        win.grab_set()
+
+    def _s2_resolve_source(self, included):
+        """Which trial file each session contributes, or None to refuse.
+
+        Returns ``(key, message)``. ``key`` is the row key holding the path to
+        read -- "_trials_csv" or "_trials_selected_csv" -- or None when
+        Selected was asked for and cannot be honoured, in which case
+        ``message`` says which sessions are the problem.
+
+        REFUSED rather than fallen back to Full, and refused rather than
+        merged from whatever each session happens to have. A group file whose
+        columns depend on which sessions were included is one where adding a
+        participant silently changes the analysable variables, and pandas'
+        outer concat would fill the difference with NaN -- indistinguishable
+        in the output from a trial where the measurement genuinely failed.
+
+        Comparison is on the recorded selection, not on CSV headers. A header
+        cannot tell "this analyst chose not to keep cSP" from "this recording
+        had no cSP data", and only the first is a real disagreement.
+        """
+        if (self._s2_source_var.get() or "Full") != "Trimmed":
+            return "_trials_csv", ""
+
+        missing, selections = [], {}
+        for row in included:
+            who = "/".join(filter(None, [row.get("participant_id", "?"),
+                                         row.get("session", ""),
+                                         row.get("run", ""),
+                                         row.get("channel", "")]))
+            path = row.get("_trials_selected_csv", "")
+            if not path or not os.path.isfile(path):
+                missing.append(who)
+                continue
+            sel = row.get("_column_selection")
+            # Sorted and tupled so two sessions that chose the same groups in
+            # a different order compare equal. None (no narrowed file written,
+            # or a sidecar predating the feature) is kept distinct from the
+            # empty selection, which is a real choice.
+            key = None if sel is None else tuple(sorted(sel))
+            selections.setdefault(key, []).append(who)
+
+        if missing:
+            _shown = missing[:8]
+            return None, (
+                "These sessions have no trimmed trials file:\n\n"
+                + "\n".join(_shown)
+                + ("\n…" if len(missing) > len(_shown) else "")
+                + "\n\nRe-run First Level for them with the trimmed file on, "
+                  "or build from the Full trials file.")
+
+        if len(selections) > 1:
+            from .column_groups import GROUP_LABELS
+            lines = []
+            for key, whos in sorted(selections.items(),
+                                    key=lambda kv: (kv[0] is None, kv[0] or ())):
+                if key is None:
+                    what = "no selection recorded"
+                elif not key:
+                    what = "identifying columns only"
+                else:
+                    what = ", ".join(GROUP_LABELS.get(k, k) for k in key)
+                _shown = whos[:4]
+                lines.append("  " + what + ":\n    "
+                             + ", ".join(_shown)
+                             + (", …" if len(whos) > len(_shown) else ""))
+            return None, (
+                "These sessions did not select the same columns, so their "
+                "rows cannot be stacked into one table:\n\n"
+                + "\n".join(lines)
+                + "\n\nRe-run the odd ones out with the same selection, "
+                  "or build from the Full trials file.")
+
+        return "_trials_selected_csv", ""
+
     def _s2_run(self):
         """
         Merge all included sessions' trial-level CSVs into a single
@@ -1054,6 +1381,13 @@ class Stage2Mixin:
                 "Could not locate the derivatives folder.", parent=self.root)
             return
 
+        # ── Which trial file to read ──────────────────────────────────────────
+        _src_key, _src_msg = self._s2_resolve_source(included)
+        if _src_key is None:
+            messagebox.showerror("Selected columns unavailable", _src_msg,
+                                 parent=self.root)
+            return
+
         # ── Identify design columns ───────────────────────────────────────────
         group_cols  = [gc["name"] for gc in self._s2_group_cols]
 
@@ -1063,7 +1397,7 @@ class Stage2Mixin:
         sidecar_notes = []
 
         for row in included:
-            csv_path = row.get("_trials_csv", "")
+            csv_path = row.get(_src_key, "")
             if not csv_path or not os.path.isfile(csv_path):
                 skipped.append(row.get("participant_id", "?") + "/" +
                                row.get("session", "?"))
@@ -1081,9 +1415,15 @@ class Stage2Mixin:
 
             # ── Join per-trial add-on outputs (temporal_decomposition, ...) ────
             # Additive only: add-on columns are appended, core columns untouched.
-            _who = f"{row.get('participant_id','?')}/{row.get('session','?')}"
-            df = _s2_join_addon_sidecars(
-                df, csv_path, lambda m, w=_who: sidecar_notes.append(f"{w} {m}"))
+            # Skipped entirely when switched off, rather than joined and then
+            # dropped: an unreadable sidecar cannot then fail a run that never
+            # wanted it.
+            if self._s2_addons_var.get():
+                _who = f"{row.get('participant_id','?')}/{row.get('session','?')}"
+                df = _s2_join_addon_sidecars(
+                    df, csv_path,
+                    lambda m, w=_who: sidecar_notes.append(f"{w} {m}"),
+                    allowed=self._s2_addon_allow)
 
             # ── Append Stim_Role from Configure dialog ─────────────────────────
             cfg = row.get("_config", {})
@@ -1153,13 +1493,24 @@ class Stage2Mixin:
         msg = (f"Group analysis complete.\n\n"
                f"Sessions merged:  {n_sessions}\n"
                f"Total trials:     {n_trials}\n"
-               f"Columns:          {n_cols}\n\n"
+               f"Columns:          {n_cols}\n"
+               f"Source:           "
+               f"{'Trimmed trials file' if _src_key == '_trials_selected_csv' else 'Full trials file'}\n\n"
                f"Saved to:\n{out_path}")
         if sidecar_notes:
             _shown = sidecar_notes[:8]
             msg += (f"\n\nAdd-on columns joined ({len(sidecar_notes)}):\n"
                     + "\n".join(_shown)
                     + ("\n…" if len(sidecar_notes) > len(_shown) else ""))
+        elif not self._s2_addons_var.get():
+            # Said explicitly. Otherwise "no add-on columns" is ambiguous
+            # between "none were found" and "you turned them off".
+            msg += "\n\nAdd-on columns: excluded."
+        elif self._s2_addon_allow is not None:
+            msg += ("\n\nAdd-on columns: limited to "
+                    + (", ".join(sorted(self._s2_addon_allow))
+                       if self._s2_addon_allow else "none")
+                    + ".")
         if skipped:
             msg += f"\n\nSkipped ({len(skipped)}):\n" + "\n".join(skipped)
         messagebox.showinfo("Done", msg, parent=self.root)
@@ -1180,6 +1531,18 @@ class Stage2Mixin:
         design = {
             "group_columns": self._s2_group_cols,
             "group_values":  self._s2_group_vals,
+            # What the output table CONTAINS, not just how it is labelled.
+            # Saved because a study rebuilt next week with a different column
+            # source or a different set of add-ons is a different table, and
+            # nothing in the file would have said which one produced the
+            # results in the manuscript.
+            "column_source": self._s2_source_var.get(),
+            "include_addons": bool(self._s2_addons_var.get()),
+            # null means "whatever is present", which is deliberately NOT the
+            # same as a list naming today's add-ons: under null an add-on run
+            # after this design was saved joins, and under a list it does not.
+            "addon_allow": (None if self._s2_addon_allow is None
+                            else sorted(self._s2_addon_allow)),
             "assignments": [
                 {k: v for k, v in row.items() if not k.startswith("_")}
                 for row in self._s2_rows
@@ -1207,6 +1570,21 @@ class Stage2Mixin:
                 design = json.load(f)
             self._s2_group_cols = design.get("group_columns", [])
             self._s2_group_vals = design.get("group_values", {})
+            # Absent in a design saved before these existed, which restores as
+            # the defaults every such design was built under: Full columns,
+            # add-ons on, nothing excluded.
+            _src = design.get("column_source")
+            # "Selected" was the name this option carried when the design file
+            # first learned to store it. Accepted so a design saved then still
+            # rebuilds the same table rather than silently reverting to Full.
+            if _src == "Selected":
+                _src = "Trimmed"
+            self._s2_source_var.set(_src if _src in ("Full", "Trimmed")
+                                    else "Full")
+            self._s2_addons_var.set(bool(design.get("include_addons", True)))
+            _allow = design.get("addon_allow")
+            self._s2_addon_allow = (set(_allow)
+                                    if isinstance(_allow, list) else None)
             rows = design.get("assignments", [])
             # Re-attach private keys (csv paths) by re-scanning if needed
             self._s2_rows = rows

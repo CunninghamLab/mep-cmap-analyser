@@ -102,9 +102,18 @@ def _run(entry, bundle, **cfg):
     return res, ctx
 
 
+def _addon_out(bundle, name):
+    """Where an add-on's own output lands: results/add-ons/, not results/.
+
+    Add-ons write to context.addons_dir. The bundle here is written flat, as a
+    study analysed before the family layout existed would be, so this also
+    covers the mixed case: core files flat, new add-on output foldered.
+    """
+    return os.path.join(bundle["results"], "add-ons", f"{PREFIX}_{name}.csv")
+
+
 def _frame(bundle):
-    return pd.read_csv(os.path.join(bundle["results"],
-                                    f"{PREFIX}_temporal_decomposition.csv"))
+    return pd.read_csv(_addon_out(bundle, "temporal_decomposition"))
 
 
 def _bin_cols(df):
@@ -271,8 +280,7 @@ def test_sidecar_join_aligns_by_segment_not_row_order(entry, bundle):
     core = pd.read_csv(bundle["trials"])
     shuffled = core.sample(frac=1.0, random_state=3).reset_index(drop=True)
     joined = _s2_join_addon_sidecars(shuffled, bundle["trials"], lambda _m: None)
-    side = pd.read_csv(os.path.join(bundle["results"],
-                                    f"{PREFIX}_temporal_decomposition.csv"))
+    side = pd.read_csv(_addon_out(bundle, "temporal_decomposition"))
     ref = side.set_index(["StimType", "Segment"])["TD_Early_Area(mV*s)"]
     for _, r in joined.iterrows():
         want = ref.loc[(r["StimType"], r["Segment"])]
@@ -303,8 +311,7 @@ def test_sidecar_join_skips_tables_without_join_keys(entry, bundle):
 
 def test_sidecar_join_does_not_fan_out_on_duplicates(entry, bundle):
     _run(entry, bundle)
-    side_path = os.path.join(bundle["results"],
-                             f"{PREFIX}_temporal_decomposition.csv")
+    side_path = _addon_out(bundle, "temporal_decomposition")
     side = pd.read_csv(side_path)
     pd.concat([side, side]).to_csv(side_path, index=False)
     core = pd.read_csv(bundle["trials"])
@@ -363,7 +370,7 @@ def test_mepfeatx_emits_joinable_keys(bundle):
     res = A.run_addon(mfx[0], ctx)
     assert res["ok"], res["error"]
 
-    side = pd.read_csv(os.path.join(bundle["results"], f"{PREFIX}_mepfeatx.csv"))
+    side = pd.read_csv(_addon_out(bundle, "mepfeatx"))
     core = pd.read_csv(bundle["trials"])
     assert {"File", "StimType", "Segment"}.issubset(side.columns)
     assert "Trial" in side.columns                      # 0-based index retained

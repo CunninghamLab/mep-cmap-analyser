@@ -41,11 +41,19 @@ class AddonContext:
 
     Fields mirror design/ADDON_ARCHITECTURE.md §5. `fs` and `unit` vary by source
     format and must be taken from here (never assumed); `time_ms` is 0 at the
-    stimulus. Add-ons write new files into `results_dir` named with `bids_prefix`.
+    stimulus.
+
+    WRITE OUTPUTS INTO ``addons_dir``, named with ``bids_prefix``.
+    ``results_dir`` is the results ROOT, for READING what the pipeline wrote;
+    it is no longer where an add-on should put its own files. The two were the
+    same folder while everything was written flat, so an add-on that still
+    writes to ``results_dir`` produces a correct file in an untidy place rather
+    than a broken one.
     """
     __slots__ = ("trials", "segments", "fs", "unit", "time_ms",
                  "time_ms_by_type",
-                 "config", "results_dir", "figures_dir", "bids_prefix", "log")
+                 "config", "results_dir", "figures_dir", "bids_prefix", "log",
+                 "_addons_dir")
 
     def time_ms_for(self, stim_type):
         """The time axis for one stimulus type.
@@ -59,9 +67,19 @@ class AddonContext:
         axis = self.time_ms_by_type.get(stim_type)
         return self.time_ms if axis is None else axis
 
+    @property
+    def addons_dir(self):
+        """Where this add-on's own output files go, created on first access.
+
+        Created here rather than when the context is built, so a run with no
+        add-ons enabled does not leave an empty folder in every session.
+        """
+        os.makedirs(self._addons_dir, exist_ok=True)
+        return self._addons_dir
+
     def __init__(self, *, trials, segments, fs, unit, time_ms, config,
                  results_dir, bids_prefix, log, figures_dir=None,
-                 time_ms_by_type=None):
+                 time_ms_by_type=None, addons_dir=None):
         self.trials      = trials         # pandas.DataFrame | None
         self.segments    = segments       # {stim_type: ndarray[n_trials, n_samples]}
         self.fs          = fs             # float
@@ -73,10 +91,15 @@ class AddonContext:
         # is what it always was and is still correct when the windows agree.
         self.time_ms_by_type = dict(time_ms_by_type or {})
         self.config      = config         # dict
-        self.results_dir = results_dir    # str  (…/ses-*/results)
+        self.results_dir = results_dir    # str  (…/ses-*/results) — READ from
         self.figures_dir = figures_dir    # str  (…/ses-*/figures) sibling of results
         self.bids_prefix = bids_prefix    # str
         self.log         = log            # callable(str)
+        # Defaulted rather than required, so a caller building a context
+        # directly (a test, or an add-on harness) still gets a working one.
+        from .results_layout import ADDON_DIR
+        self._addons_dir = (addons_dir
+                            or os.path.join(results_dir, ADDON_DIR))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -89,7 +112,13 @@ def load_contexts(segments_npz_path, config=None, log=print):
     so the returned contexts are identical in shape regardless of which importer
     produced the data. Loads without `allow_pickle`.
     """
-    results_dir = os.path.dirname(segments_npz_path)
+    # The results ROOT, not the folder the bundle happens to sit in. Under the
+    # family layout the bundle is in results/segments/, so taking its dirname
+    # gave a results_dir one level too deep: figures/ resolved inside results/,
+    # and the per-trial table below was looked for somewhere it never is, which
+    # left context.trials silently None rather than raising.
+    from .results_layout import results_root_for
+    results_dir = results_root_for(segments_npz_path)
     # figures/ is the sibling of results/ in the BIDS derivatives layout
     figures_dir = os.path.join(os.path.dirname(results_dir), "figures")
     base        = os.path.basename(segments_npz_path)
@@ -106,7 +135,12 @@ def load_contexts(segments_npz_path, config=None, log=print):
     # Optional per-trial table (for context.trials).
     trials_df = None
     if pd is not None:
-        _tp = os.path.join(results_dir, f"{run_prefix}_trials.csv")
+        from .results_layout import result_path as _rp
+        _tp = _rp(results_dir, f"{run_prefix}_trials.csv",
+                  create=False)
+        if not os.path.isfile(_tp):
+            _tp = os.path.join(results_dir,
+                               f"{run_prefix}_trials.csv")
         if os.path.exists(_tp):
             try:
                 trials_df = pd.read_csv(_tp)

@@ -46,7 +46,10 @@ so the same add-on runs on all of them. The only things that vary are `fs` and
 `unit` — always take them from `context`, never hardcode a rate or a unit.
     context.config       dict              — analysis settings (prestim_ms,
                                              ptp_start, ptp_end, …).
-    context.results_dir  str               — write your output files here.
+    context.addons_dir   str               — write your output files here.
+    context.results_dir  str               — the results root, to READ what
+                                             the pipeline wrote. Not an
+                                             output location.
     context.bids_prefix  str               — file-name prefix to use.
     context.log          callable(str)     — write a line to the GUI log.
 """
@@ -84,6 +87,20 @@ def run(context):
     # The window mask is per stimulus type, since each may be epoched over a
     # different span; built inside the loop below.
 
+    # The join keys Stage 2 needs. Without File and Segment this file is not
+    # matchable to the core trials and the group merge skips it, so the example
+    # every third-party add-on is copied from must emit them.
+    #
+    # File is constant for one recording, so any trial row carries it; fall back
+    # to the prefix when the add-on runs without a per-trial table beside the
+    # bundle. Segment is 1-based and indexes the bundle, matching the core
+    # tables; Trial is kept alongside as the 0-based index.
+    file_name = context.bids_prefix
+    _tr = getattr(context, "trials", None)
+    if _tr is not None and getattr(_tr, "empty", True) is False \
+            and "File" in _tr.columns and len(_tr["File"]):
+        file_name = _tr["File"].iloc[0]
+
     rows = []
     for stim_type, stack in context.segments.items():
         time_ms = np.asarray(_t_ms_for(stim_type) if _t_ms_for
@@ -102,7 +119,9 @@ def run(context):
                          if hasattr(np, "trapezoid")
                          else np.trapz(windowed, dx=dt))
             rows.append({
+                "File":                       file_name,
                 "StimType":                   stim_type,
+                "Segment":                    trial_idx + 1,
                 "Trial":                      trial_idx,
                 f"Rectified_Area({unit}*s)":  round(area, 6),   # unit from context
                 # Two numeric columns rather than a "10-50" string: a value like
@@ -117,7 +136,7 @@ def run(context):
         return []
 
     # WRITE A NEW FILE ONLY — never touch the core outputs.
-    out_path = os.path.join(context.results_dir,
+    out_path = os.path.join(context.addons_dir,
                             f"{context.bids_prefix}_{ADDON_NAME}.csv")
     pd.DataFrame(rows).to_csv(out_path, index=False)
     log(f"{ADDON_NAME}: wrote {len(rows)} rows → {os.path.basename(out_path)}")

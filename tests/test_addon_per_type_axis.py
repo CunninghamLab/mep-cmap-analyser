@@ -144,3 +144,41 @@ def test_the_baseline_error_says_which_type_and_what_to_change():
     src = (SINGLE / "mepfeatx_features.py").read_text(encoding="utf-8")
     assert "'{stim_type}' has too little pre-stimulus baseline" in src
     assert "tab 1a" in src, "the setting moved; the message must point at it"
+
+
+# ── Join keys on per-trial outputs ───────────────────────────────────────────
+
+def test_the_example_addon_emits_the_group_join_keys():
+    """It is the file third-party add-ons are copied from.
+
+    rectified_area shipped with StimType and Trial but no File and no Segment,
+    so Stage 2 could not match its rows to trials and dropped it from the group
+    table without saying so -- and every add-on written by copying it inherited
+    the same silence. It is itself excluded from the merge as a demonstration
+    rather than a measurement, which means nothing at runtime exercises this
+    any more; the guarantee it makes to an author reading it lives here.
+
+    Parsed rather than searched for a literal: the dict is written over several
+    lines and reflowing it must not be able to break the test.
+    """
+    import ast as _ast
+
+    src = (SINGLE / "rectified_area.py").read_text(encoding="utf-8")
+    emitted = set()
+    for node in _ast.walk(_ast.parse(src)):
+        if isinstance(node, _ast.Dict):
+            for k in node.keys:
+                if isinstance(k, _ast.Constant) and isinstance(k.value, str):
+                    emitted.add(k.value)
+    missing = {"File", "StimType", "Segment"} - emitted
+    assert not missing, (
+        "the example add-on must show authors how to emit the Stage 2 join "
+        f"keys; missing: {sorted(missing)}")
+
+
+def test_the_example_addon_is_kept_out_of_the_group_table():
+    """Enabled like any other add-on, so one curious click would otherwise put
+    demonstration numbers in a manuscript's group table."""
+    from mep_cmap.stage2 import _S2_EXAMPLE_SUFFIXES
+
+    assert "_rectified_area.csv" in _S2_EXAMPLE_SUFFIXES

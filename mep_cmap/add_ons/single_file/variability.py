@@ -757,19 +757,19 @@ def run(context):
             f"the group-level join stays one-to-one.")
         trial_df = trial_df.drop_duplicates(subset=["File", "StimType", "Segment"],
                                             keep="first")
-    trial_path = os.path.join(context.results_dir,
+    trial_path = os.path.join(context.addons_dir,
                               f"{context.bids_prefix}_{ADDON_NAME}.csv")
     trial_df.to_csv(trial_path, index=False)
     written.append(trial_path)
 
     cond_df = pd.DataFrame(cond_rows).reindex(columns=CONDITION_COLUMNS)
-    cond_path = os.path.join(context.results_dir,
+    cond_path = os.path.join(context.addons_dir,
                              f"{context.bids_prefix}_{ADDON_NAME}_by_condition.csv")
     cond_df.to_csv(cond_path, index=False)
     written.append(cond_path)
 
     if tta_rows:
-        tta_path = os.path.join(context.results_dir,
+        tta_path = os.path.join(context.addons_dir,
                                 f"{context.bids_prefix}_{ADDON_NAME}_trials_to_average.csv")
         pd.concat(tta_rows, ignore_index=True).to_csv(tta_path, index=False)
         written.append(tta_path)
@@ -784,7 +784,7 @@ def run(context):
             pairs.insert(1, "Metric", metric)
             for k, v in (omni or {}).items():
                 pairs["Omnibus_" + k] = v
-            con_path = os.path.join(context.results_dir,
+            con_path = os.path.join(context.addons_dir,
                                     f"{context.bids_prefix}_{ADDON_NAME}_contrasts.csv")
             pairs.to_csv(con_path, index=False)
             written.append(con_path)
@@ -794,19 +794,19 @@ def run(context):
                     f"(Fligner-Killeen p = {omni['fligner_p']:.4f}).")
 
     if sens_rows:
-        sp = os.path.join(context.results_dir,
+        sp = os.path.join(context.addons_dir,
                           f"{context.bids_prefix}_{ADDON_NAME}_sensitivity.csv")
         pd.concat(sens_rows, ignore_index=True).to_csv(sp, index=False)
         written.append(sp)
 
     if jk_rows:
-        jp = os.path.join(context.results_dir,
+        jp = os.path.join(context.addons_dir,
                           f"{context.bids_prefix}_{ADDON_NAME}_jackknife.csv")
         pd.concat(jk_rows, ignore_index=True).to_csv(jp, index=False)
         written.append(jp)
 
     if corr_rows:
-        cor_path = os.path.join(context.results_dir,
+        cor_path = os.path.join(context.addons_dir,
                                 f"{context.bids_prefix}_{ADDON_NAME}_correlations.csv")
         pd.concat(corr_rows, ignore_index=True).to_csv(cor_path, index=False)
         written.append(cor_path)

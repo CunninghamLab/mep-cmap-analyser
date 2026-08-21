@@ -87,6 +87,14 @@ from .preferences    import prefs, apply_scaling, accent_button_kw
 from .stage2         import Stage2Mixin
 from .filter_preview import FilterPreviewMixin
 
+# Labels for the per-recording selected-column override. Three, not a
+# checkbox: "use the preference" must stay distinguishable from "off for this
+# recording", or a recording deliberately opted out would opt itself back in
+# the moment the global preference was switched on.
+_COLSEL_INHERIT = "Use Preferences setting"
+_COLSEL_ON      = "Write for this recording"
+_COLSEL_OFF     = "Skip for this recording"
+
 def _under_sourcedata(file_path: str, scan_root: str) -> bool:
     """True if *file_path* sits under a ``sourcedata`` folder BELOW *scan_root*.
 
@@ -274,6 +282,19 @@ FIELD_HELP = {
         "The two are not the same: a measure taken from the mean trace is not "
         "the mean of the measures, and which is wanted depends on the "
         "question."
+    ),
+    "column_selection": (
+        "Writes a second, trimmed copy of the trials file, keeping only the "
+        "columns you pick. _trials.csv itself is never affected \u2014 it "
+        "always carries every column.\n\n"
+        "Which columns to keep is set in Preferences \u2192 Trial columns, "
+        "for every recording. This changes it for THIS one only:\n\n"
+        "\u2022 Use Preferences setting \u2014 do whatever Preferences "
+        "\u2192 Trial columns says, on or off. The normal setting.\n"
+        "\u2022 Write for this recording \u2014 write it here, with its own "
+        "columns, even if Preferences has it off.\n"
+        "\u2022 Skip for this recording \u2014 do not write it here, even "
+        "if Preferences has it on."
     ),
 }
 
@@ -1478,6 +1499,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             # misc
             enable_inspector  = self.enable_inspector.get(),
             average_mode      = self.average_mode.get(),
+            column_selection  = self._effective_column_selection(),
             channel_idx       = self.channel_idx,
             # Which channels to analyse, their display names, and each one's
             # tab 1a setup. The worker loops over these; the pipeline itself
@@ -1977,6 +1999,9 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
 
                     enable_inspector     = params["enable_inspector"],
                     average_mode         = params["average_mode"],
+                    # .get, not [], and NOT `or None`: an empty list means
+                    # "protected columns only", which is a real selection.
+                    column_selection     = params.get("column_selection"),
                     channel_idx          = _ch,
                     channel_label        = _nm,
                     multi_channel        = len(_chan_list) > 1,
@@ -2593,6 +2618,44 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         check_with_help(run_frame, "Analyse average waveform per event type", FIELD_HELP["average_waveform"],
             variable=self.average_mode).grid(row=1, column=1, sticky='w', padx=4)
 
+        # ── Selected-column trial file, for THIS recording ────────────────
+        # Here rather than in Preferences because it decides what this
+        # recording writes, which is what the rest of this frame does and
+        # what the session already saves. Preferences sets the study-wide
+        # default; this is where one recording departs from it.
+        #
+        # Three states, not a checkbox. "Use preference" has to stay
+        # distinguishable from "off for this recording", or a recording
+        # deliberately opted out would opt itself back in the moment the
+        # global preference was switched on.
+        _cs_row = tk.Frame(run_frame)
+        _cs_row.grid(row=2, column=0, columnspan=2, sticky='w', padx=4,
+                     pady=(4, 0))
+        tk.Label(_cs_row, text="Also write a trimmed trials file:").pack(side="left")
+        # Its own icon widget rather than a suffix on the label, because this
+        # row packs left-to-right instead of sitting in the fixed grid the
+        # label_with_help suffix exists to avoid disturbing.
+        attach_info_icon(_cs_row, FIELD_HELP["column_selection"]).pack(
+            side="left", padx=(2, 0))
+        self._colsel_mode = tk.StringVar(value=_COLSEL_INHERIT)
+        # Wide enough for the longest option. A readonly Combobox clips rather
+        # than scrolls, and a half-shown "Use Preferences settin" is exactly
+        # the ambiguity this wording exists to remove.
+        ttk.Combobox(_cs_row, textvariable=self._colsel_mode,
+                     values=[_COLSEL_INHERIT, _COLSEL_ON, _COLSEL_OFF],
+                     state="readonly",
+                     width=max(len(_s) for _s in (_COLSEL_INHERIT, _COLSEL_ON,
+                                                  _COLSEL_OFF)) + 2
+                     ).pack(side="left", padx=(6, 4))
+        self._colsel_choose_btn = tk.Button(_cs_row, text="Columns\u2026",
+                                            command=self._colsel_choose)
+        self._colsel_choose_btn.pack(side="left")
+        self._colsel_note = tk.Label(_cs_row, text="", fg="grey")
+        self._colsel_note.pack(side="left", padx=(8, 0))
+        self._colsel_mode.trace_add("write",
+                                    lambda *_a: self._colsel_on_mode_change())
+        self._refresh_colsel_control()
+
         # Log stays in the scrollable area so it expands with content
         tk.Label(self.main_frame, text="Log:").pack(anchor='w', padx=10, pady=(10,0))
         self.log_box = scrolledtext.ScrolledText(self.main_frame, height=6, wrap=tk.WORD)
@@ -2784,6 +2847,23 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
                 str(_c): {k: list(v) for k, v in (_b or {}).items()}
                 for _c, _b in (getattr(self, "_cond_epochs", None) or {}).items()},
             "gap_ms_map":       self.gap_ms_map,
+            # Per-recording override of the selected-column preference.
+            #
+            # TOP LEVEL, not inside "settings", and the distinction is load
+            # behaviour rather than tidiness. Everything in "settings" is
+            # restored through _b/_i/_f/_s against a hardcoded literal, so a
+            # session written before a key existed silently adopts that
+            # literal. For an override that is exactly wrong: absent has to
+            # mean "no override, use the preference", not "force this value".
+            # Read here with `or None` like window_map and the condition keys,
+            # each of which restores absent as "nothing was set".
+            #
+            # Tri-state. None (or missing) = inherit the preference. A dict =
+            # this recording decides for itself. That keeps "the analyst
+            # deliberately turned it off here" distinguishable from "this
+            # session predates the feature" -- the same distinction Stage 2
+            # needs when it compares sessions.
+            "column_selection": getattr(self, "column_selection", None),
             "reference_map":    self.reference_map,
             "reference_display": getattr(self, '_reference_display', {}),
             "latency_map":      {k: list(v) for k, v in self.latency_map.items()},
@@ -3041,6 +3121,20 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             pass
         # Force the tab to adopt the restored rows rather than rebuild.
         self._cond_source_path = None
+        # Selected-column override for this recording. Restored OUTSIDE the
+        # settings try-block below, so a malformed value in that block cannot
+        # take it down with the rest, and absent means "no override" rather
+        # than a literal default. Only a dict counts: anything else is treated
+        # as unset, which is what a session from an older version carries.
+        _colsel = sess.get("column_selection")
+        self.column_selection = _colsel if isinstance(_colsel, dict) else None
+        # The widgets do not watch the attribute, so a restored session would
+        # otherwise leave the previous recording's answer on screen while the
+        # run used this one's.
+        try:
+            self._refresh_colsel_control()
+        except Exception:
+            pass
         self.gap_ms_map=sess.get("gap_ms_map",{})
         self.delay_ms_map=sess.get("delay_ms_map",{})
         self.delay_source_map=sess.get("delay_source_map",{})
@@ -3751,8 +3845,29 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
                  font=("TkDefaultFont", 13, "bold")).pack(pady=(16,2))
         tk.Label(win, text=f"Version {TOOL_VERSION}").pack()
         try:
-            from .assets import tmsmultilab_logo
+            from .assets import tmsmultilab_logo, load_photo
+            # 64 first, then the other shipped sizes.
+            #
+            # A compiled build drew the 32 px mark in the header and nothing
+            # here, with the 64 px file present in the bundle and structurally
+            # identical to the one that worked. The cause is not visible from
+            # outside the running executable, so this asks for what it wants
+            # and then for whatever else is there, rather than showing nothing
+            # because one size would not load.
             _l = tmsmultilab_logo(64)
+            if _l is None:
+                for _sz in (40, 32, 140, 22):
+                    _l = tmsmultilab_logo(_sz)
+                    if _l is not None:
+                        break
+            if _l is None:
+                # Said, not swallowed. The image is decoration and must not
+                # stop the dialogue opening, but a mark that vanishes without
+                # explanation is what made this take two releases to chase.
+                from .assets import asset_path
+                self.log("   \u2139\ufe0f  About: the TMSMultiLab mark could "
+                         "not be loaded from "
+                         + str(asset_path("tmsmultilab_64.png")))
             if _l is not None:
                 _w = tk.Label(win, image=_l, bd=0, cursor="hand2")
                 _w.image = _l          # Tk keeps only a weak reference
@@ -4612,8 +4727,11 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
 
             df_main.to_csv(main_csv, index=False)
             # Update summary files
-            _summary_csv_ps      = main_csv.replace("_trials.csv", "_summary.csv")
-            _summary_with_out_ps = main_csv.replace("_trials.csv", "_summary_with_outliers.csv")
+            # Resolved through the layout, not by editing the path.
+            # Summary and trials no longer share a folder.
+            from .results_layout import sibling as _sib
+            _summary_csv_ps      = _sib(main_csv, "summary.csv")
+            _summary_with_out_ps = _sib(main_csv, "summary_with_outliers.csv")
             _update_summary(_summary_csv_ps, df_main)
             # summary_with_outliers built from same trials df (all rows, clean filtering inside)
             _update_summary(_summary_with_out_ps, df_main)
@@ -4660,8 +4778,9 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         # _trials_with_outliers.csv removed — _trials.csv contains all trials
 
         # ── Update summary files ─────────────────────────────────────────────
-        _summary_csv      = main_csv.replace("_trials.csv", "_summary.csv")
-        _summary_with_out = main_csv.replace("_trials.csv", "_summary_with_outliers.csv")
+        from .results_layout import sibling as _sib
+        _summary_csv      = _sib(main_csv, "summary.csv")
+        _summary_with_out = _sib(main_csv, "summary_with_outliers.csv")
         _update_summary(_summary_csv, df_main)
         # summary_with_outliers uses same df (all rows, clean filtering inside _update_summary)
         _update_summary(_summary_with_out, df_main)
@@ -7480,6 +7599,154 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         if self.analyse_channels:
             return sorted(self.analyse_channels)
         return [self.channel_idx]
+
+    def _effective_column_selection(self):
+        """Group keys for the narrowed trials copy, or None for no such file.
+
+        The one place the preference and the per-recording override are
+        combined, so the run, the log and anything that later reports what was
+        written cannot disagree about which won.
+
+        The override is tri-state on purpose. A dict means this recording
+        decided for itself and the preference is not consulted at all --
+        including a dict that says enabled=False, which is an analyst
+        deliberately opting this recording out. Only an absent override
+        (None) falls through to the preference. Collapsing those two would
+        make "off here" indistinguishable from "not set here", and a
+        recording opted out would silently opt back in the moment the global
+        preference was switched on.
+        """
+        from .preferences import prefs
+        override = getattr(self, "column_selection", None)
+        if isinstance(override, dict):
+            if not override.get("enabled"):
+                return None
+            groups = override.get("groups")
+            return list(groups) if isinstance(groups, list) else []
+        if not prefs.trials_selected_enabled:
+            return None
+        return list(prefs.trials_selected_groups)
+
+    # ── The per-recording override control ────────────────────────────────
+    #
+    # self.column_selection is the stored state and the only thing saved,
+    # restored or read by the run. These three keep the widgets in step with
+    # it; nothing else should write it.
+
+    def _refresh_colsel_control(self):
+        """Show what this recording will do, whether set here or inherited.
+
+        Called after a session loads as well as on every change, because
+        restoring a session writes self.column_selection directly and the
+        widgets would otherwise still show the previous recording's answer.
+        """
+        if not hasattr(self, "_colsel_mode"):
+            return          # called before the tab was built
+        override = getattr(self, "column_selection", None)
+        if isinstance(override, dict):
+            mode = _COLSEL_ON if override.get("enabled") else _COLSEL_OFF
+        else:
+            mode = _COLSEL_INHERIT
+        if self._colsel_mode.get() != mode:
+            # Set without re-entering the trace, which would rewrite the very
+            # state just restored.
+            self._colsel_suspend = True
+            try:
+                self._colsel_mode.set(mode)
+            finally:
+                self._colsel_suspend = False
+
+        groups = self._effective_column_selection()
+        if groups is None:
+            note = "not written"
+        else:
+            from .column_groups import resolve
+            _keys, _pulled = resolve(groups)
+            note = f"{len(_keys)} group(s)"
+        # The dropdown already says where the answer comes from, so this says
+        # only what the answer IS. It is the one line that reports the
+        # outcome, so it must read the same whether set here or inherited.
+        note = "\u2192 " + note
+        try:
+            self._colsel_note.config(text=note)
+            self._colsel_choose_btn.config(
+                state=("normal" if mode == _COLSEL_ON else "disabled"))
+        except Exception:
+            pass
+
+    def _colsel_on_mode_change(self):
+        """Write the chosen mode into the stored override."""
+        if getattr(self, "_colsel_suspend", False):
+            return
+        from .preferences import prefs
+        mode = self._colsel_mode.get()
+        if mode == _COLSEL_INHERIT:
+            self.column_selection = None
+        else:
+            # Groups are kept across an off/on flip and seeded from the
+            # preference the first time, so switching off and back on does not
+            # silently empty a selection the analyst made.
+            existing = getattr(self, "column_selection", None)
+            groups = (list(existing.get("groups") or [])
+                      if isinstance(existing, dict)
+                      else list(prefs.trials_selected_groups))
+            self.column_selection = {"enabled": mode == _COLSEL_ON,
+                                     "groups": groups}
+        self._session_dirty = True
+        self._refresh_colsel_control()
+
+    def _colsel_choose(self):
+        """Pick this recording's groups, from the same source of truth."""
+        from .column_groups import (DEPENDENCIES, GROUPS, GROUP_LABELS,
+                                    PROTECTED)
+        current = getattr(self, "column_selection", None)
+        chosen = set(current.get("groups") or []) if isinstance(current, dict) \
+            else set()
+
+        win = tk.Toplevel(self.root)
+        win.title("Trimmed trials file \u2014 this recording")
+        win.transient(self.root)
+        win.resizable(False, False)
+
+        tk.Label(win,
+                 text="_trials.csv always keeps every column. This chooses what\n"
+                      "the trimmed copy beside it keeps, for this recording only.",
+                 justify="left", fg="grey").pack(anchor="w", padx=12,
+                                                 pady=(10, 6))
+        tk.Label(win,
+                 text="Always kept: " + ", ".join(PROTECTED),
+                 justify="left", fg="grey", wraplength=420).pack(
+            anchor="w", padx=12, pady=(0, 8))
+
+        body = tk.Frame(win)
+        body.pack(anchor="w", padx=12)
+        vars_ = {}
+        for key, label, cols in GROUPS:
+            v = tk.BooleanVar(value=key in chosen)
+            vars_[key] = v
+            txt = f"{label}  ({len(cols)})"
+            req = DEPENDENCIES.get(key)
+            if req:
+                txt += f"  \u2014 also selects '{GROUP_LABELS.get(req, req)}'"
+            tk.Checkbutton(body, text=txt, variable=v,
+                           anchor="w").pack(anchor="w")
+
+        btns = tk.Frame(win)
+        btns.pack(pady=10)
+
+        def _ok():
+            self.column_selection = {
+                "enabled": True,
+                "groups": [k for k, v in vars_.items() if v.get()]}
+            self._session_dirty = True
+            self._refresh_colsel_control()
+            win.destroy()
+
+        tk.Button(btns, text="OK", width=10, command=_ok).pack(side="left",
+                                                               padx=4)
+        tk.Button(btns, text="Cancel", width=10,
+                  command=win.destroy).pack(side="left", padx=4)
+        win.grab_set()
 
     def _refresh_run_button(self):
         """Enable Run once the detection tab has been seen for this recording.

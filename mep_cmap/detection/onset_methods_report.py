@@ -234,14 +234,16 @@ def write_onset_method_tables(rows, results_out, bids_prefix):
     os.makedirs(results_out, exist_ok=True)
     written = []
 
-    long_path = os.path.join(results_out, f"{bids_prefix}_onset_methods.csv")
+    from ..results_layout import result_path
+    long_path = result_path(results_out,
+                            f"{bids_prefix}_onset_methods.csv")
     pd.DataFrame(rows, columns=METHOD_COLS).to_csv(long_path, index=False)
     written.append(long_path)
 
     summ = build_method_summary(rows)
     if len(summ):
-        summ_path = os.path.join(results_out,
-                                 f"{bids_prefix}_onset_method_summary.csv")
+        summ_path = result_path(
+            results_out, f"{bids_prefix}_onset_method_summary.csv")
         summ.to_csv(summ_path, index=False)
         written.append(summ_path)
     return written

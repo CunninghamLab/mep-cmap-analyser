@@ -545,7 +545,7 @@ def run(context):
             bucket.append((trial_idx, detail, feats, found, y_uV))
 
     df = pd.DataFrame(rows, columns=OUT_COLUMNS)
-    out_path = os.path.join(context.results_dir, f"{context.bids_prefix}_{ADDON_NAME}.csv")
+    out_path = os.path.join(context.addons_dir, f"{context.bids_prefix}_{ADDON_NAME}.csv")
     df.to_csv(out_path, index=False)
     log(f"mepfeatx: {len(rows)} trial(s), {n_found} with a detected MEP -> "
         f"{os.path.basename(out_path)}")

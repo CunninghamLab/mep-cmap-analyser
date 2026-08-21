@@ -341,6 +341,13 @@ class PipelineConfig:
     csp_max_mep_offset_ms: float = 100.0
     # Averaged-waveform analysis mode (analyse per-condition mean once)
     average_mode:          bool  = False
+    # Column selection for the narrowed COPY of trials.csv. None means no
+    # narrowed file is written, which is what every run did before this and
+    # what an unconfigured run still does. A list of group keys (see
+    # column_groups) means also write <prefix>_trials_selected.csv holding
+    # those groups plus the protected columns. trials.csv itself is never
+    # affected by this.
+    column_selection:      list  = None
 
 
 def _make_bids_prefix(meta_prefix, file_stem):
@@ -1822,7 +1829,8 @@ def _trials_frame(rows):
 
 
 def pipeline_write_outputs(latency_manual, results_out, bids_prefix,
-                           channel_label=None):
+                           channel_label=None, column_selection=None,
+                           log_callback=None):
     """Write all result CSVs to results_out directory.
 
     Outputs
@@ -1831,6 +1839,20 @@ def pipeline_write_outputs(latency_manual, results_out, bids_prefix,
     <prefix>_trials_with_outliers.csv — same including outlier trials
     <prefix>_summary.csv              — mean ± SD per stim type (clean trials only)
     <prefix>_summary_with_outliers.csv — same including outlier trials
+    <prefix>_trials_selected.csv      — column-narrowed COPY of trials.csv,
+                                        written only when column_selection is
+                                        given
+
+    ``column_selection`` is a list of group keys from :mod:`column_groups`.
+    It narrows nothing but the extra copy: trials.csv always carries every
+    column, and LAT_COLS is neither read nor reordered here.
+
+    Returns
+    -------
+    list | None — the group keys actually written to the narrowed file, after
+    dependency resolution, or None when no narrowed file was written. The
+    caller records this in the sidecar so Stage 2 compares stated intent
+    rather than guessing from CSV headers.
     """
     # Summary file headers — mirrors LAT_COLS with mean/SD for every metric,
     # plus trial counts so both files report the same variables.
@@ -1883,7 +1905,11 @@ def pipeline_write_outputs(latency_manual, results_out, bids_prefix,
         df[col] = pd.Categorical(df[col], categories=cats, ordered=True)
         return df.sort_values([col, "File"]).reset_index(drop=True)
 
-    def _p(name): return os.path.join(results_out, f"{bids_prefix}_{name}")
+    def _p(name):
+        # Routed by family. The NAME is unchanged -- a file has to be
+        # identifiable wherever it ends up -- only where it lands.
+        from .results_layout import result_path
+        return result_path(results_out, f"{bids_prefix}_{name}")
 
     # ── Trial-level files ─────────────────────────────────────────────────────
     def _tag_channel(df):
@@ -1900,6 +1926,7 @@ def pipeline_write_outputs(latency_manual, results_out, bids_prefix,
             df.insert(min(1, len(df.columns)), "Channel", str(channel_label))
         return df
 
+    _selected_written = None
     if latency_manual:
         df_all = _alpha_sort(
             _trials_frame(latency_manual),
@@ -1908,6 +1935,27 @@ def pipeline_write_outputs(latency_manual, results_out, bids_prefix,
         # filter column so the analyst keeps control of trial-level modelling.
         # (_trials_with_outliers.csv was retired for this reason.)
         _tag_channel(df_all).to_csv(_p("trials.csv"), index=False)
+
+        # ── Column-narrowed COPY ─────────────────────────────────────────
+        # On a copy, at write time, after the full file is already on disk.
+        # Nothing upstream knows this exists: the rows were built positionally
+        # against LAT_COLS and are untouched, and trials.csv above still holds
+        # every column. Narrowing a frame the row builders share would put a
+        # variable schema behind ~20 index constants that assert their own
+        # positions, which is the one thing this must never do.
+        if column_selection is not None:
+            from . import column_groups as _cg
+            _log = log_callback or (lambda _m: None)
+            _keys, _pulled = _cg.resolve(column_selection)
+            for _dep, _req, _why in _pulled:
+                _log(f"   ↳ '{_cg.GROUP_LABELS.get(_req, _req)}' added: "
+                     f"'{_cg.GROUP_LABELS.get(_dep, _dep)}' needs it — {_why}")
+            _cols = _cg.select(list(df_all.columns), _keys)
+            df_all[_cols].to_csv(_p("trials_selected.csv"), index=False)
+            _selected_written = sorted(_keys)
+            _log(f"   ↳ Selected-column copy: {len(_cols)} of "
+                 f"{len(df_all.columns)} columns → "
+                 f"{os.path.basename(_p('trials_selected.csv'))}")
 
     # ── Summary files — build from trial-level data for consistency ───────────
     # This ensures summary and trial files always report the same variables.
@@ -2019,6 +2067,8 @@ def pipeline_write_outputs(latency_manual, results_out, bids_prefix,
             .pipe(_tag_channel).to_csv(_p("summary.csv"),               index=False)
         _build_summary(df_all) \
             .pipe(_tag_channel).to_csv(_p("summary_with_outliers.csv"), index=False)
+
+    return _selected_written
 
 
 def pipeline_generate_plots(trace_stats, segments_metadata,
@@ -2326,7 +2376,8 @@ def pipeline_write_averaged(rows, results_out, bids_prefix):
     <prefix>_averaged.csv  — one row per condition (measured on the mean).
     """
     df = pd.DataFrame(rows, columns=AVERAGED_COLS)
-    out_path = os.path.join(results_out, f"{bids_prefix}_averaged.csv")
+    from .results_layout import result_path
+    out_path = result_path(results_out, f"{bids_prefix}_averaged.csv")
     df.to_csv(out_path, index=False)
     return out_path
 
@@ -2461,8 +2512,8 @@ def pipeline_write_segments_bundle(bundle, results_out, bids_prefix,
     arrays["manifest_fs"]      = np.asarray(g_fs, dtype=float)
     arrays["manifest_pre_ms"]  = np.asarray(g_pre, dtype=float)
     arrays["manifest_post_ms"] = np.asarray(g_post, dtype=float)
-    os.makedirs(results_out, exist_ok=True)
-    out_path = os.path.join(results_out, f"{bids_prefix}_segments.npz")
+    from .results_layout import result_path
+    out_path = result_path(results_out, f"{bids_prefix}_segments.npz")
     np.savez_compressed(out_path, **arrays)
     log_callback(f"💾 Waveform bundle written: {os.path.basename(out_path)} "
                  f"({len(bundle)} group(s))")
@@ -2548,6 +2599,7 @@ def run_pipeline(input_path,
                  csp_n_boot=1000, csp_search_end_ms=400.0,
                  csp_max_mep_offset_ms=100.0,
                  average_mode=False,
+                 column_selection=None,
                  existing_segments_metadata=None):
     """
     Orchestrate the full per-file MEP/CMAP analysis pipeline.
@@ -2607,6 +2659,10 @@ def run_pipeline(input_path,
         csp_search_end_ms=csp_search_end_ms,
         csp_max_mep_offset_ms=csp_max_mep_offset_ms,
         average_mode=average_mode,
+        # NOT `or None`: an empty list is a real selection (protected columns
+        # only) and must stay distinguishable from None, which means no
+        # narrowed file at all.
+        column_selection=column_selection,
     )
 
     # ── BIDS output paths ─────────────────────────────────────────────────────
@@ -3268,17 +3324,37 @@ def run_pipeline(input_path,
             log_callback=lambda _: None)
 
     # ── Stage 10: Write outputs ───────────────────────────────────────────────
-    pipeline_write_outputs(latency_manual,
-                           results_out, _bids_prefix,
-                           channel_label=channel_label)
+    _selected_groups = pipeline_write_outputs(
+        latency_manual,
+        results_out, _bids_prefix,
+        channel_label=channel_label,
+        column_selection=cfg.column_selection,
+        log_callback=log_callback)
 
     # ── Write _trials.json sidecar ────────────────────────────────────────────
     # This is the file Stage 2 scans for. It must be written alongside
     # the trials.csv in the results/ folder.
-    _trials_csv = os.path.join(results_out, f"{_bids_prefix}_trials.csv")
+    from .results_layout import result_path as _rp
+    _trials_csv = _rp(results_out, f"{_bids_prefix}_trials.csv",
+                      create=False)
+    if not os.path.isfile(_trials_csv):
+        # A study written before the folders existed keeps its flat
+        # layout; the sidecar must still find its own trials file.
+        _trials_csv = os.path.join(results_out,
+                                   f"{_bids_prefix}_trials.csv")
     if os.path.isfile(_trials_csv):
         _write_sidecar(_trials_csv, extra={
             "trials_csv": f"{_bids_prefix}_trials.csv",
+            # What the narrowed copy was ASKED for, not what its header
+            # happens to show. Stage 2 compares these across sessions to
+            # decide whether they can be merged, and a header comparison
+            # cannot tell "this analyst chose not to keep cSP" from "this
+            # recording had no cSP data to keep".
+            #
+            # null means no narrowed file was written. Recorded either way,
+            # so a session that predates the feature (key absent) is
+            # distinguishable from one that deliberately wrote none.
+            "column_selection": _selected_groups,
         })
 
     # Auto-open combined figure

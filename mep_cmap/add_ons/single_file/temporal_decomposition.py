@@ -647,8 +647,8 @@ def run(context):
     df = df.reindex(columns=ordered + [c for c in df.columns if c not in ordered])
     df = df.sort_values(["StimType", "Segment"]).reset_index(drop=True)
 
-    os.makedirs(context.results_dir, exist_ok=True)
-    out_path = os.path.join(context.results_dir,
+    # addons_dir creates itself on access, so no makedirs is needed here.
+    out_path = os.path.join(context.addons_dir,
                             f"{context.bids_prefix}_{ADDON_NAME}.csv")
     df.to_csv(out_path, index=False)
 

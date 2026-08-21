@@ -353,13 +353,34 @@ def test_subfolder_is_created_on_demand_only(tmp_path):
 
 
 def test_tables_stay_in_results_not_the_figures_subfolder(tmp_path):
-    """CSVs are results, not figures; only the images move."""
+    """CSVs are results, not figures; only the images move.
+
+    They now sit in results/onset-methods/ rather than loose in results/, so
+    the test asserts what it always meant -- under the results root, not in
+    figures -- rather than one exact folder.
+    """
     import os
 
     rows = collect_agreement_rows(_fixture(n=6), "f.smr")
     paths = write_onset_method_tables(rows, str(tmp_path), "sub-01")
+    assert paths
     for p in paths:
-        assert os.path.dirname(p) == str(tmp_path)
+        d = os.path.dirname(os.path.abspath(p))
+        assert d.startswith(str(tmp_path)), f"{p} escaped the results folder"
+        assert "figures" not in os.path.relpath(p, str(tmp_path)).split(os.sep)
+
+
+def test_the_tables_are_grouped_by_family(tmp_path):
+    """One recording writes nine files per channel; a five-channel study is
+    forty-five loose files without this."""
+    import os
+
+    from mep_cmap.results_layout import family_for
+
+    rows = collect_agreement_rows(_fixture(n=6), "f.smr")
+    for p in write_onset_method_tables(rows, str(tmp_path), "sub-01"):
+        assert os.path.basename(os.path.dirname(p)) == family_for(p)
+        assert family_for(p) == "onset-methods"
 
 
 # ── The consensus must appear, and the reported method must be identifiable ──

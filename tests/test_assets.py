@@ -71,15 +71,28 @@ def test_the_assets_are_bundled_into_the_frozen_builds():
 
 
 def test_every_use_of_the_logo_is_guarded():
-    """A decorative mark is never worth preventing a window from opening."""
+    """A decorative mark is never worth preventing a window from opening.
+
+    Checked by parsing rather than by scanning back a fixed number of
+    characters: the old form failed the moment a comment was added above the
+    call, which says nothing about whether the call is guarded.
+    """
+    import ast
+
     for src, name in ((APP, "app.py"), (SPLASH, "splash_screen.py")):
-        i = 0
-        while True:
-            i = src.find("tmsmultilab_logo", i + 1)
-            if i < 0:
-                break
-            before = src[max(0, i - 400):i]
-            assert "try:" in before, f"{name}: unguarded use of the logo"
+        tree = ast.parse(src)
+        guarded = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Try):
+                for sub in ast.walk(node):
+                    guarded.add(id(sub))
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "tmsmultilab_logo"):
+                assert id(node) in guarded, (
+                    f"{name}: unguarded use of the logo at line "
+                    f"{getattr(node, 'lineno', '?')}")
 
 
 # ── authorship ───────────────────────────────────────────────────────────────

@@ -29,6 +29,17 @@ DEFAULTS   = {
     # Seed for a new stimulus type's epoch window on tab 1a, in ms. The value
     # in force is the row itself; this only decides what a fresh row starts at.
     "default_epoch_ms": [20, 400],
+    # Column selection for the narrowed COPY of trials.csv. Off by default:
+    # a study that never touches this writes exactly the files it always did.
+    #
+    # BOTH keys MUST be here. load() keeps only `if k in DEFAULTS`, so a key
+    # written to preferences.json without an entry above appears to save,
+    # reads back for the rest of the session from the in-memory dict, and is
+    # silently discarded on the next start -- a setting that forgets itself
+    # overnight and only ever for the analyst, never on the machine it was
+    # tested on.
+    "trials_selected_enabled": False,
+    "trials_selected_groups": ["amplitude", "onset", "prestim"],
 }
 DEFAULTS.update(_detection_pref_defaults())
 # Stamped so a superseded default can be recognised rather than shadowed
@@ -166,6 +177,41 @@ class Preferences:
 
     def set_preview_trials_per_type(self, value: int):
         self._data["preview_trials_per_type"] = max(1, min(100, int(value)))
+        self.save()
+
+    # ── Selected-column trial file ────────────────────────────────────────────
+
+    @property
+    def trials_selected_enabled(self) -> bool:
+        """Whether a run also writes the column-narrowed copy of trials.csv."""
+        return bool(self._data.get("trials_selected_enabled", False))
+
+    @property
+    def trials_selected_groups(self) -> list:
+        """Column groups the narrowed copy keeps, as keys from column_groups.
+
+        Unknown keys are dropped on the way out rather than on the way in: a
+        group renamed or retired in a later version would otherwise sit in the
+        stored preference forever, and asking for a group that no longer exists
+        should mean "not selected", not an error mid-run.
+        """
+        from .column_groups import GROUP_KEYS
+        stored = self._data.get("trials_selected_groups")
+        if not isinstance(stored, list):
+            stored = DEFAULTS["trials_selected_groups"]
+        return [k for k in stored if k in GROUP_KEYS]
+
+    def set_trials_selected(self, enabled: bool, groups=None):
+        """Persist both keys together.
+
+        One call because they are one decision: a selection with nothing
+        enabled and an enable with no selection are both half a setting.
+        """
+        from .column_groups import GROUP_KEYS
+        self._data["trials_selected_enabled"] = bool(enabled)
+        if groups is not None:
+            self._data["trials_selected_groups"] = [
+                k for k in groups if k in GROUP_KEYS]
         self.save()
 
     @property
@@ -1155,6 +1201,72 @@ def open_preferences_dialog(root, on_apply=None):
     tk.Button(addon_tab, text="Clear",
               command=lambda: addons_path_var.set("")).pack(anchor="w", padx=16, pady=(0, 4))
 
+    # ── Tab 5: Trial columns ─────────────────────────────────────────────────
+    from .column_groups import GROUPS as _CG_GROUPS
+    from .column_groups import (DEPENDENCIES as _CG_DEPS,
+                                GROUP_LABELS as _CG_LABELS,
+                                PROTECTED as _CG_PROTECTED)
+
+    col_tab = tk.Frame(notebook)
+    notebook.add(col_tab, text="Trial columns")
+
+    _cc = tk.Canvas(col_tab, highlightthickness=0, borderwidth=0)
+    _cs = ttk.Scrollbar(col_tab, orient="vertical", command=_cc.yview)
+    _cb = tk.Frame(_cc)
+    _cb.bind("<Configure>",
+             lambda e: _cc.configure(scrollregion=_cc.bbox("all")))
+    _cw = _cc.create_window((0, 0), window=_cb, anchor="nw")
+    _cc.bind("<Configure>", lambda e: _cc.itemconfigure(_cw, width=e.width))
+    _cc.configure(yscrollcommand=_cs.set)
+    _cc.pack(side="left", fill="both", expand=True)
+    _cs.pack(side="right", fill="y")
+
+    tk.Label(_cb, text="Trimmed trials file",
+             font=("TkDefaultFont", 11, "bold")).pack(pady=(14, 4),
+                                                      anchor="w", padx=16)
+    tk.Label(_cb,
+             text="_trials.csv always carries every column; this writes an\n"
+                  "extra, narrower copy beside it as _trials_selected.csv, which\n"
+                  "Second Level can be pointed at instead. Nothing is lost: the\n"
+                  "columns below identify every trial, so the trimmed file can\n"
+                  "always be merged back against the full one.\n\n"
+                  "This is the default for every recording. A single recording\n"
+                  "can override it on tab 1c.",
+             justify="left", fg="grey").pack(anchor="w", padx=16, pady=(0, 10))
+
+    sel_en_var = tk.BooleanVar(value=prefs.trials_selected_enabled)
+    tk.Checkbutton(_cb, text="Also write a trimmed copy of _trials.csv",
+                   variable=sel_en_var, anchor="w").pack(anchor="w", padx=16)
+
+    _prot = tk.LabelFrame(_cb, text="Always written", padx=10, pady=8)
+    _prot.pack(anchor="w", padx=16, pady=(10, 6), fill="x")
+    for _name, _why in _CG_PROTECTED.items():
+        _v = tk.BooleanVar(value=True)
+        # Ticked and disabled, with the reason beside it. A control that
+        # cannot be changed and does not say why reads as a broken checkbox.
+        tk.Checkbutton(_prot, text=_name, variable=_v, state="disabled",
+                       anchor="w").grid(sticky="w")
+        tk.Label(_prot, text=_why, fg="grey", anchor="w").grid(
+            row=_prot.grid_size()[1] - 1, column=1, sticky="w", padx=(8, 0))
+
+    _grp = tk.LabelFrame(_cb, text="Choose what else to keep", padx=10, pady=8)
+    _grp.pack(anchor="w", padx=16, pady=(0, 10), fill="x")
+    sel_group_vars = {}
+    for _key, _label, _cols in _CG_GROUPS:
+        _v = tk.BooleanVar(value=_key in prefs.trials_selected_groups)
+        sel_group_vars[_key] = _v
+        _req = _CG_DEPS.get(_key)
+        _txt = f"{_label}  ({len(_cols)} column{'s' if len(_cols) != 1 else ''})"
+        if _req:
+            _txt += f"  \u2014 also selects '{_CG_LABELS.get(_req, _req)}'"
+        tk.Checkbutton(_grp, text=_txt, variable=_v,
+                       anchor="w").pack(anchor="w")
+
+    tk.Label(_cb,
+             text="A group whose members depend on another pulls it in\n"
+                  "automatically, and the run log says so.",
+             justify="left", fg="grey").pack(anchor="w", padx=16, pady=(0, 12))
+
     def _apply():
         # Font scale
         prefs.set_font_scale(scale_var.get() / 100.0)
@@ -1263,6 +1375,12 @@ def open_preferences_dialog(root, on_apply=None):
                 parent=win)
 
         prefs.set_addons_path(addons_path_var.get())
+
+        # Both keys in one call: an enable with no groups and groups with no
+        # enable are each half a setting.
+        prefs.set_trials_selected(
+            sel_en_var.get(),
+            [k for k, v in sel_group_vars.items() if v.get()])
 
         if on_apply:
             on_apply(root)

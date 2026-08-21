@@ -1754,7 +1754,7 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
     # ──────────────────────────────────────────────────────────────
     def _open_inspector_preview(self, segments_dict, fs, pre_ms, post_ms, unit,
                                 label_map, color_map, metadata_dict=None,
-                                ptp_windows_by_type=None):
+                                ptp_windows_by_type=None, container=None):
         """Open the Inspector read-only, before any analysis has run.
 
         A separate call site rather than a flag on _open_inspector_gui. That
@@ -1820,7 +1820,17 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
             enable_auc          = self.enable_auc_global.get(),
             underlays           = {},
             read_only           = True,
+            # Given a frame, the Inspector builds itself INTO it rather than
+            # into a window of its own. Everything else about it is unchanged,
+            # which is the point: the preview is only worth trusting if it
+            # measures exactly like the review that follows it.
+            container           = container,
         )
+        if container is not None:
+            # Hosted: the containing window owns the title, the modal grab and
+            # closing. Returning the instance lets it drive the trial shown
+            # when a trace is clicked in the overlay above.
+            return inspector
         # A window titled "review" invites the analyst to believe their marker
         # drags counted.
         try:
@@ -1829,8 +1839,13 @@ class TMSAnalysisApp(Stage2Mixin, FilterPreviewMixin, BidsifyTabMixin,
         except tk.TclError:
             pass
         self.root.wait_window(inspector.top)
-        # Deliberately not stored: not segments_metadata, not the per-channel
-        # map, not _last_outlier_result, and no session autosave.
+        # Deliberately not stored: no marker metadata, no per-channel map, no
+        # outlier result, and no session autosave. A preview is a picture of
+        # what the settings do, not an analysis. (The identifiers are named in
+        # test_the_preview_opener_writes_nothing_back rather than here: that
+        # test scans this method's source for them, and a comment quoting them
+        # would trip the guard it is describing.)
+        return inspector
 
     def _show_inspector_cb(self, segments_dict, fs, pre_ms, post_ms,
                         unit, label_map, color_map, analysis_pre_ms=None,

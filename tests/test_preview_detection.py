@@ -278,6 +278,14 @@ def test_the_two_inspector_call_sites_pass_the_same_settings():
                         sites[fn] = {k.arg for k in n.keywords if k.arg}
     assert len(sites) == 2, f"expected two call sites, found {sorted(sites)}"
     review, preview = sites["_open_inspector_gui"], sites["_open_inspector_preview"]
+    # Hosting, not measurement. The preview puts the Inspector inside the
+    # combined window through `container`; review gives it its own window.
+    # Nothing about what is measured or detected differs, which is what this
+    # test is for, so the argument is excluded by name rather than by
+    # loosening the comparison -- a setting added to one site and not the
+    # other must still fail here.
+    _HOSTING_ONLY = {"container"}
+    preview = preview - _HOSTING_ONLY
     assert review == preview, (
         f"only in review: {sorted(review - preview)}; "
         f"only in preview: {sorted(preview - review)}")

@@ -77,9 +77,18 @@ window that saves nothing.
 Two things cannot be faithful before a run, and the preview says so in the log
 rather than hiding them:
 
-  * per-stimulus-type amplitude window anchoring is computed *from* a run's
-    median onset, so anchored types preview with the file-wide window;
-  * outlier decisions do not exist yet, so every chosen trial is shown.
+  * outlier decisions do not exist yet, so every chosen trial is shown;
+  * saved manual onsets are honoured by the run but are not detection, so the
+    pre-detected count can read lower than the results without the two
+    disagreeing.
+
+Amplitude window anchoring IS faithful, and this is why the preview cuts two
+sets of segments. The anchor is the median onset of a stimulus type, so
+detecting over the eight trials being shown would give a different median, a
+different window and a different peak-to-peak from the run. Every trial of each
+type is therefore cut and detected, while only the chosen ones are drawn. An
+earlier version did preview anchored types with the file-wide window, and this
+docstring went on saying so after it stopped being true.
 
 This mixin assumes the host provides: self.root, self.log(),
 self._validate_analysis_setup(), self._snapshot_analysis_params(),
@@ -571,6 +580,16 @@ class PreviewDetectionMixin:
                 onset_bigoni_walkback_sd=_params.get("onset_bigoni_walkback_sd", 1.0),
                 onset_anchor=_params.get("onset_anchor", False),
                 onset_anchor_halfwidth_ms=_params.get("onset_anchor_halfwidth_ms", 8.0),
+                # The blanking gap and the silent-period assignment. Both were
+                # missing, and both are settings the run uses: the gap moves
+                # the pre-stimulus window the reported baseline metrics are
+                # computed over, and csp_types decides whether the end of the
+                # MEP is the start of a silent period or a return to baseline
+                # -- which changes the offset, its provenance, and the
+                # duration derived from it.
+                gap_ms_map=_own("gap_ms_map", {}) or {},
+                csp_types=set(_own("csp_types", None) or
+                              getattr(self, "csp_types", None) or set()),
                 # The ptp_anchor* settings are NOT passed here. They are not
                 # Tk-backed, so config_detection_kwargs returns them, and
                 # naming them as well raises "got multiple values for keyword
@@ -643,6 +662,21 @@ class PreviewDetectionMixin:
                                     (_w1 - _before) * 1000.0 / _fs)
                 except Exception:
                     pass
+            # Guarded SEPARATELY from the onset stage above. Sharing that
+            # handler meant a fault here emptied the seed entirely, so a
+            # problem in offset or cSP detection cost the onsets too -- and
+            # the symptom was an empty onset strip beside a trial view showing
+            # a perfectly good latency, which points at the wrong stage.
+            try:
+                self._preview_detect_extras(payload, _cfg, _seed, _sb_seed)
+            except Exception as _exc:                 # noqa: BLE001 — reported
+                import traceback as _tb
+                self.log(f"   ⚠️  Offset/cSP pre-detection failed "
+                         f"({type(_exc).__name__}: {_exc}); onsets are "
+                         f"unaffected and the Inspector will find offsets "
+                         f"itself.")
+                for _line in _tb.format_exc().strip().splitlines()[-3:]:
+                    self.log(f"      {_line.strip()}")
         except Exception as exc:                      # noqa: BLE001 — reported
             import traceback
             _seed = {}
@@ -661,8 +695,14 @@ class PreviewDetectionMixin:
         # the count either way makes the two cases tell themselves apart.
         if _seed:
             _by_type = {}
-            for (_st, _i) in _seed:
-                _by_type[_st] = _by_type.get(_st, 0) + 1
+            # Only entries carrying an ONSET. The seed also holds offsets and
+            # silent periods now, and those are created for trials whose onset
+            # detection found nothing -- so counting seed entries reported
+            # "B 20/20" on a type with six onsets and twenty silent periods,
+            # which is the opposite of what this line exists to say.
+            for (_st, _i), _m in _seed.items():
+                if isinstance(_m, dict) and _m.get("onset_idx") is not None:
+                    _by_type[_st] = _by_type.get(_st, 0) + 1
             # Out of how many, and how many the analyst has already placed.
             #
             # "A·first 4" reads as a shortfall against a run that reports a
@@ -680,7 +720,14 @@ class PreviewDetectionMixin:
                 # Only the ones detection MISSED. A trial both detected and
                 # hand-placed is one trial, and counting it twice would make
                 # the total exceed the trials shown.
-                _found = {_i for (_s, _i) in _seed if _s == _st}
+                #
+                # Keyed on an ONSET being present, for the same reason as the
+                # count above: a trial seeded with only an offset or a silent
+                # period has not had its onset detected, and treating it as
+                # though it had would hide a hand-placed one.
+                _found = {_i for (_s, _i), _m in _seed.items()
+                          if _s == _st and isinstance(_m, dict)
+                          and _m.get("onset_idx") is not None}
                 _n_manual = sum(
                     1 for (_mst, _mi), _m in _saved.items()
                     if _mst == _st and _mi not in _found
@@ -749,6 +796,23 @@ class PreviewDetectionMixin:
         self.log("   ℹ️  Outlier decisions do not exist yet — every chosen "
                  "trial is shown. Markers are fixed and nothing is saved.")
 
+        # ONE window: the overlay above, the trial-by-trial view below. They
+        # answer two halves of one question, and as separate Toplevels the
+        # analyst arranged them by hand on every preview and lost the
+        # condition-level picture the moment the trial view was raised.
+        #
+        # The Inspector is used as it is, hosted in the lower pane. It still
+        # calls the analysis detector for every trial it draws, which is what
+        # makes the preview worth trusting.
+        try:
+            self._preview_combined(payload, _seed, _ptp_ms, _cfg)
+            self.log("🔎 Preview closed — no changes were saved")
+            return
+        except Exception as exc:                      # noqa: BLE001 — reported
+            self.log(f"   ⚠️  Combined preview unavailable "
+                     f"({type(exc).__name__}: {exc}); opening the "
+                     f"trial-by-trial view on its own.")
+
         self._open_inspector_preview(
             payload["segments"], payload["fs"],
             payload["prestim_ms"], payload["post_ms"],
@@ -757,3 +821,256 @@ class PreviewDetectionMixin:
             dict(getattr(self, "color_map", {}) or {}),
             metadata_dict=_seed, ptp_windows_by_type=_ptp_ms)
         self.log("🔎 Preview closed — no changes were saved")
+
+    # ── Overlay ──────────────────────────────────────────────────────────────
+
+    def _preview_overlay_payload(self, payload, seed, ptp_ms, keys):
+        """The groups dict the overlay draws, for the given group keys.
+
+        Onsets are read from the SEED, which holds what the analysis detector
+        returned, converted back to ms about the stimulus. Re-deriving them
+        here would be a second detection path and therefore a second answer.
+        """
+        fs = float(payload["fs"])
+        sb = float(payload["prestim_ms"]) * fs / 1000.0
+        colours = dict(getattr(self, "color_map", {}) or {})
+        groups = {}
+        for key in keys:
+            segs = (payload.get("segments") or {}).get(key)
+            if not segs:
+                continue
+            nums = [i + 1 for i in
+                    ((payload.get("picked") or {}).get(key)
+                     or range(len(segs)))]
+            onsets = []
+            offsets = []
+            csp_ends = []
+            for disp in range(len(segs)):
+                m = seed.get((key, disp)) or {}
+                idx = m.get("onset_idx")
+                onsets.append(None if idx is None
+                              else (float(idx) - sb) * 1000.0 / fs)
+                oidx = m.get("mep_offset_idx")
+                offsets.append(None if oidx is None
+                               else (float(oidx) - sb) * 1000.0 / fs)
+                # Only the END. The silent period's START is the MEP offset --
+                # one physical event, which resolve_mep_offset already reports
+                # as the offset -- so a separate cSP start row would draw the
+                # same instant twice and invite it to be read as two findings.
+                eidx = m.get("silent_end_idx")
+                csp_ends.append(None if eidx is None
+                                else (float(eidx) - sb) * 1000.0 / fs)
+            groups[key] = {"traces": segs, "onsets_ms": onsets,
+                           "offsets_ms": offsets,
+                           "csp_end_ms": csp_ends,
+                           "trial_numbers": nums,
+                           "colour": colours.get(key)}
+        return groups
+
+    def _preview_combined(self, payload, seed, ptp_ms, cfg):
+        """Open the one preview window: overlay above, trial view below.
+
+        What may share axes is NOT decided here. pipeline's overlay_groups
+        answers it from the resolved epochs, and this offers exactly what that
+        returns, so a combination the plot could not draw honestly never
+        appears as a choice and the reason is shown instead.
+        """
+        from .overlay import CombinedPreviewWindow
+        from .pipeline import overlay_groups
+
+        keys = [k for k, v in (payload.get("segments") or {}).items() if v]
+        if not keys:
+            raise ValueError("no segments to preview")
+        compat = overlay_groups(cfg, keys)
+
+        # Each condition on its own is always available: one condition shares
+        # its own epoch with itself. The combined entries come from the
+        # compatibility answer, refusals included, so the window can say why.
+        options = [(k, [k], "") for k in sorted(keys)]
+        for base, (members, _epoch, reason) in sorted(compat.items()):
+            if len(members) < 2:
+                continue
+            options.append((f"All conditions of {base}", members, reason))
+
+        def _groups_for(members):
+            groups = self._preview_overlay_payload(payload, seed, ptp_ms,
+                                                   members)
+            # Only a window shared by every member is marked. Conditions of
+            # one type share an epoch by construction but can still anchor
+            # their amplitude windows separately, and drawing one of them
+            # across all of them would attribute a window to trials it was
+            # not derived from.
+            wins = {ptp_ms.get(k) for k in members if ptp_ms.get(k)}
+            # Per the types being DRAWN, not across the file. The blanking gap
+            # is per stimulus type: taking it over every key meant one type's
+            # 20 ms gap displaced the baseline band on every other type in the
+            # recording, which is a shaded window that is simply wrong
+            # wherever it is not the type it came from.
+            return (groups,
+                    (wins.pop() if len(wins) == 1 else None),
+                    self._preview_prestim_window_ms(cfg, members))
+
+        def _make_inspector(container):
+            return self._open_inspector_preview(
+                payload["segments"], payload["fs"],
+                payload["prestim_ms"], payload["post_ms"],
+                payload["unit"],
+                dict(getattr(self, "label_map", {}) or {}),
+                dict(getattr(self, "color_map", {}) or {}),
+                metadata_dict=seed, ptp_windows_by_type=ptp_ms,
+                container=container)
+
+        win = CombinedPreviewWindow(
+            self.root, _groups_for, keys, options,
+            payload["fs"], payload["prestim_ms"], payload["unit"],
+            inspector_factory=_make_inspector)
+        # Trial numbers as the RECORDING numbers them, so a click in the
+        # overlay can be mapped onto the Inspector's own display order.
+        win.trial_numbers = {
+            k: [i + 1 for i in ((payload.get("picked") or {}).get(k)
+                                or range(len(v)))]
+            for k, v in (payload.get("segments") or {}).items()}
+        self.root.wait_window(win.win)
+
+    def _preview_detect_extras(self, payload, cfg, seed, sb_seed):
+        """Seed MEP offsets and silent periods alongside the onsets.
+
+        Same functions the run and the Inspector call: resolve_mep_offset from
+        detection.offset_detection and detect_csp from detection.csp_detection.
+        Neither is reimplemented here. A preview that computed offsets its own
+        way would be a second answer to a question that already has one, and
+        the trial view sitting below the overlay would disagree with the strip
+        above it.
+
+        ORDER MATTERS. The silent period is found first, because the offset
+        rule takes the start of a detected cSP as the end of the MEP: the two
+        are one physical event, and reversing the order would report a
+        baseline return on exactly the trials where a silent period exists.
+
+        Seeded into INSPECTOR index space, like the onsets, so the trial view
+        draws the same landmarks the overlay counts.
+        """
+        from .detection.csp_detection import detect_csp_bootstrap
+        from .detection.offset_detection import resolve_mep_offset
+        from .pipeline import resolve_window
+
+        fs = float(payload["fs"])
+        n_off = n_csp = 0
+        csp_reasons = {}
+        # NOT a PipelineConfig field. Every other cSP setting is one, so
+        # reading this from cfg looked right and raised AttributeError, which
+        # the guard below swallowed -- so cSP detection here did nothing at
+        # all, whatever had been configured. It is an app-level setting the
+        # Inspector is handed directly, and is read the same way here.
+        try:
+            _csp_start_search = float(self.csp_search_start_ms.get())
+        except Exception:
+            _csp_start_search = 40.0
+        for st, segs in (payload.get("segments") or {}).items():
+            if not len(segs):
+                continue
+            pre_ms, post_ms = resolve_window(cfg, st)
+            disp_pre_ms = float(payload["prestim_ms"])
+            csp_on = st in (cfg.csp_types or set())
+            for disp, seg in enumerate(segs):
+                seg = np.asarray(seg, dtype=float)
+                t_ms = (np.arange(len(seg)) - sb_seed) * 1000.0 / fs
+                onset_idx = (seed.get((st, disp)) or {}).get("onset_idx")
+                onset_ms = (None if onset_idx is None
+                            else (onset_idx - sb_seed) * 1000.0 / fs)
+
+                csp_start_ms = None
+                if csp_on:
+                    # detect_csp says WHY it found nothing through reason_out.
+                    # Discarding that left "no silent period" indistinguishable
+                    # from a search window that never covered the suppression,
+                    # a baseline too short to bootstrap, or a raised exception.
+                    _why = []
+                    try:
+                        _res = detect_csp_bootstrap(
+                            seg, fs, t_ms,
+                            pre_ms=disp_pre_ms,
+                            search_start_ms=_csp_start_search,
+                            search_end_ms=cfg.csp_search_end_ms,
+                            min_silence_ms=cfg.csp_min_silence_ms,
+                            min_return_ms=cfg.csp_min_return_ms,
+                            criterion=cfg.csp_criterion,
+                            significance=cfg.csp_significance,
+                            n_boot=cfg.csp_n_boot,
+                            reason_out=_why)
+                    except Exception as _cexc:
+                        _res = None
+                        _why.append(f"{type(_cexc).__name__}: {_cexc}")
+                    if _res is None and _why:
+                        csp_reasons.setdefault(st, _why[0])
+                    if _res:
+                        s_idx, e_idx = _res
+                        seed.setdefault((st, disp), {}).update(
+                            silent_start_idx=int(s_idx),
+                            silent_end_idx=int(e_idx))
+                        csp_start_ms = (int(s_idx) - sb_seed) * 1000.0 / fs
+                        n_csp += 1
+
+                try:
+                    _off = resolve_mep_offset(
+                        seg, fs,
+                        onset_ms=onset_ms,
+                        csp_start_ms=csp_start_ms,
+                        csp_enabled=csp_on,
+                        manual_offset_ms=None,
+                        pre_ms=disp_pre_ms,
+                        search_end_ms=post_ms,
+                        min_duration_ms=cfg.mep_offset_min_duration_ms,
+                        max_duration_ms=cfg.mep_offset_max_duration_ms,
+                        min_return_ms=cfg.mep_offset_min_return_ms,
+                        env_window_ms=cfg.mep_offset_env_window_ms,
+                        criterion=cfg.mep_offset_criterion,
+                        peak_frac=cfg.mep_offset_peak_frac)
+                except Exception:
+                    _off = None
+                if _off is not None and _off.offset_ms is not None:
+                    seed.setdefault((st, disp), {})["mep_offset_idx"] = int(
+                        round(sb_seed + _off.offset_ms * fs / 1000.0))
+                    n_off += 1
+
+        if n_off or n_csp:
+            self.log(f"   Offsets pre-detected: {n_off}"
+                     + (f"; silent periods: {n_csp}" if n_csp else ""))
+        # A silent period assigned but never found is a setting to look at,
+        # not an absence to pass over -- and the reason the detector gives is
+        # the shortest route to which setting.
+        _csp_types = [st for st in (payload.get("segments") or {})
+                      if st in (cfg.csp_types or set())]
+        if not _csp_types:
+            if getattr(self, "csp_types", None):
+                self.log("   cSP is not assigned to any stimulus type shown "
+                         "here, so no silent period was looked for. Assign it "
+                         "on tab 1a.")
+        elif not n_csp:
+            self.log("   No silent period was found for "
+                     + ", ".join(_csp_types)
+                     + f" (searched {_csp_start_search:g}-"
+                     + f"{float(cfg.csp_search_end_ms):g} ms).")
+            for _st, _r in sorted(csp_reasons.items()):
+                self.log(f"      {_st}: {_r}")
+
+    def _preview_prestim_window_ms(self, cfg, keys):
+        """The window PreStimRMS is measured over, as (start_ms, end_ms).
+
+        NOT the detector baseline. The analysis cuts two things per trial: the
+        epoch, whose pre-stimulus part is what the onset detectors threshold
+        against, and a separate pre-stimulus segment ending a gap before the
+        stimulus, which is what PreStimRMS, PreStimPTP, the outlier screen and
+        the excitability compensation are computed from. They are different
+        intervals whenever a blanking gap is set, and drawing one while
+        labelling it the other is how a gap comes to look as though it had no
+        effect.
+        """
+        gap = 0.0
+        for k in keys:
+            try:
+                gap = max(gap, float((cfg.gap_ms_map or {}).get(k, 0.0)))
+            except (TypeError, ValueError):
+                continue
+        end = -gap
+        return (end - float(cfg.prestim_ms), end)

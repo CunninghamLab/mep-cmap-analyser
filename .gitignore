@@ -72,3 +72,5 @@ dist/
 build/
 *.egg-info/
 *.json.bak 
+backups/ 
+commit_msg_*.txt 

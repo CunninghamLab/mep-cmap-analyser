@@ -588,6 +588,57 @@ def time_axis_for(cfg: PipelineConfig, stim_type: str, fs: float):
     return np.linspace(-pre, post, before + after, endpoint=False)
 
 
+def overlay_groups(cfg: PipelineConfig, group_keys):
+    """Which group keys may be drawn on one set of axes, and why not otherwise.
+
+    Returns ``{base_stim_type: (keys, epoch, reason)}``. ``keys`` is every
+    group key of that stimulus type; ``epoch`` is the (pre_ms, post_ms) they
+    share, or None; ``reason`` is empty when they may be overlaid and
+    otherwise names the epochs that differ.
+
+    Overlaying two conditions cut to different epochs would put two time axes
+    on one plot. The traces would be drawn against a single axis regardless,
+    so a response at 30 ms in one condition and 30 ms in the other would land
+    in different places, and the plot would show a latency difference that
+    does not exist. Refused rather than rescaled: a rescaled overlay is still
+    two different measurements, and the analyst has no way to see which trace
+    came from which window.
+
+    Compared on the RESOLVED pair from resolve_window, never on what
+    window_map happens to hold. Two conditions can be configured differently
+    and resolve identically -- one carrying an explicit copy of the file-wide
+    pair -- or be configured identically and differ after a per-condition
+    epoch is applied. Comparing the configuration rather than the result is
+    the same fault as reading a file-wide value where a per-type one was
+    needed.
+
+    An event delay difference does NOT block an overlay. A delay moves each
+    type's t=0 onto the actual stimulus, so two conditions with different
+    delays are each correctly aligned and comparable; only the extents matter.
+    """
+    by_type = {}
+    for key in group_keys:
+        base, _cond = split_group_key(cfg, key)
+        by_type.setdefault(base, []).append(key)
+
+    out = {}
+    for base, keys in by_type.items():
+        keys = sorted(keys)
+        epochs = {}
+        for key in keys:
+            epochs.setdefault(resolve_window(cfg, key), []).append(key)
+        if len(epochs) == 1:
+            out[base] = (keys, next(iter(epochs)), "")
+            continue
+        parts = []
+        for (pre, post), members in sorted(epochs.items()):
+            parts.append(f"{', '.join(members)}: {pre:g} to {post:g} ms")
+        out[base] = (keys, None,
+                     "these are cut to different epochs, so they cannot share "
+                     "a time axis (" + "; ".join(parts) + ")")
+    return out
+
+
 #: How much of the requested pre-stimulus window must exist before a trial is
 #: kept. Above this the baseline is trimmed and the trial survives; below it,
 #: the window is a baseline in name only and the trial is dropped instead.

@@ -176,6 +176,46 @@ class DraggableLine:
         self.update_cb(new_idx)
         self.ax.figure.canvas.draw_idle()
 
+class _EmbeddedTop(tk.Frame):
+    """A Frame that answers to the Toplevel calls the Inspector makes.
+
+    The Inspector owns its own window: it titles it, grabs it, maximises it
+    and resizes it to fit its widgets. All of that is right for a window and
+    wrong for a panel sitting inside one, but the alternative to this class was
+    editing seventeen call sites in a 1755-line file that is verified working.
+
+    A REAL Frame, subclassed rather than a wrapper object, because ``self.top``
+    is used as the parent of half a dozen widgets and Tk needs a genuine
+    widget there.
+
+    ``state()`` reports "zoomed" deliberately. Both resize paths skip geometry
+    changes when the window is maximised, so reporting it is the honest answer
+    for a panel whose size belongs to its container, and it disables the
+    auto-resize without touching either code path.
+    """
+
+    def title(self, *_a):
+        return ""
+
+    def grab_set(self):
+        pass
+
+    def grab_release(self):
+        pass
+
+    def protocol(self, *_a, **_k):
+        pass
+
+    def geometry(self, *_a):
+        return ""
+
+    def state(self, *_a):
+        return "zoomed"
+
+    def attributes(self, *_a):
+        return True
+
+
 class DataInspectorWindow:
     """
     Interactive reviewer for single-trial EMG segments.
@@ -221,14 +261,25 @@ class DataInspectorWindow:
                  latency_map=None,
                  csp_types=None, analysis_pre_ms=None,
                  extra_segs=None, wide_window_s=3.0, underlays=None,
-                 read_only=False):
+                 read_only=False, container=None):
 
         # --------- book-keeping -----------------------------------------
-        self.top = tk.Toplevel(master)
-        self.top.title("Data Inspector – review")
-        # Note: transient(master) is intentionally NOT set here — it removes
-        # the minimise/maximise/restore buttons from the title bar on Windows.
-        self.top.grab_set()
+        # ``container`` makes this a PANEL rather than a window. Given one,
+        # every Toplevel-only call the class makes is absorbed by _EmbeddedTop
+        # and nothing else in this file changes: the same widgets are built,
+        # the same detector runs, the same markers are drawn. Used by the
+        # preview, where the overlay and the trial view are two halves of one
+        # question and belonged in one window.
+        if container is not None:
+            self.top = _EmbeddedTop(container)
+            self.top.pack(fill="both", expand=True)
+        else:
+            self.top = tk.Toplevel(master)
+            self.top.title("Data Inspector – review")
+            # Note: transient(master) is intentionally NOT set here — it removes
+            # the minimise/maximise/restore buttons from the title bar on Windows.
+            self.top.grab_set()
+        self.embedded = container is not None
 
         # read_only: a viewing window. Markers are drawn but fixed, the
         # editing controls are inert, and nothing is committed on close. Used
